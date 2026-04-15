@@ -1,9 +1,9 @@
-pub mod compress;
+pub mod ask;
 pub mod diagnostics;
+pub mod fs;
 pub mod gguf;
-pub mod nlq;
+pub mod nbd;
 pub mod stego;
-pub mod vfs;
 
 pub const APP_NAME: &str = "llmdb";
 pub const BLOCK_SIZE: usize = 4096;

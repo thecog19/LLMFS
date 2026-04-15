@@ -7,9 +7,8 @@ edition = "2024"
 clap = { version = "4.5.38", features = ["derive"] }
 crc32fast = "1.4.2"
 memmap2 = "0.9.5"
-rusqlite = { version = "0.37.0", features = ["bundled"] }
 thiserror = "2.0.12"
+ureq = { version = "2.12.1", default-features = false }
 
 [dev-dependencies]
 tempfile = "3.16.0"
-

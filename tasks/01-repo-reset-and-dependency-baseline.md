@@ -1,6 +1,6 @@
 # Task 01: Repo Reset And Dependency Baseline
 
-Status: todo
+Status: done
 Depends on: none
 Spec refs: DESIGN-NEW.MD sections "2. Version Roadmap", "10. Crate Structure"
 

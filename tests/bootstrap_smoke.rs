@@ -10,21 +10,25 @@ fn crate_exports_bootstrap_contracts() {
     let device = llmdb::stego::device::DeviceBootstrap::default();
     assert_eq!(device.block_size, llmdb::BLOCK_SIZE);
 
-    let vfs = llmdb::vfs::sqlite_vfs::SqliteVfsBootstrap::default();
-    assert_eq!(vfs.page_size, llmdb::BLOCK_SIZE);
+    let redirection = llmdb::stego::redirection::RedirectionBootstrap::default();
+    assert_eq!(redirection.entries_per_block, 1022);
 
-    let compression = llmdb::compress::bpe::CompressionBootstrap::default();
-    assert!(compression.enabled_by_default);
+    let freelist = llmdb::stego::freelist::FreeListBootstrap::default();
+    assert_eq!(freelist.block_size, llmdb::BLOCK_SIZE);
 
     let diagnostics = llmdb::diagnostics::DiagnosticsBootstrap::default();
     assert!(diagnostics.tracks_tiers);
 
+    let file_table = llmdb::fs::file_table::FileTableBootstrap::default();
+    assert_eq!(file_table.entries_per_block, 16);
+
+    let nbd = llmdb::nbd::protocol::NbdProtocolBootstrap::default();
+    assert_eq!(nbd.block_size, llmdb::BLOCK_SIZE);
+
+    let ask = llmdb::ask::bridge::AskBridgeBootstrap::default();
+    assert_eq!(ask.tool_count, 3);
+
     let packers = llmdb::stego::packing::supported_packers();
     assert!(packers.contains(&"q8_0"));
     assert!(packers.contains(&"float"));
-
-    assert_eq!(
-        llmdb::nlq::consistency::classify_temperature(0.0),
-        llmdb::nlq::consistency::ConsistencyMode::Strong
-    );
 }
