@@ -1,6 +1,6 @@
 # Task 03: Packing Modules
 
-Status: todo
+Status: done
 Depends on: 02-gguf-parser-extensions.md
 Spec refs: DESIGN-NEW.MD sections "4. Quantization Block Layouts"
 

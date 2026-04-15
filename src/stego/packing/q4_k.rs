@@ -1,8 +1,9 @@
-use super::{PackingError, StegoPacker};
+use super::{PackingError, QuantPacker, StegoPacker};
 
 pub const NAME: &str = "q4_k";
 pub const BLOCK_BYTES: usize = 144;
 pub const PAYLOAD_BYTES_PER_BLOCK: usize = 32;
+pub const WEIGHTS_PER_BLOCK: usize = 256;
 const QS_BYTES: usize = 128;
 
 pub struct Q4KPacker;
@@ -10,6 +11,31 @@ pub struct Q4KPacker;
 impl StegoPacker for Q4KPacker {
     const NAME: &'static str = NAME;
     const STEALABLE_BITS_PER_WEIGHT: usize = 1;
+}
+
+impl QuantPacker for Q4KPacker {
+    fn bits_per_weight(&self) -> u32 {
+        1
+    }
+    fn block_size_bytes(&self) -> usize {
+        BLOCK_BYTES
+    }
+    fn weights_per_block(&self) -> usize {
+        WEIGHTS_PER_BLOCK
+    }
+    fn extract(&self, block_bytes: &[u8]) -> Vec<u8> {
+        read_payload_block(block_bytes)
+            .expect("q4_k extract on invalid block")
+            .to_vec()
+    }
+    fn embed(&self, block_bytes: &[u8], data: &[u8]) -> Vec<u8> {
+        let mut block = block_bytes.to_vec();
+        write_payload_block(&mut block, data).expect("q4_k embed on invalid block");
+        block
+    }
+    fn stealable_byte_offsets(&self) -> Vec<usize> {
+        (0..QS_BYTES).collect()
+    }
 }
 
 pub fn read_payload_block(block: &[u8]) -> Result<[u8; PAYLOAD_BYTES_PER_BLOCK], PackingError> {

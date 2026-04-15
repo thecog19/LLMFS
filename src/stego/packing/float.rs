@@ -1,8 +1,8 @@
-use super::{PackingError, StegoPacker};
+use super::{PackingError, QuantPacker, StegoPacker};
 
 pub const NAME: &str = "float";
-const F16_BYTES_PER_VALUE: usize = 2;
-const F32_BYTES_PER_VALUE: usize = 4;
+pub const F16_BYTES_PER_VALUE: usize = 2;
+pub const F32_BYTES_PER_VALUE: usize = 4;
 
 pub struct F16Packer;
 pub struct F32Packer;
@@ -15,6 +15,57 @@ impl StegoPacker for F16Packer {
 impl StegoPacker for F32Packer {
     const NAME: &'static str = "f32";
     const STEALABLE_BITS_PER_WEIGHT: usize = 8;
+}
+
+impl QuantPacker for F16Packer {
+    fn bits_per_weight(&self) -> u32 {
+        4
+    }
+    fn block_size_bytes(&self) -> usize {
+        F16_BYTES_PER_VALUE
+    }
+    fn weights_per_block(&self) -> usize {
+        1
+    }
+    fn extract(&self, block_bytes: &[u8]) -> Vec<u8> {
+        assert_eq!(block_bytes.len(), F16_BYTES_PER_VALUE, "f16 block size");
+        vec![block_bytes[0] & 0x0F]
+    }
+    fn embed(&self, block_bytes: &[u8], data: &[u8]) -> Vec<u8> {
+        assert_eq!(block_bytes.len(), F16_BYTES_PER_VALUE, "f16 block size");
+        assert_eq!(data.len(), 1, "f16 data nibble");
+        vec![
+            (block_bytes[0] & 0xF0) | (data[0] & 0x0F),
+            block_bytes[1],
+        ]
+    }
+    fn stealable_byte_offsets(&self) -> Vec<usize> {
+        vec![0]
+    }
+}
+
+impl QuantPacker for F32Packer {
+    fn bits_per_weight(&self) -> u32 {
+        8
+    }
+    fn block_size_bytes(&self) -> usize {
+        F32_BYTES_PER_VALUE
+    }
+    fn weights_per_block(&self) -> usize {
+        1
+    }
+    fn extract(&self, block_bytes: &[u8]) -> Vec<u8> {
+        assert_eq!(block_bytes.len(), F32_BYTES_PER_VALUE, "f32 block size");
+        vec![block_bytes[0]]
+    }
+    fn embed(&self, block_bytes: &[u8], data: &[u8]) -> Vec<u8> {
+        assert_eq!(block_bytes.len(), F32_BYTES_PER_VALUE, "f32 block size");
+        assert_eq!(data.len(), 1, "f32 data byte");
+        vec![data[0], block_bytes[1], block_bytes[2], block_bytes[3]]
+    }
+    fn stealable_byte_offsets(&self) -> Vec<usize> {
+        vec![0]
+    }
 }
 
 pub fn read_f16_nibble(storage: &[u8], value_index: usize) -> Result<u8, PackingError> {

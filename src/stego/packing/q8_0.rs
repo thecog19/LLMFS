@@ -1,4 +1,4 @@
-use super::{PackingError, StegoPacker};
+use super::{PackingError, QuantPacker, StegoPacker};
 
 pub const NAME: &str = "q8_0";
 pub const BLOCK_BYTES: usize = 34;
@@ -11,6 +11,31 @@ pub struct Q8_0Packer;
 impl StegoPacker for Q8_0Packer {
     const NAME: &'static str = NAME;
     const STEALABLE_BITS_PER_WEIGHT: usize = 4;
+}
+
+impl QuantPacker for Q8_0Packer {
+    fn bits_per_weight(&self) -> u32 {
+        4
+    }
+    fn block_size_bytes(&self) -> usize {
+        BLOCK_BYTES
+    }
+    fn weights_per_block(&self) -> usize {
+        QUANT_COUNT
+    }
+    fn extract(&self, block_bytes: &[u8]) -> Vec<u8> {
+        read_payload_block(block_bytes)
+            .expect("q8_0 extract on invalid block")
+            .to_vec()
+    }
+    fn embed(&self, block_bytes: &[u8], data: &[u8]) -> Vec<u8> {
+        let mut block = block_bytes.to_vec();
+        write_payload_block(&mut block, data).expect("q8_0 embed on invalid block");
+        block
+    }
+    fn stealable_byte_offsets(&self) -> Vec<usize> {
+        (SCALE_BYTES..SCALE_BYTES + QUANT_COUNT).collect()
+    }
 }
 
 pub fn read_quant_nibble(block: &[u8], quant_index: usize) -> Result<u8, PackingError> {
