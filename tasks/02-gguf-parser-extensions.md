@@ -1,6 +1,6 @@
 # Task 02: GGUF Parser Extensions
 
-Status: todo
+Status: done
 Depends on: 01-repo-reset-and-dependency-baseline.md
 Spec refs: DESIGN-NEW.MD sections "3. GGUF Parser", "4. Quantization Block Layouts"
 

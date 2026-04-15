@@ -235,6 +235,12 @@ fn quant_rank(quant_type: GgufQuantType) -> u8 {
         GgufQuantType::Q5K => 3,
         GgufQuantType::Q4K => 2,
         GgufQuantType::Q3K => 1,
-        GgufQuantType::Q2K => 0,
+        GgufQuantType::Q2K
+        | GgufQuantType::Q4_0
+        | GgufQuantType::Q4_1
+        | GgufQuantType::Q5_0
+        | GgufQuantType::Q5_1
+        | GgufQuantType::Q8_1
+        | GgufQuantType::Q8K => 0,
     }
 }

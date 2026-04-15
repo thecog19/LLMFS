@@ -762,7 +762,15 @@ impl StegoDevice {
                 payload
             }
             GgufQuantType::F32 => packing::float::read_f32_payload(storage)?,
-            GgufQuantType::Q2K => return Err(DeviceError::UnsupportedQuantType(slot.quant_type)),
+            GgufQuantType::Q2K
+            | GgufQuantType::Q4_0
+            | GgufQuantType::Q4_1
+            | GgufQuantType::Q5_0
+            | GgufQuantType::Q5_1
+            | GgufQuantType::Q8_1
+            | GgufQuantType::Q8K => {
+                return Err(DeviceError::UnsupportedQuantType(slot.quant_type));
+            }
         };
 
         Ok(payload)
@@ -808,7 +816,15 @@ impl StegoDevice {
             )?,
             GgufQuantType::F16 => packing::float::write_f16_payload(storage, payload)?,
             GgufQuantType::F32 => packing::float::write_f32_payload(storage, payload)?,
-            GgufQuantType::Q2K => return Err(DeviceError::UnsupportedQuantType(slot.quant_type)),
+            GgufQuantType::Q2K
+            | GgufQuantType::Q4_0
+            | GgufQuantType::Q4_1
+            | GgufQuantType::Q5_0
+            | GgufQuantType::Q5_1
+            | GgufQuantType::Q8_1
+            | GgufQuantType::Q8K => {
+                return Err(DeviceError::UnsupportedQuantType(slot.quant_type));
+            }
         }
 
         Ok(())
@@ -964,7 +980,13 @@ fn tensor_storage_layout(
         GgufQuantType::Q3K => chunk_storage_len(weight_count, 256, packing::q3_k::BLOCK_BYTES)?,
         GgufQuantType::F16 => weight_count * 2,
         GgufQuantType::F32 => weight_count * 4,
-        GgufQuantType::Q2K => return Err(DeviceError::UnsupportedQuantType(quant_type)),
+        GgufQuantType::Q2K
+        | GgufQuantType::Q4_0
+        | GgufQuantType::Q4_1
+        | GgufQuantType::Q5_0
+        | GgufQuantType::Q5_1
+        | GgufQuantType::Q8_1
+        | GgufQuantType::Q8K => return Err(DeviceError::UnsupportedQuantType(quant_type)),
     };
 
     Ok(TensorStorageLayout { storage_len })
