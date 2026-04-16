@@ -1,18 +1,18 @@
 use crc32fast::Hasher;
 use thiserror::Error;
 
+use crate::gguf::quant::GgufQuantType;
+
 pub const SUPERBLOCK_MAGIC: [u8; 5] = *b"LLMDB";
 pub const INTEGRITY_MAGIC: [u8; 4] = *b"ICHK";
-pub const SUPERBLOCK_VERSION: u16 = 1;
+pub const SUPERBLOCK_VERSION: u8 = 1;
 pub const NO_BLOCK: u32 = u32::MAX;
 pub const ENTRIES_PER_INTEGRITY_BLOCK: usize = 1020;
-const SUPERBLOCK_CHECKSUM_OFFSET: usize = 0x25;
-const PENDING_TARGET_BLOCK_OFFSET: usize = 0x29;
-const PENDING_TARGET_CRC32_OFFSET: usize = 0x2D;
-const PENDING_METADATA_OP_OFFSET: usize = 0x31;
-const PENDING_METADATA_BLOCK_OFFSET: usize = 0x32;
-const PENDING_METADATA_AUX_OFFSET: usize = 0x36;
-const GENERATION_OFFSET: usize = 0x3A;
+
+const SUPERBLOCK_CRC_RANGE_END: usize = 0x28;
+const SUPERBLOCK_CRC_OFFSET: usize = 0x28;
+const FLAG_LOBOTOMY: u8 = 0x01;
+const FLAG_DIRTY: u8 = 0x02;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IntegrityBootstrap {
@@ -27,40 +27,36 @@ impl Default for IntegrityBootstrap {
     }
 }
 
+/// Superblock layout per DESIGN-NEW §5.
+///
+/// ```text
+/// 0x00  5   magic "LLMDB"
+/// 0x05  1   version (1)
+/// 0x06  2   block size (4096)
+/// 0x08  4   total blocks
+/// 0x0C  4   free list head
+/// 0x10  4   integrity chain head
+/// 0x14  4   redirection table start
+/// 0x18  4   redirection table length
+/// 0x1C  4   file table start
+/// 0x20  4   file table length
+/// 0x24  1   flags (bit 0 lobotomy, bit 1 dirty)
+/// 0x25  1   quant profile
+/// 0x26  2   reserved
+/// 0x28  4   CRC32 of bytes 0x00–0x27
+/// 0x2C  4052 reserved / padding
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SuperblockFields {
     pub total_blocks: u32,
     pub free_list_head: u32,
-    pub table_directory_block: u32,
     pub integrity_chain_head: u32,
-    pub wal_region_start: u32,
-    pub wal_region_length: u32,
-    pub shadow_block: u32,
-    pub pending_target_block: u32,
-    pub pending_target_crc32: u32,
-    pub pending_metadata_op: PendingMetadataOp,
-    pub pending_metadata_block: u32,
-    pub pending_metadata_aux: u32,
-    pub generation: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum PendingMetadataOp {
-    None = 0,
-    AllocHeadAdvance = 1,
-    FreeHeadPush = 2,
-}
-
-impl PendingMetadataOp {
-    fn from_raw(raw: u8) -> Result<Self, IntegrityError> {
-        match raw {
-            0 => Ok(Self::None),
-            1 => Ok(Self::AllocHeadAdvance),
-            2 => Ok(Self::FreeHeadPush),
-            _ => Err(IntegrityError::UnknownPendingMetadataOp(raw)),
-        }
-    }
+    pub redirection_table_start: u32,
+    pub redirection_table_length: u32,
+    pub file_table_start: u32,
+    pub file_table_length: u32,
+    pub flags: u8,
+    pub quant_profile: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,33 +69,40 @@ impl Superblock {
         Self { fields }
     }
 
+    pub fn is_lobotomy(&self) -> bool {
+        self.fields.flags & FLAG_LOBOTOMY != 0
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.fields.flags & FLAG_DIRTY != 0
+    }
+
+    pub fn set_dirty(&mut self, dirty: bool) {
+        if dirty {
+            self.fields.flags |= FLAG_DIRTY;
+        } else {
+            self.fields.flags &= !FLAG_DIRTY;
+        }
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let mut bytes = vec![0_u8; crate::BLOCK_SIZE];
-        bytes[0..5].copy_from_slice(&SUPERBLOCK_MAGIC);
-        bytes[0x05..0x07].copy_from_slice(&SUPERBLOCK_VERSION.to_le_bytes());
-        bytes[0x07..0x09].copy_from_slice(&(crate::BLOCK_SIZE as u16).to_le_bytes());
-        bytes[0x09..0x0D].copy_from_slice(&self.fields.total_blocks.to_le_bytes());
-        bytes[0x0D..0x11].copy_from_slice(&self.fields.free_list_head.to_le_bytes());
-        bytes[0x11..0x15].copy_from_slice(&self.fields.table_directory_block.to_le_bytes());
-        bytes[0x15..0x19].copy_from_slice(&self.fields.integrity_chain_head.to_le_bytes());
-        bytes[0x19..0x1D].copy_from_slice(&self.fields.wal_region_start.to_le_bytes());
-        bytes[0x1D..0x21].copy_from_slice(&self.fields.wal_region_length.to_le_bytes());
-        bytes[0x21..0x25].copy_from_slice(&self.fields.shadow_block.to_le_bytes());
-        bytes[PENDING_TARGET_BLOCK_OFFSET..PENDING_TARGET_BLOCK_OFFSET + 4]
-            .copy_from_slice(&self.fields.pending_target_block.to_le_bytes());
-        bytes[PENDING_TARGET_CRC32_OFFSET..PENDING_TARGET_CRC32_OFFSET + 4]
-            .copy_from_slice(&self.fields.pending_target_crc32.to_le_bytes());
-        bytes[PENDING_METADATA_OP_OFFSET] = self.fields.pending_metadata_op as u8;
-        bytes[PENDING_METADATA_BLOCK_OFFSET..PENDING_METADATA_BLOCK_OFFSET + 4]
-            .copy_from_slice(&self.fields.pending_metadata_block.to_le_bytes());
-        bytes[PENDING_METADATA_AUX_OFFSET..PENDING_METADATA_AUX_OFFSET + 4]
-            .copy_from_slice(&self.fields.pending_metadata_aux.to_le_bytes());
-        bytes[GENERATION_OFFSET..GENERATION_OFFSET + 8]
-            .copy_from_slice(&self.fields.generation.to_le_bytes());
+        bytes[0x00..0x05].copy_from_slice(&SUPERBLOCK_MAGIC);
+        bytes[0x05] = SUPERBLOCK_VERSION;
+        bytes[0x06..0x08].copy_from_slice(&(crate::BLOCK_SIZE as u16).to_le_bytes());
+        bytes[0x08..0x0C].copy_from_slice(&self.fields.total_blocks.to_le_bytes());
+        bytes[0x0C..0x10].copy_from_slice(&self.fields.free_list_head.to_le_bytes());
+        bytes[0x10..0x14].copy_from_slice(&self.fields.integrity_chain_head.to_le_bytes());
+        bytes[0x14..0x18].copy_from_slice(&self.fields.redirection_table_start.to_le_bytes());
+        bytes[0x18..0x1C].copy_from_slice(&self.fields.redirection_table_length.to_le_bytes());
+        bytes[0x1C..0x20].copy_from_slice(&self.fields.file_table_start.to_le_bytes());
+        bytes[0x20..0x24].copy_from_slice(&self.fields.file_table_length.to_le_bytes());
+        bytes[0x24] = self.fields.flags;
+        bytes[0x25] = self.fields.quant_profile;
 
-        let checksum = superblock_crc32(&bytes);
-        bytes[SUPERBLOCK_CHECKSUM_OFFSET..SUPERBLOCK_CHECKSUM_OFFSET + 4]
-            .copy_from_slice(&checksum.to_le_bytes());
+        let crc = superblock_crc32(&bytes);
+        bytes[SUPERBLOCK_CRC_OFFSET..SUPERBLOCK_CRC_OFFSET + 4]
+            .copy_from_slice(&crc.to_le_bytes());
         bytes
     }
 
@@ -112,76 +115,84 @@ impl Superblock {
             });
         }
 
-        if bytes[0..5] != SUPERBLOCK_MAGIC {
+        if bytes[0x00..0x05] != SUPERBLOCK_MAGIC {
             return Err(IntegrityError::InvalidMagic {
                 context: "superblock",
             });
         }
 
-        let version = u16::from_le_bytes([bytes[0x05], bytes[0x06]]);
+        let version = bytes[0x05];
         if version != SUPERBLOCK_VERSION {
             return Err(IntegrityError::UnsupportedVersion(version));
         }
 
-        let block_size = u16::from_le_bytes([bytes[0x07], bytes[0x08]]) as usize;
+        let block_size = u16::from_le_bytes([bytes[0x06], bytes[0x07]]) as usize;
         if block_size != crate::BLOCK_SIZE {
             return Err(IntegrityError::UnexpectedBlockSize(block_size));
         }
 
-        let expected_checksum = u32::from_le_bytes([
-            bytes[SUPERBLOCK_CHECKSUM_OFFSET],
-            bytes[SUPERBLOCK_CHECKSUM_OFFSET + 1],
-            bytes[SUPERBLOCK_CHECKSUM_OFFSET + 2],
-            bytes[SUPERBLOCK_CHECKSUM_OFFSET + 3],
-        ]);
-        let actual_checksum = superblock_crc32(bytes);
-        if expected_checksum != actual_checksum {
+        let expected_crc = u32::from_le_bytes(
+            bytes[SUPERBLOCK_CRC_OFFSET..SUPERBLOCK_CRC_OFFSET + 4]
+                .try_into()
+                .unwrap(),
+        );
+        let actual_crc = superblock_crc32(bytes);
+        if expected_crc != actual_crc {
             return Err(IntegrityError::ChecksumMismatch {
-                expected: expected_checksum,
-                actual: actual_checksum,
+                expected: expected_crc,
+                actual: actual_crc,
             });
         }
 
         Ok(Self {
             fields: SuperblockFields {
-                total_blocks: u32::from_le_bytes(bytes[0x09..0x0D].try_into().unwrap()),
-                free_list_head: u32::from_le_bytes(bytes[0x0D..0x11].try_into().unwrap()),
-                table_directory_block: u32::from_le_bytes(bytes[0x11..0x15].try_into().unwrap()),
-                integrity_chain_head: u32::from_le_bytes(bytes[0x15..0x19].try_into().unwrap()),
-                wal_region_start: u32::from_le_bytes(bytes[0x19..0x1D].try_into().unwrap()),
-                wal_region_length: u32::from_le_bytes(bytes[0x1D..0x21].try_into().unwrap()),
-                shadow_block: u32::from_le_bytes(bytes[0x21..0x25].try_into().unwrap()),
-                pending_target_block: u32::from_le_bytes(
-                    bytes[PENDING_TARGET_BLOCK_OFFSET..PENDING_TARGET_BLOCK_OFFSET + 4]
-                        .try_into()
-                        .unwrap(),
+                total_blocks: u32::from_le_bytes(bytes[0x08..0x0C].try_into().unwrap()),
+                free_list_head: u32::from_le_bytes(bytes[0x0C..0x10].try_into().unwrap()),
+                integrity_chain_head: u32::from_le_bytes(bytes[0x10..0x14].try_into().unwrap()),
+                redirection_table_start: u32::from_le_bytes(
+                    bytes[0x14..0x18].try_into().unwrap(),
                 ),
-                pending_target_crc32: u32::from_le_bytes(
-                    bytes[PENDING_TARGET_CRC32_OFFSET..PENDING_TARGET_CRC32_OFFSET + 4]
-                        .try_into()
-                        .unwrap(),
+                redirection_table_length: u32::from_le_bytes(
+                    bytes[0x18..0x1C].try_into().unwrap(),
                 ),
-                pending_metadata_op: PendingMetadataOp::from_raw(
-                    bytes[PENDING_METADATA_OP_OFFSET],
-                )?,
-                pending_metadata_block: u32::from_le_bytes(
-                    bytes[PENDING_METADATA_BLOCK_OFFSET..PENDING_METADATA_BLOCK_OFFSET + 4]
-                        .try_into()
-                        .unwrap(),
-                ),
-                pending_metadata_aux: u32::from_le_bytes(
-                    bytes[PENDING_METADATA_AUX_OFFSET..PENDING_METADATA_AUX_OFFSET + 4]
-                        .try_into()
-                        .unwrap(),
-                ),
-                generation: u64::from_le_bytes(
-                    bytes[GENERATION_OFFSET..GENERATION_OFFSET + 8]
-                        .try_into()
-                        .unwrap(),
-                ),
+                file_table_start: u32::from_le_bytes(bytes[0x1C..0x20].try_into().unwrap()),
+                file_table_length: u32::from_le_bytes(bytes[0x20..0x24].try_into().unwrap()),
+                flags: bytes[0x24],
+                quant_profile: bytes[0x25],
             },
         })
     }
+}
+
+/// Quant-profile byte: each bit indicates a quant type present in the
+/// tensor map for the `status` command.
+pub fn encode_quant_profile(types: &[GgufQuantType]) -> u8 {
+    let mut profile = 0_u8;
+    for qt in types {
+        profile |= match qt {
+            GgufQuantType::Q8_0 => 0x01,
+            GgufQuantType::Q6K => 0x02,
+            GgufQuantType::Q5K => 0x04,
+            GgufQuantType::Q4K => 0x08,
+            GgufQuantType::Q3K => 0x10,
+            GgufQuantType::F16 => 0x20,
+            GgufQuantType::F32 => 0x40,
+            _ => 0x00,
+        };
+    }
+    profile
+}
+
+pub fn decode_quant_profile(profile: u8) -> Vec<GgufQuantType> {
+    let mut types = Vec::new();
+    if profile & 0x01 != 0 { types.push(GgufQuantType::Q8_0); }
+    if profile & 0x02 != 0 { types.push(GgufQuantType::Q6K); }
+    if profile & 0x04 != 0 { types.push(GgufQuantType::Q5K); }
+    if profile & 0x08 != 0 { types.push(GgufQuantType::Q4K); }
+    if profile & 0x10 != 0 { types.push(GgufQuantType::Q3K); }
+    if profile & 0x20 != 0 { types.push(GgufQuantType::F16); }
+    if profile & 0x40 != 0 { types.push(GgufQuantType::F32); }
+    types
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -290,7 +301,7 @@ pub enum IntegrityError {
     #[error("invalid magic for {context}")]
     InvalidMagic { context: &'static str },
     #[error("unsupported superblock version {0}")]
-    UnsupportedVersion(u16),
+    UnsupportedVersion(u8),
     #[error("unexpected block size {0}")]
     UnexpectedBlockSize(usize),
     #[error("superblock checksum mismatch: expected {expected:#x}, got {actual:#x}")]
@@ -299,14 +310,10 @@ pub enum IntegrityError {
     TooManyIntegrityEntries(usize),
     #[error("integrity entry count overflow: {0}")]
     EntryCountOverflow(u32),
-    #[error("unknown pending metadata op {0}")]
-    UnknownPendingMetadataOp(u8),
 }
 
 fn superblock_crc32(bytes: &[u8]) -> u32 {
-    let mut working = bytes.to_vec();
-    working[SUPERBLOCK_CHECKSUM_OFFSET..SUPERBLOCK_CHECKSUM_OFFSET + 4].fill(0);
     let mut hasher = Hasher::new();
-    hasher.update(&working);
+    hasher.update(&bytes[..SUPERBLOCK_CRC_RANGE_END]);
     hasher.finalize()
 }

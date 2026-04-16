@@ -1,6 +1,6 @@
 # Task 05: Superblock And Integrity
 
-Status: todo
+Status: done
 Depends on: 04-tensor-eligibility-and-map.md
 Spec refs: DESIGN-NEW.MD sections "5. Stego Device" (Superblock, Free List, Integrity Blocks)
 

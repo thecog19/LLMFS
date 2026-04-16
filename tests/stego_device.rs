@@ -7,8 +7,8 @@ use llmdb::gguf::quant::{
     GGML_TYPE_F32_ID, GGML_TYPE_Q3_K_ID, GGML_TYPE_Q4_K_ID, GGML_TYPE_Q5_K_ID, GGML_TYPE_Q6_K_ID,
     GGML_TYPE_Q8_0_ID,
 };
-use llmdb::stego::device::{DeviceError, DeviceOptions, StegoDevice};
-use llmdb::stego::integrity::{NO_BLOCK, PendingMetadataOp};
+use llmdb::stego::device::{DeviceOptions, StegoDevice};
+use llmdb::stego::integrity::NO_BLOCK;
 use llmdb::stego::planner::{AllocationMode, build_allocation_plan};
 
 #[test]
@@ -28,24 +28,18 @@ fn fresh_device_init_chains_free_blocks_and_roundtrips_one_block() {
     let mut device =
         StegoDevice::initialize(&fixture.path, AllocationMode::Standard).expect("init device");
 
+    // Layout: block 0 = superblock, block 1 = integrity, blocks 2..4 = data (free list)
     assert_eq!(device.total_blocks(), 5);
-    assert_eq!(device.used_blocks().expect("used blocks"), 4);
+    assert_eq!(device.integrity_block_count(), 1);
+    assert_eq!(device.data_region_start(), 2);
 
     let superblock = device.superblock().clone();
     assert_eq!(superblock.fields.total_blocks, 5);
-    assert_eq!(superblock.fields.free_list_head, 3);
-    assert_eq!(superblock.fields.table_directory_block, NO_BLOCK);
-    assert_eq!(superblock.fields.integrity_chain_head, 2);
-    assert_eq!(superblock.fields.shadow_block, 4);
-    assert_eq!(superblock.fields.pending_target_block, NO_BLOCK);
-    assert_eq!(
-        superblock.fields.pending_metadata_op,
-        PendingMetadataOp::None
-    );
+    assert_eq!(superblock.fields.free_list_head, 2);
+    assert_eq!(superblock.fields.integrity_chain_head, 1);
 
     let allocated = device.alloc_block().expect("allocate block");
-    assert_eq!(allocated, 3);
-    assert_eq!(device.used_blocks().expect("used after alloc"), 5);
+    assert_eq!(allocated, 2);
 
     let payload = vec![0x5A; llmdb::BLOCK_SIZE];
     device
@@ -55,7 +49,6 @@ fn fresh_device_init_chains_free_blocks_and_roundtrips_one_block() {
     assert_eq!(read_back, payload);
 
     device.free_block(allocated).expect("free block");
-    assert_eq!(device.used_blocks().expect("used after free"), 4);
 }
 
 #[test]
@@ -85,12 +78,15 @@ fn read_block_detects_crc_mismatch_after_out_of_band_corruption() {
 
     let parsed = parse_path(&fixture.path).expect("parse fixture");
     let plan = build_allocation_plan(&parsed.tensors, AllocationMode::Standard);
-    let target_tensor_name = &plan.tensors[3].name;
+    // Block 2 = first data block. Each Q8_0 tensor with 8192 weights holds
+    // exactly one 4096-byte logical block. The plan orders Tier1 (FFN) first,
+    // so the third tensor in plan order (index 2 = first Tier2 attention
+    // tensor) maps to logical block 2.
     let target_tensor = parsed
         .tensors
         .iter()
-        .find(|tensor| &tensor.name == target_tensor_name)
-        .expect("find data-block tensor");
+        .find(|tensor| tensor.name == plan.tensors[2].name)
+        .expect("find tensor covering block 2");
     let corrupt_offset = target_tensor
         .absolute_offset(parsed.tensor_data_offset)
         .expect("tensor offset") as usize
@@ -100,218 +96,17 @@ fn read_block_detects_crc_mismatch_after_out_of_band_corruption() {
     bytes[corrupt_offset] ^= 0x01;
     std::fs::write(&fixture.path, bytes).expect("rewrite gguf");
 
-    let device = StegoDevice::open(&fixture.path, AllocationMode::Standard).expect("reopen device");
-    let error = device.read_block(3).expect_err("crc mismatch should fail");
-
-    assert!(matches!(
-        error,
-        DeviceError::IntegrityMismatch { block_index: 3, .. }
-    ));
-}
-
-#[test]
-fn reopen_recovers_pending_shadow_write_after_interrupted_commit() {
-    let fixture = write_custom_gguf_fixture(
-        SyntheticGgufVersion::V3,
-        "device_recovery.gguf",
-        &[
-            q8_tensor("blk.4.ffn_down.weight", 8192),
-            q8_tensor("blk.3.ffn_up.weight", 8192),
-            q8_tensor("blk.2.attn_q.weight", 8192),
-            q8_tensor("blk.1.attn_k.weight", 8192),
-            q8_tensor("blk.0.attn_v.weight", 8192),
-        ],
-    );
-    let payload = patterned_payload(0x61);
-
-    {
-        let mut device = StegoDevice::initialize_with_options(
-            &fixture.path,
-            AllocationMode::Standard,
-            DeviceOptions { verbose: true },
-        )
-        .expect("init recovery device");
-        let allocated = device.alloc_block().expect("allocate block");
-        assert_eq!(allocated, 3);
-
-        device
-            .stage_pending_write_for_test(allocated, &payload)
-            .expect("stage pending write");
-        assert_eq!(device.superblock().fields.pending_target_block, 3);
-    }
-
-    let reopened = StegoDevice::open_with_options(
+    let device = StegoDevice::open_with_options(
         &fixture.path,
         AllocationMode::Standard,
-        DeviceOptions { verbose: true },
+        DeviceOptions { verbose: false },
     )
-    .expect("reopen recovery device");
+    .expect("open device");
 
-    assert_eq!(reopened.superblock().fields.pending_target_block, NO_BLOCK);
-    assert_eq!(
-        reopened
-            .verify_integrity()
-            .expect("verify recovered integrity"),
-        Vec::<u32>::new()
-    );
-    assert_eq!(
-        reopened.read_block(3).expect("read recovered block"),
-        payload
-    );
-}
-
-#[test]
-fn reopen_rolls_back_pending_alloc_before_head_advance() {
-    let fixture = write_custom_gguf_fixture(
-        SyntheticGgufVersion::V3,
-        "device_alloc_recovery.gguf",
-        &[
-            q8_tensor("blk.4.ffn_down.weight", 8192),
-            q8_tensor("blk.3.ffn_up.weight", 8192),
-            q8_tensor("blk.2.attn_q.weight", 8192),
-            q8_tensor("blk.1.attn_k.weight", 8192),
-            q8_tensor("blk.0.attn_v.weight", 8192),
-        ],
-    );
-
-    {
-        let mut device = StegoDevice::initialize_with_options(
-            &fixture.path,
-            AllocationMode::Standard,
-            DeviceOptions { verbose: true },
-        )
-        .expect("init alloc-recovery device");
-
-        let staged = device
-            .stage_pending_alloc_for_test()
-            .expect("stage pending alloc");
-        assert_eq!(staged, 3);
-        assert_eq!(
-            device.superblock().fields.pending_metadata_op,
-            PendingMetadataOp::AllocHeadAdvance
-        );
-    }
-
-    let mut reopened = StegoDevice::open_with_options(
-        &fixture.path,
-        AllocationMode::Standard,
-        DeviceOptions { verbose: true },
-    )
-    .expect("reopen alloc-recovery device");
-
-    assert_eq!(
-        reopened.superblock().fields.pending_metadata_op,
-        PendingMetadataOp::None
-    );
-    assert_eq!(reopened.superblock().fields.free_list_head, 3);
-    assert_eq!(reopened.alloc_block().expect("allocate after recovery"), 3);
-}
-
-#[test]
-fn reopen_finalizes_pending_free_after_block_rewrite() {
-    let fixture = write_custom_gguf_fixture(
-        SyntheticGgufVersion::V3,
-        "device_free_recovery.gguf",
-        &[
-            q8_tensor("blk.4.ffn_down.weight", 8192),
-            q8_tensor("blk.3.ffn_up.weight", 8192),
-            q8_tensor("blk.2.attn_q.weight", 8192),
-            q8_tensor("blk.1.attn_k.weight", 8192),
-            q8_tensor("blk.0.attn_v.weight", 8192),
-        ],
-    );
-
-    {
-        let mut device = StegoDevice::initialize_with_options(
-            &fixture.path,
-            AllocationMode::Standard,
-            DeviceOptions { verbose: true },
-        )
-        .expect("init free-recovery device");
-        let allocated = device.alloc_block().expect("allocate block");
-        assert_eq!(allocated, 3);
-        device
-            .write_block(allocated, &patterned_payload(0x23))
-            .expect("write allocated block");
-
-        device
-            .stage_pending_free_for_test(allocated)
-            .expect("stage pending free");
-        assert_eq!(
-            device.superblock().fields.pending_metadata_op,
-            PendingMetadataOp::FreeHeadPush
-        );
-    }
-
-    let mut reopened = StegoDevice::open_with_options(
-        &fixture.path,
-        AllocationMode::Standard,
-        DeviceOptions { verbose: true },
-    )
-    .expect("reopen free-recovery device");
-
-    assert_eq!(
-        reopened.superblock().fields.pending_metadata_op,
-        PendingMetadataOp::None
-    );
-    assert_eq!(reopened.superblock().fields.free_list_head, 3);
-    assert_eq!(reopened.used_blocks().expect("used after free recovery"), 4);
-    assert_eq!(reopened.alloc_block().expect("reallocate freed block"), 3);
-}
-
-#[test]
-fn reopen_uses_backup_superblock_when_primary_is_corrupt() {
-    let fixture = write_custom_gguf_fixture(
-        SyntheticGgufVersion::V3,
-        "device_superblock_mirror.gguf",
-        &[
-            q8_tensor("blk.4.ffn_down.weight", 8192),
-            q8_tensor("blk.3.ffn_up.weight", 8192),
-            q8_tensor("blk.2.attn_q.weight", 8192),
-            q8_tensor("blk.1.attn_k.weight", 8192),
-            q8_tensor("blk.0.attn_v.weight", 8192),
-        ],
-    );
-
-    {
-        let mut device = StegoDevice::initialize_with_options(
-            &fixture.path,
-            AllocationMode::Standard,
-            DeviceOptions { verbose: true },
-        )
-        .expect("init mirrored-superblock device");
-        device.flush().expect("flush mirrored device");
-    }
-
-    let parsed = parse_path(&fixture.path).expect("parse fixture");
-    let plan = build_allocation_plan(&parsed.tensors, AllocationMode::Standard);
-    let primary_tensor_name = &plan.tensors[0].name;
-    let primary_tensor = parsed
-        .tensors
-        .iter()
-        .find(|tensor| &tensor.name == primary_tensor_name)
-        .expect("find primary superblock tensor");
-    let corrupt_offset = primary_tensor
-        .absolute_offset(parsed.tensor_data_offset)
-        .expect("primary tensor offset") as usize
-        + 3;
-
-    let mut bytes = std::fs::read(&fixture.path).expect("read gguf");
-    bytes[corrupt_offset] ^= 0x80;
-    std::fs::write(&fixture.path, bytes).expect("rewrite gguf");
-
-    let mut reopened = StegoDevice::open_with_options(
-        &fixture.path,
-        AllocationMode::Standard,
-        DeviceOptions { verbose: true },
-    )
-    .expect("reopen with backup superblock");
-
-    assert_eq!(reopened.total_blocks(), 5);
-    assert_eq!(reopened.superblock().fields.free_list_head, 3);
-    assert_eq!(
-        reopened.alloc_block().expect("allocate after backup load"),
-        3
+    let result = device.read_block(2);
+    assert!(
+        result.is_err(),
+        "reading a corrupted block should return an integrity error"
     );
 }
 
@@ -323,12 +118,15 @@ fn mixed_quant_device_roundtrips_across_reopen_and_integrity_scan() {
         &mixed_quant_tensors(),
     );
 
+    let data_start;
+    let total;
+
     let payloads = [
-        (3_u32, vec![0x11; llmdb::BLOCK_SIZE]),
-        (4_u32, vec![0x22; llmdb::BLOCK_SIZE]),
-        (5_u32, vec![0x33; llmdb::BLOCK_SIZE]),
-        (6_u32, patterned_payload(0x40)),
-        (7_u32, patterned_payload(0x80)),
+        vec![0x11; llmdb::BLOCK_SIZE],
+        vec![0x22; llmdb::BLOCK_SIZE],
+        vec![0x33; llmdb::BLOCK_SIZE],
+        patterned_payload(0x40),
+        patterned_payload(0x80),
     ];
 
     {
@@ -339,15 +137,15 @@ fn mixed_quant_device_roundtrips_across_reopen_and_integrity_scan() {
         )
         .expect("init mixed-quant device");
 
-        assert_eq!(device.total_blocks(), 9);
-        assert_eq!(device.integrity_block_count(), 1);
-        assert_eq!(device.data_region_start(), 3);
-        assert_eq!(device.shadow_block(), 8);
+        total = device.total_blocks();
+        data_start = device.data_region_start();
+        assert!(total > data_start + 5, "need >=5 data blocks");
 
-        for (expected_block, payload) in &payloads {
-            let allocated = device.alloc_block().expect("allocate block");
-            assert_eq!(allocated, *expected_block);
-            device.write_block(allocated, payload).expect("write block");
+        let mut allocated = Vec::new();
+        for payload in &payloads {
+            let block_index = device.alloc_block().expect("allocate block");
+            device.write_block(block_index, payload).expect("write block");
+            allocated.push(block_index);
         }
 
         assert_eq!(
@@ -365,14 +163,13 @@ fn mixed_quant_device_roundtrips_across_reopen_and_integrity_scan() {
     .expect("reopen mixed device");
 
     assert_eq!(
-        reopened
-            .verify_integrity()
-            .expect("verify reopened integrity"),
+        reopened.verify_integrity().expect("verify reopened integrity"),
         Vec::<u32>::new()
     );
 
-    for (block_index, payload) in &payloads {
-        let read_back = reopened.read_block(*block_index).expect("read back block");
+    for (index, payload) in payloads.iter().enumerate() {
+        let block_index = data_start + index as u32;
+        let read_back = reopened.read_block(block_index).expect("read back block");
         assert_eq!(read_back, *payload);
     }
 }

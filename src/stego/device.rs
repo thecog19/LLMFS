@@ -10,13 +10,12 @@ use crate::gguf::parser::{self, GgufFile};
 use crate::gguf::quant::GgufQuantType;
 use crate::stego::integrity::{
     ENTRIES_PER_INTEGRITY_BLOCK, FreeListBlock, IntegrityBlock, IntegrityError, NO_BLOCK,
-    PendingMetadataOp, Superblock, SuperblockFields,
+    Superblock, SuperblockFields,
 };
 use crate::stego::packing::{self, PackingError};
 use crate::stego::planner::{AllocationMode, AllocationPlan, build_allocation_plan};
 
-const PRIMARY_SUPERBLOCK_BLOCK: u32 = 0;
-const BACKUP_SUPERBLOCK_BLOCK: u32 = 1;
+const SUPERBLOCK_BLOCK: u32 = 0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceBootstrap {
@@ -71,14 +70,11 @@ impl StegoDevice {
     ) -> Result<Self, DeviceError> {
         let mut device = Self::open_internal(path, mode, options)?;
         device.superblock = device.load_superblock()?;
-        device.recover_if_needed()?;
         device.log_verbose(format!(
-            "opened device: total_blocks={}, integrity_head={}, free_list_head={}, shadow_block={}, generation={}",
+            "opened device: total_blocks={}, integrity_head={}, free_list_head={}",
             device.superblock.fields.total_blocks,
             device.superblock.fields.integrity_chain_head,
             device.superblock.fields.free_list_head,
-            device.superblock.fields.shadow_block,
-            device.superblock.fields.generation
         ));
         Ok(device)
     }
@@ -100,11 +96,7 @@ impl StegoDevice {
     }
 
     pub fn data_region_start(&self) -> u32 {
-        2 + self.integrity_block_count()
-    }
-
-    pub fn shadow_block(&self) -> u32 {
-        self.superblock.fields.shadow_block
+        1 + self.integrity_block_count()
     }
 
     pub fn read_block(&self, block_index: u32) -> Result<Vec<u8>, DeviceError> {
@@ -124,17 +116,10 @@ impl StegoDevice {
             });
         }
 
-        let shadow_block = self.shadow_block_index()?;
-        let pending_crc = self.stage_pending_write(block_index, data)?;
         self.write_logical_block_raw(block_index, data)?;
         self.update_block_crc(block_index, data)?;
         self.flush()?;
-        self.clear_pending_write()?;
         self.log_verbose(format!("wrote data block {}", block_index));
-        self.log_verbose(format!(
-            "committed shadow block {} into data block {} with crc {pending_crc:#x}",
-            shadow_block, block_index
-        ));
         Ok(())
     }
 
@@ -147,14 +132,8 @@ impl StegoDevice {
         let head_block = self.read_logical_block_raw(head)?;
         self.verify_block_crc(head, &head_block)?;
         let free_block = FreeListBlock::decode(&head_block)?;
-        self.stage_pending_metadata(
-            PendingMetadataOp::AllocHeadAdvance,
-            head,
-            free_block.next_free_block,
-        )?;
         self.superblock.fields.free_list_head = free_block.next_free_block;
-        self.clear_pending_metadata_fields();
-        self.persist_superblocks()?;
+        self.persist_superblock()?;
         self.log_verbose(format!(
             "allocated block {} next_free={}",
             head, self.superblock.fields.free_list_head
@@ -166,15 +145,13 @@ impl StegoDevice {
         self.ensure_data_block(block_index)?;
 
         let previous_head = self.superblock.fields.free_list_head;
-        self.stage_pending_metadata(PendingMetadataOp::FreeHeadPush, block_index, previous_head)?;
         let free_block = FreeListBlock {
             next_free_block: previous_head,
         };
         let bytes = free_block.encode();
         self.write_block(block_index, &bytes)?;
         self.superblock.fields.free_list_head = block_index;
-        self.clear_pending_metadata_fields();
-        self.persist_superblocks()?;
+        self.persist_superblock()?;
         self.log_verbose(format!(
             "freed block {} new_free_head={}",
             block_index, self.superblock.fields.free_list_head
@@ -200,7 +177,7 @@ impl StegoDevice {
 
     pub fn verify_integrity(&self) -> Result<Vec<u32>, DeviceError> {
         let mut corrupted = Vec::new();
-        for block_index in self.data_region_start()..self.shadow_block_index()? {
+        for block_index in self.data_region_start()..self.total_blocks() {
             let bytes = self.read_logical_block_raw(block_index)?;
             match self.verify_block_crc(block_index, &bytes) {
                 Ok(()) => {}
@@ -209,14 +186,6 @@ impl StegoDevice {
             }
         }
         Ok(corrupted)
-    }
-
-    pub fn reserve_all_data_blocks(&mut self) -> Result<(), DeviceError> {
-        self.superblock.fields.free_list_head = NO_BLOCK;
-        self.clear_pending_metadata_fields();
-        self.persist_superblocks()?;
-        self.log_verbose("reserved entire data region for linear ownership");
-        Ok(())
     }
 
     pub fn flush(&mut self) -> Result<(), DeviceError> {
@@ -248,17 +217,13 @@ impl StegoDevice {
             superblock: Superblock::new(SuperblockFields {
                 total_blocks: 0,
                 free_list_head: NO_BLOCK,
-                table_directory_block: NO_BLOCK,
                 integrity_chain_head: NO_BLOCK,
-                wal_region_start: NO_BLOCK,
-                wal_region_length: 0,
-                shadow_block: NO_BLOCK,
-                pending_target_block: NO_BLOCK,
-                pending_target_crc32: 0,
-                pending_metadata_op: PendingMetadataOp::None,
-                pending_metadata_block: NO_BLOCK,
-                pending_metadata_aux: NO_BLOCK,
-                generation: 0,
+                redirection_table_start: NO_BLOCK,
+                redirection_table_length: 0,
+                file_table_start: NO_BLOCK,
+                file_table_length: 0,
+                flags: 0,
+                quant_profile: 0,
             }),
             verbose: options.verbose,
         };
@@ -276,47 +241,40 @@ impl StegoDevice {
         let total_blocks = u32::try_from(self.plan.total_capacity_bytes / crate::BLOCK_SIZE as u64)
             .map_err(|_| DeviceError::CapacityOverflow(self.plan.total_capacity_bytes))?;
         let integrity_count = integrity_block_count(total_blocks);
-        let data_region_start = 2 + integrity_count;
-        let shadow_block = total_blocks.saturating_sub(1);
-        if shadow_block <= data_region_start {
-            return Err(DeviceError::InsufficientCapacityForShadow {
+        let data_region_start = 1 + integrity_count;
+
+        if data_region_start >= total_blocks {
+            return Err(DeviceError::InsufficientCapacityForMetadata {
                 total_blocks,
                 integrity_blocks: integrity_count,
             });
         }
-        let free_list_head = if data_region_start < shadow_block {
-            data_region_start
-        } else {
-            NO_BLOCK
-        };
+
+        let free_list_head = data_region_start;
 
         self.superblock = Superblock::new(SuperblockFields {
             total_blocks,
             free_list_head,
-            table_directory_block: NO_BLOCK,
-            integrity_chain_head: if integrity_count > 0 {
-                BACKUP_SUPERBLOCK_BLOCK + 1
+            integrity_chain_head: if integrity_count > 0 { 1 } else { NO_BLOCK },
+            redirection_table_start: NO_BLOCK,
+            redirection_table_length: 0,
+            file_table_start: NO_BLOCK,
+            file_table_length: 0,
+            flags: if self.plan.mode == AllocationMode::Lobotomy {
+                0x01
             } else {
-                NO_BLOCK
+                0x00
             },
-            wal_region_start: NO_BLOCK,
-            wal_region_length: 0,
-            shadow_block,
-            pending_target_block: NO_BLOCK,
-            pending_target_crc32: 0,
-            pending_metadata_op: PendingMetadataOp::None,
-            pending_metadata_block: NO_BLOCK,
-            pending_metadata_aux: NO_BLOCK,
-            generation: 0,
+            quant_profile: 0,
         });
 
         self.log_verbose(format!(
-            "formatting device: total_blocks={}, integrity_blocks={}, data_region_start={}, shadow_block={}",
-            total_blocks, integrity_count, data_region_start, shadow_block
+            "formatting device: total_blocks={}, integrity_blocks={}, data_region_start={}",
+            total_blocks, integrity_count, data_region_start,
         ));
 
-        for block_index in data_region_start..shadow_block {
-            let next = if block_index + 1 < shadow_block {
+        for block_index in data_region_start..total_blocks {
+            let next = if block_index + 1 < total_blocks {
                 block_index + 1
             } else {
                 NO_BLOCK
@@ -328,8 +286,8 @@ impl StegoDevice {
             self.write_logical_block_raw(block_index, &bytes)?;
         }
 
-        self.initialize_integrity_blocks(integrity_count, data_region_start, shadow_block)?;
-        self.persist_superblocks()?;
+        self.initialize_integrity_blocks(integrity_count, data_region_start, total_blocks)?;
+        self.persist_superblock()?;
         Ok(())
     }
 
@@ -337,9 +295,9 @@ impl StegoDevice {
         &mut self,
         integrity_count: u32,
         data_region_start: u32,
-        shadow_block: u32,
+        total_blocks: u32,
     ) -> Result<(), DeviceError> {
-        let data_block_count = shadow_block.saturating_sub(data_region_start);
+        let data_block_count = total_blocks.saturating_sub(data_region_start);
 
         for integrity_offset in 0..integrity_count {
             let first_data_block =
@@ -347,89 +305,40 @@ impl StegoDevice {
             let remaining = data_block_count
                 .saturating_sub(integrity_offset * ENTRIES_PER_INTEGRITY_BLOCK as u32);
             let entry_count = remaining.min(ENTRIES_PER_INTEGRITY_BLOCK as u32);
-            let mut crc32_entries = Vec::with_capacity(entry_count as usize);
-            for entry_offset in 0..entry_count {
-                let block_index = first_data_block + entry_offset;
-                let next = if block_index + 1 < shadow_block {
-                    block_index + 1
-                } else {
-                    NO_BLOCK
-                };
-                let bytes = FreeListBlock {
-                    next_free_block: next,
-                }
-                .encode();
-                crc32_entries.push(crc32(&bytes));
-            }
             let block = IntegrityBlock {
                 first_data_block,
                 entry_count,
                 next_integrity_block: if integrity_offset + 1 < integrity_count {
-                    BACKUP_SUPERBLOCK_BLOCK + 1 + integrity_offset + 1
+                    1 + integrity_offset + 1
                 } else {
                     NO_BLOCK
                 },
-                crc32_entries,
+                crc32_entries: vec![0_u32; entry_count as usize],
             };
 
             let encoded = block.encode()?;
-            self.write_logical_block_raw(BACKUP_SUPERBLOCK_BLOCK + 1 + integrity_offset, &encoded)?;
+            self.write_logical_block_raw(1 + integrity_offset, &encoded)?;
+        }
+
+        for block_index in data_region_start..total_blocks {
+            let bytes = self.read_logical_block_raw(block_index)?;
+            self.update_block_crc(block_index, &bytes)?;
         }
 
         Ok(())
     }
 
-    fn persist_superblocks(&mut self) -> Result<(), DeviceError> {
-        self.superblock.fields.generation = self.superblock.fields.generation.saturating_add(1);
+    fn persist_superblock(&mut self) -> Result<(), DeviceError> {
         let bytes = self.superblock.encode();
-        self.log_verbose(format!(
-            "persisting mirrored superblocks generation={}",
-            self.superblock.fields.generation
-        ));
-        self.write_logical_block_raw(PRIMARY_SUPERBLOCK_BLOCK, &bytes)?;
-        self.flush()?;
-        self.write_logical_block_raw(BACKUP_SUPERBLOCK_BLOCK, &bytes)?;
+        self.log_verbose("persisting superblock");
+        self.write_logical_block_raw(SUPERBLOCK_BLOCK, &bytes)?;
         self.flush()?;
         Ok(())
     }
 
     fn load_superblock(&self) -> Result<Superblock, DeviceError> {
-        let primary_bytes = self.read_stego_bytes(0, crate::BLOCK_SIZE)?;
-        let backup_bytes = self.read_stego_bytes(crate::BLOCK_SIZE, crate::BLOCK_SIZE)?;
-        let primary = Superblock::decode(&primary_bytes);
-        let backup = Superblock::decode(&backup_bytes);
-
-        match (primary, backup) {
-            (Ok(primary), Ok(backup)) => {
-                if primary.fields.generation >= backup.fields.generation {
-                    self.log_verbose(format!(
-                        "loaded primary superblock generation={} backup_generation={}",
-                        primary.fields.generation, backup.fields.generation
-                    ));
-                    Ok(primary)
-                } else {
-                    self.log_verbose(format!(
-                        "loaded backup superblock generation={} primary_generation={}",
-                        backup.fields.generation, primary.fields.generation
-                    ));
-                    Ok(backup)
-                }
-            }
-            (Ok(primary), Err(error)) => {
-                self.log_verbose(format!("backup superblock invalid, using primary: {error}"));
-                Ok(primary)
-            }
-            (Err(error), Ok(backup)) => {
-                self.log_verbose(format!("primary superblock invalid, using backup: {error}"));
-                Ok(backup)
-            }
-            (Err(primary_error), Err(backup_error)) => {
-                Err(DeviceError::AllSuperblockMirrorsCorrupt {
-                    primary: primary_error,
-                    backup: backup_error,
-                })
-            }
-        }
+        let bytes = self.read_stego_bytes(0, crate::BLOCK_SIZE)?;
+        Superblock::decode(&bytes).map_err(|error| DeviceError::Integrity(error))
     }
 
     fn ensure_valid_block(&self, block_index: u32) -> Result<(), DeviceError> {
@@ -451,197 +360,6 @@ impl StegoDevice {
                 data_region_start: self.data_region_start(),
             });
         }
-        let shadow_block = self.shadow_block_index()?;
-        if block_index >= shadow_block {
-            return Err(DeviceError::ReservedShadowBlock {
-                index: block_index,
-                shadow_block,
-            });
-        }
-        Ok(())
-    }
-
-    fn shadow_block_index(&self) -> Result<u32, DeviceError> {
-        let shadow_block = self.superblock.fields.shadow_block;
-        if shadow_block == NO_BLOCK {
-            return Err(DeviceError::MissingShadowBlock);
-        }
-        Ok(shadow_block)
-    }
-
-    fn stage_pending_write(&mut self, block_index: u32, data: &[u8]) -> Result<u32, DeviceError> {
-        let shadow_block = self.shadow_block_index()?;
-        let pending_crc = crc32(data);
-
-        self.write_logical_block_raw(shadow_block, data)?;
-        self.flush()?;
-
-        self.superblock.fields.pending_target_block = block_index;
-        self.superblock.fields.pending_target_crc32 = pending_crc;
-        self.persist_superblocks()?;
-
-        self.log_verbose(format!(
-            "staged pending write for block {} via shadow block {} crc={pending_crc:#x}",
-            block_index, shadow_block
-        ));
-
-        Ok(pending_crc)
-    }
-
-    fn clear_pending_write(&mut self) -> Result<(), DeviceError> {
-        self.superblock.fields.pending_target_block = NO_BLOCK;
-        self.superblock.fields.pending_target_crc32 = 0;
-        self.persist_superblocks()?;
-        self.log_verbose("cleared pending write marker");
-        Ok(())
-    }
-
-    fn recover_if_needed(&mut self) -> Result<(), DeviceError> {
-        self.recover_pending_data_write()?;
-        self.recover_pending_metadata()?;
-        Ok(())
-    }
-
-    fn recover_pending_data_write(&mut self) -> Result<(), DeviceError> {
-        let target_block = self.superblock.fields.pending_target_block;
-        if target_block == NO_BLOCK {
-            return Ok(());
-        }
-
-        self.ensure_data_block(target_block)?;
-        let shadow_block = self.shadow_block_index()?;
-        let shadow_bytes = self.read_logical_block_raw(shadow_block)?;
-        let actual_crc = crc32(&shadow_bytes);
-        let expected_crc = self.superblock.fields.pending_target_crc32;
-
-        if actual_crc != expected_crc {
-            return Err(DeviceError::PendingWriteCrcMismatch {
-                target_block,
-                expected: expected_crc,
-                actual: actual_crc,
-            });
-        }
-
-        self.log_verbose(format!(
-            "replaying pending write from shadow block {} into block {}",
-            shadow_block, target_block
-        ));
-        self.write_logical_block_raw(target_block, &shadow_bytes)?;
-        self.update_block_crc(target_block, &shadow_bytes)?;
-        self.flush()?;
-        self.clear_pending_write()?;
-        Ok(())
-    }
-
-    fn recover_pending_metadata(&mut self) -> Result<(), DeviceError> {
-        match self.superblock.fields.pending_metadata_op {
-            PendingMetadataOp::None => Ok(()),
-            PendingMetadataOp::AllocHeadAdvance => {
-                let block_index = self.superblock.fields.pending_metadata_block;
-                let next_head = self.superblock.fields.pending_metadata_aux;
-                self.log_verbose(format!(
-                    "rolling back pending alloc: block={} next_head={}",
-                    block_index, next_head
-                ));
-                self.superblock.fields.free_list_head = block_index;
-                self.clear_pending_metadata_fields();
-                self.persist_superblocks()?;
-                Ok(())
-            }
-            PendingMetadataOp::FreeHeadPush => {
-                let block_index = self.superblock.fields.pending_metadata_block;
-                let previous_head = self.superblock.fields.pending_metadata_aux;
-                self.ensure_data_block(block_index)?;
-
-                let free_bytes = FreeListBlock {
-                    next_free_block: previous_head,
-                }
-                .encode();
-                self.log_verbose(format!(
-                    "finalizing pending free: block={} previous_head={}",
-                    block_index, previous_head
-                ));
-                self.write_logical_block_raw(block_index, &free_bytes)?;
-                self.update_block_crc(block_index, &free_bytes)?;
-                self.flush()?;
-
-                self.superblock.fields.free_list_head = block_index;
-                self.clear_pending_metadata_fields();
-                self.persist_superblocks()?;
-                Ok(())
-            }
-        }
-    }
-
-    fn stage_pending_metadata(
-        &mut self,
-        operation: PendingMetadataOp,
-        block_index: u32,
-        auxiliary: u32,
-    ) -> Result<(), DeviceError> {
-        self.superblock.fields.pending_metadata_op = operation;
-        self.superblock.fields.pending_metadata_block = block_index;
-        self.superblock.fields.pending_metadata_aux = auxiliary;
-        self.persist_superblocks()?;
-        self.log_verbose(format!(
-            "staged pending metadata op {:?} block={} aux={}",
-            operation, block_index, auxiliary
-        ));
-        Ok(())
-    }
-
-    fn clear_pending_metadata_fields(&mut self) {
-        self.superblock.fields.pending_metadata_op = PendingMetadataOp::None;
-        self.superblock.fields.pending_metadata_block = NO_BLOCK;
-        self.superblock.fields.pending_metadata_aux = NO_BLOCK;
-    }
-
-    #[doc(hidden)]
-    pub fn stage_pending_write_for_test(
-        &mut self,
-        block_index: u32,
-        data: &[u8],
-    ) -> Result<(), DeviceError> {
-        self.ensure_data_block(block_index)?;
-        if data.len() != crate::BLOCK_SIZE {
-            return Err(DeviceError::InvalidBlockWriteLength {
-                expected: crate::BLOCK_SIZE,
-                actual: data.len(),
-            });
-        }
-
-        self.stage_pending_write(block_index, data)?;
-        Ok(())
-    }
-
-    #[doc(hidden)]
-    pub fn stage_pending_alloc_for_test(&mut self) -> Result<u32, DeviceError> {
-        let head = self.superblock.fields.free_list_head;
-        if head == NO_BLOCK {
-            return Err(DeviceError::OutOfSpace);
-        }
-
-        let head_block = self.read_logical_block_raw(head)?;
-        self.verify_block_crc(head, &head_block)?;
-        let free_block = FreeListBlock::decode(&head_block)?;
-        self.stage_pending_metadata(
-            PendingMetadataOp::AllocHeadAdvance,
-            head,
-            free_block.next_free_block,
-        )?;
-        Ok(head)
-    }
-
-    #[doc(hidden)]
-    pub fn stage_pending_free_for_test(&mut self, block_index: u32) -> Result<(), DeviceError> {
-        self.ensure_data_block(block_index)?;
-        let previous_head = self.superblock.fields.free_list_head;
-        self.stage_pending_metadata(PendingMetadataOp::FreeHeadPush, block_index, previous_head)?;
-        let free_bytes = FreeListBlock {
-            next_free_block: previous_head,
-        }
-        .encode();
-        self.write_block(block_index, &free_bytes)?;
         Ok(())
     }
 
@@ -894,14 +612,13 @@ impl StegoDevice {
 
         let zero_based = block_index - self.data_region_start();
         let integrity_offset = zero_based / ENTRIES_PER_INTEGRITY_BLOCK as u32;
-        let integrity_block_index = BACKUP_SUPERBLOCK_BLOCK + 1 + integrity_offset;
+        let integrity_block_index = 1 + integrity_offset;
         let entry_index = (zero_based % ENTRIES_PER_INTEGRITY_BLOCK as u32) as usize;
         Ok((integrity_block_index, entry_index))
     }
 
     fn tracks_crc_for_block(&self, block_index: u32) -> Result<bool, DeviceError> {
-        let shadow_block = self.shadow_block_index()?;
-        Ok(block_index >= self.data_region_start() && block_index < shadow_block)
+        Ok(block_index >= self.data_region_start() && block_index < self.total_blocks())
     }
 
     fn log_verbose(&self, message: impl AsRef<str>) {
@@ -1060,7 +777,7 @@ fn encode_blockwise(
 fn integrity_block_count(total_blocks: u32) -> u32 {
     let mut integrity_count = 0_u32;
     loop {
-        let data_blocks = total_blocks.saturating_sub(3 + integrity_count);
+        let data_blocks = total_blocks.saturating_sub(1 + integrity_count);
         let needed = if data_blocks == 0 {
             0
         } else {
@@ -1087,19 +804,14 @@ pub enum DeviceError {
     Parse(#[from] parser::ParseError),
     #[error("metadata error: {0}")]
     Integrity(#[from] IntegrityError),
-    #[error("no valid mirrored superblock found: primary={primary}, backup={backup}")]
-    AllSuperblockMirrorsCorrupt {
-        primary: IntegrityError,
-        backup: IntegrityError,
-    },
     #[error("packing error: {0}")]
     Packing(#[from] PackingError),
     #[error("insufficient capacity: {0} bytes")]
     InsufficientCapacity(u64),
     #[error(
-        "insufficient capacity for shadow layout: total_blocks={total_blocks}, integrity_blocks={integrity_blocks}"
+        "insufficient capacity for metadata: total_blocks={total_blocks}, integrity_blocks={integrity_blocks}"
     )]
-    InsufficientCapacityForShadow {
+    InsufficientCapacityForMetadata {
         total_blocks: u32,
         integrity_blocks: u32,
     },
@@ -1124,8 +836,6 @@ pub enum DeviceError {
     BlockOutOfRange { index: u32, total_blocks: u32 },
     #[error("block {index} is reserved metadata, first data block is {data_region_start}")]
     ReservedMetadataBlock { index: u32, data_region_start: u32 },
-    #[error("block {index} is the reserved shadow block {shadow_block}")]
-    ReservedShadowBlock { index: u32, shadow_block: u32 },
     #[error("invalid block write length: expected {expected}, got {actual}")]
     InvalidBlockWriteLength { expected: usize, actual: usize },
     #[error("byte range overflow")]
@@ -1150,15 +860,5 @@ pub enum DeviceError {
     MissingIntegrityEntry {
         block_index: u32,
         integrity_block_index: u32,
-    },
-    #[error("device superblock is missing a shadow block")]
-    MissingShadowBlock,
-    #[error(
-        "pending shadow write crc mismatch for block {target_block}: expected {expected:#x}, got {actual:#x}"
-    )]
-    PendingWriteCrcMismatch {
-        target_block: u32,
-        expected: u32,
-        actual: u32,
     },
 }
