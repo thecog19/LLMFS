@@ -1,6 +1,6 @@
 # Task 06: Redirection Table
 
-Status: todo
+Status: done
 Depends on: 05-superblock-and-integrity.md
 Spec refs: DESIGN-NEW.MD section "5. Stego Device" (Redirection Table, Block Write Implementation)
 
