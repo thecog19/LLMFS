@@ -1,5 +1,5 @@
 use crate::gguf::quant::GgufQuantType;
-use crate::stego::planner::{AllocationPlan, AllocationTier};
+use crate::stego::planner::{AllocationPlan, TensorTier};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TensorMapBootstrap {
@@ -18,7 +18,7 @@ impl Default for TensorMapBootstrap {
 pub struct TensorSlot {
     pub name: String,
     pub quant_type: GgufQuantType,
-    pub tier: AllocationTier,
+    pub tier: TensorTier,
     pub data_offset: u64,
     pub weight_count: u64,
     pub stealable_bits_per_weight: usize,
@@ -31,7 +31,7 @@ pub struct TensorSlot {
 pub struct PhysicalBitSegment {
     pub tensor_name: String,
     pub quant_type: GgufQuantType,
-    pub tier: AllocationTier,
+    pub tier: TensorTier,
     pub data_offset: u64,
     pub bit_offset_in_tensor: u64,
     pub bit_len: u8,

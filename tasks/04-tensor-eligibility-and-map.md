@@ -1,6 +1,6 @@
 # Task 04: Tensor Eligibility And Tensor Map
 
-Status: todo
+Status: done
 Depends on: 03-packing-modules.md
 Spec refs: DESIGN-NEW.MD sections "5. Stego Device" (Tensor Eligibility, Tensor Map, Address Translation)
 

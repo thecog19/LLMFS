@@ -1,6 +1,6 @@
 use llmdb::gguf::parser::GgufTensorInfo;
 use llmdb::gguf::quant::{GGML_TYPE_Q5_K_ID, GGML_TYPE_Q6_K_ID, GGML_TYPE_Q8_0_ID, GgufQuantType};
-use llmdb::stego::planner::{AllocationMode, AllocationTier, build_allocation_plan};
+use llmdb::stego::planner::{AllocationMode, TensorTier, build_allocation_plan};
 use llmdb::stego::tensor_map::TensorMap;
 
 #[test]
@@ -16,7 +16,9 @@ fn tensor_map_builds_contiguous_bit_ranges_from_allocation_plan() {
     assert_eq!(map.slots[0].bit_start, 0);
     assert_eq!(map.slots[0].bit_end, 8);
     assert_eq!(map.slots[0].quant_type, GgufQuantType::Q8_0);
-    assert_eq!(map.slots[0].tier, AllocationTier::FfnQ80);
+    assert_eq!(map.slots[0].tier, TensorTier::Tier1);
+    assert_eq!(map.slots[1].tier, TensorTier::Tier1);
+    assert_eq!(map.slots[2].tier, TensorTier::Tier2);
 
     assert_eq!(map.slots[1].name, "blk.2.ffn_up.weight");
     assert_eq!(map.slots[1].bit_start, 8);

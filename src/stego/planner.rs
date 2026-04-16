@@ -7,14 +7,10 @@ pub enum AllocationMode {
     Lobotomy,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TensorRole {
-    Ffn,
-    Attention,
-    Embedding,
-    Output,
-    LayerNorm,
-    Unknown,
+impl AllocationMode {
+    pub fn is_lobotomy(self) -> bool {
+        matches!(self, Self::Lobotomy)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,27 +21,21 @@ pub enum SkipReason {
     NoStealableBits,
 }
 
+/// Allocation tier per DESIGN-NEW §5. V1 uses exactly four tiers ordered
+/// by sensitivity: Tier1 (FFN, most robust) fills first, then Tier2
+/// (attention projections), then Lobotomy (embeddings, norms, LM head —
+/// only eligible when lobotomy mode is on). Skip is the catch-all for
+/// anything the planner does not write into.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
-pub enum AllocationTier {
-    FfnQ80 = 1,
-    FfnFloat = 2,
-    FfnQ6K = 3,
-    FfnQ5K = 4,
-    AttentionQ80 = 5,
-    AttentionFloat = 6,
-    AttentionQ6K = 7,
-    AttentionQ5K = 8,
-    FfnQ4K = 9,
-    AttentionQ4K = 10,
-    FfnQ3K = 11,
-    AttentionQ3K = 12,
-    Embedding = 13,
-    Output = 14,
-    LayerNorm = 15,
+pub enum TensorTier {
+    Tier1 = 1,
+    Tier2 = 2,
+    Lobotomy = 3,
+    Skip = 255,
 }
 
-impl AllocationTier {
+impl TensorTier {
     pub fn as_u8(self) -> u8 {
         self as u8
     }
@@ -54,9 +44,8 @@ impl AllocationTier {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlannedTensor {
     pub name: String,
-    pub role: TensorRole,
     pub quant_type: GgufQuantType,
-    pub tier: AllocationTier,
+    pub tier: TensorTier,
     pub layer_index: Option<u32>,
     pub weight_count: u64,
     pub stealable_bits_per_weight: usize,
@@ -68,7 +57,7 @@ pub struct PlannedTensor {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkippedTensor {
     pub name: String,
-    pub role: TensorRole,
+    pub tier: TensorTier,
     pub raw_type_id: u32,
     pub reason: SkipReason,
 }
@@ -83,16 +72,18 @@ pub struct AllocationPlan {
 }
 
 pub fn build_allocation_plan(tensors: &[GgufTensorInfo], mode: AllocationMode) -> AllocationPlan {
+    let lobotomy = mode.is_lobotomy();
     let mut planned = Vec::new();
     let mut skipped = Vec::new();
     let mut total_capacity_bits = 0_u64;
 
     for tensor in tensors {
-        let role = classify_tensor_role(&tensor.name);
+        let tier = classify_tensor(&tensor.name, lobotomy);
+
         let Some(quant_type) = GgufQuantType::from_raw_ggml_type(tensor.raw_type_id) else {
             skipped.push(SkippedTensor {
                 name: tensor.name.clone(),
-                role,
+                tier,
                 raw_type_id: tensor.raw_type_id,
                 reason: SkipReason::UnsupportedQuantType,
             });
@@ -103,22 +94,22 @@ pub fn build_allocation_plan(tensors: &[GgufTensorInfo], mode: AllocationMode) -
         if stealable_bits_per_weight == 0 {
             skipped.push(SkippedTensor {
                 name: tensor.name.clone(),
-                role,
+                tier,
                 raw_type_id: tensor.raw_type_id,
                 reason: SkipReason::NoStealableBits,
             });
             continue;
         }
 
-        let Some(tier) = resolve_tier(role, quant_type, mode) else {
+        if matches!(tier, TensorTier::Skip) {
             skipped.push(SkippedTensor {
                 name: tensor.name.clone(),
-                role,
+                tier,
                 raw_type_id: tensor.raw_type_id,
-                reason: skip_reason(role, mode),
+                reason: skip_reason_for(&tensor.name, mode),
             });
             continue;
-        };
+        }
 
         let weight_count = tensor.element_count();
         let capacity_bits = weight_count.saturating_mul(stealable_bits_per_weight as u64);
@@ -128,7 +119,6 @@ pub fn build_allocation_plan(tensors: &[GgufTensorInfo], mode: AllocationMode) -
 
         planned.push(PlannedTensor {
             name: tensor.name.clone(),
-            role,
             quant_type,
             tier,
             layer_index: extract_layer_index(&tensor.name),
@@ -144,7 +134,6 @@ pub fn build_allocation_plan(tensors: &[GgufTensorInfo], mode: AllocationMode) -
         left.tier
             .cmp(&right.tier)
             .then_with(|| right.layer_index.cmp(&left.layer_index))
-            .then_with(|| quant_rank(right.quant_type).cmp(&quant_rank(left.quant_type)))
             .then_with(|| left.name.cmp(&right.name))
     });
 
@@ -157,26 +146,37 @@ pub fn build_allocation_plan(tensors: &[GgufTensorInfo], mode: AllocationMode) -
     }
 }
 
-pub fn classify_tensor_role(name: &str) -> TensorRole {
-    if name == "token_embd.weight" {
-        TensorRole::Embedding
-    } else if name == "output.weight" {
-        TensorRole::Output
-    } else if name.ends_with(".attn_norm.weight") || name.ends_with(".ffn_norm.weight") {
-        TensorRole::LayerNorm
-    } else if name.ends_with(".ffn_gate.weight")
-        || name.ends_with(".ffn_up.weight")
-        || name.ends_with(".ffn_down.weight")
-    {
-        TensorRole::Ffn
-    } else if name.ends_with(".attn_q.weight")
-        || name.ends_with(".attn_k.weight")
-        || name.ends_with(".attn_v.weight")
-        || name.ends_with(".attn_output.weight")
-    {
-        TensorRole::Attention
+/// Classifier per DESIGN-NEW §5. Returns the `TensorTier` that this tensor
+/// should land in given the current lobotomy flag.
+///
+/// The §5 pseudocode checks the LM-head / embedding pattern first, but that
+/// ordering is buggy: `attn_output.weight` contains `output.weight` as a
+/// substring, so attention output projections would be misclassified as the
+/// LM head and skipped. We check attention patterns first to preserve the
+/// spec's spirit — FFN to Tier1, attention projections to Tier2, LM head /
+/// embeddings / norms to Skip-or-Lobotomy.
+pub fn classify_tensor(name: &str, lobotomy: bool) -> TensorTier {
+    let lobotomy_or_skip = if lobotomy {
+        TensorTier::Lobotomy
     } else {
-        TensorRole::Unknown
+        TensorTier::Skip
+    };
+
+    if name.contains("attn_q")
+        || name.contains("attn_k")
+        || name.contains("attn_v")
+        || name.contains("attn_output")
+    {
+        TensorTier::Tier2
+    } else if name.contains("ffn_gate") || name.contains("ffn_up") || name.contains("ffn_down") {
+        TensorTier::Tier1
+    } else if name.contains("token_embd")
+        || name.contains("output.weight")
+        || name.contains("_norm")
+    {
+        lobotomy_or_skip
+    } else {
+        TensorTier::Skip
     }
 }
 
@@ -186,61 +186,17 @@ pub fn extract_layer_index(name: &str) -> Option<u32> {
     digits.parse().ok()
 }
 
-fn resolve_tier(
-    role: TensorRole,
-    quant_type: GgufQuantType,
-    mode: AllocationMode,
-) -> Option<AllocationTier> {
-    match (role, quant_type, mode) {
-        (TensorRole::Ffn, GgufQuantType::Q8_0, _) => Some(AllocationTier::FfnQ80),
-        (TensorRole::Ffn, GgufQuantType::F16 | GgufQuantType::F32, _) => {
-            Some(AllocationTier::FfnFloat)
-        }
-        (TensorRole::Ffn, GgufQuantType::Q6K, _) => Some(AllocationTier::FfnQ6K),
-        (TensorRole::Ffn, GgufQuantType::Q5K, _) => Some(AllocationTier::FfnQ5K),
-        (TensorRole::Attention, GgufQuantType::Q8_0, _) => Some(AllocationTier::AttentionQ80),
-        (TensorRole::Attention, GgufQuantType::F16 | GgufQuantType::F32, _) => {
-            Some(AllocationTier::AttentionFloat)
-        }
-        (TensorRole::Attention, GgufQuantType::Q6K, _) => Some(AllocationTier::AttentionQ6K),
-        (TensorRole::Attention, GgufQuantType::Q5K, _) => Some(AllocationTier::AttentionQ5K),
-        (TensorRole::Ffn, GgufQuantType::Q4K, _) => Some(AllocationTier::FfnQ4K),
-        (TensorRole::Attention, GgufQuantType::Q4K, _) => Some(AllocationTier::AttentionQ4K),
-        (TensorRole::Ffn, GgufQuantType::Q3K, _) => Some(AllocationTier::FfnQ3K),
-        (TensorRole::Attention, GgufQuantType::Q3K, _) => Some(AllocationTier::AttentionQ3K),
-        (TensorRole::Embedding, _, AllocationMode::Lobotomy) => Some(AllocationTier::Embedding),
-        (TensorRole::Output, _, AllocationMode::Lobotomy) => Some(AllocationTier::Output),
-        (TensorRole::LayerNorm, _, AllocationMode::Lobotomy) => Some(AllocationTier::LayerNorm),
-        _ => None,
-    }
-}
-
-fn skip_reason(role: TensorRole, mode: AllocationMode) -> SkipReason {
-    match (role, mode) {
-        (TensorRole::Unknown, _) => SkipReason::UnsupportedTensorRole,
-        (
-            TensorRole::Embedding | TensorRole::Output | TensorRole::LayerNorm,
-            AllocationMode::Standard,
-        ) => SkipReason::IneligibleInStandardMode,
-        _ => SkipReason::UnsupportedTensorRole,
-    }
-}
-
-fn quant_rank(quant_type: GgufQuantType) -> u8 {
-    match quant_type {
-        GgufQuantType::F32 => 7,
-        GgufQuantType::F16 => 6,
-        GgufQuantType::Q8_0 => 5,
-        GgufQuantType::Q6K => 4,
-        GgufQuantType::Q5K => 3,
-        GgufQuantType::Q4K => 2,
-        GgufQuantType::Q3K => 1,
-        GgufQuantType::Q2K
-        | GgufQuantType::Q4_0
-        | GgufQuantType::Q4_1
-        | GgufQuantType::Q5_0
-        | GgufQuantType::Q5_1
-        | GgufQuantType::Q8_1
-        | GgufQuantType::Q8K => 0,
+fn skip_reason_for(name: &str, mode: AllocationMode) -> SkipReason {
+    // In standard mode, embeddings / norms / output are rejected because of the
+    // mode, not because the tensor is unrecognized. Everything else without a
+    // matched tier is an unknown tensor pattern.
+    if matches!(mode, AllocationMode::Standard)
+        && (name.contains("token_embd")
+            || name.contains("output.weight")
+            || name.contains("_norm"))
+    {
+        SkipReason::IneligibleInStandardMode
+    } else {
+        SkipReason::UnsupportedTensorRole
     }
 }

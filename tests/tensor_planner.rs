@@ -5,8 +5,8 @@ use llmdb::gguf::quant::{
     GGML_TYPE_Q6_K_ID, GGML_TYPE_Q8_0_ID, GGML_TYPE_Q8_1_ID, GGML_TYPE_Q8_K_ID, GgufQuantType,
 };
 use llmdb::stego::planner::{
-    AllocationMode, AllocationTier, SkipReason, TensorRole, build_allocation_plan,
-    classify_tensor_role, extract_layer_index,
+    AllocationMode, SkipReason, TensorTier, build_allocation_plan, classify_tensor,
+    extract_layer_index,
 };
 
 #[test]
@@ -110,6 +110,191 @@ fn stego_eligible_quant_types_report_nonzero_stealable_bits() {
 }
 
 #[test]
+fn classify_tensor_matches_design_new_pseudocode() {
+    // FFN → Tier1 regardless of lobotomy
+    for name in [
+        "blk.0.ffn_gate.weight",
+        "blk.7.ffn_up.weight",
+        "blk.31.ffn_down.weight",
+    ] {
+        assert_eq!(classify_tensor(name, false), TensorTier::Tier1);
+        assert_eq!(classify_tensor(name, true), TensorTier::Tier1);
+    }
+
+    // Attention → Tier2 regardless of lobotomy
+    for name in [
+        "blk.0.attn_q.weight",
+        "blk.1.attn_k.weight",
+        "blk.2.attn_v.weight",
+        "blk.3.attn_output.weight",
+    ] {
+        assert_eq!(classify_tensor(name, false), TensorTier::Tier2);
+        assert_eq!(classify_tensor(name, true), TensorTier::Tier2);
+    }
+
+    // Embeddings/output → Skip in standard, Lobotomy when enabled
+    for name in ["token_embd.weight", "output.weight"] {
+        assert_eq!(classify_tensor(name, false), TensorTier::Skip);
+        assert_eq!(classify_tensor(name, true), TensorTier::Lobotomy);
+    }
+
+    // Norm tensors → Skip in standard, Lobotomy when enabled
+    for name in [
+        "blk.5.attn_norm.weight",
+        "blk.12.ffn_norm.weight",
+        "output_norm.weight",
+    ] {
+        assert_eq!(classify_tensor(name, false), TensorTier::Skip);
+        assert_eq!(classify_tensor(name, true), TensorTier::Lobotomy);
+    }
+
+    // Anything else → Skip regardless of lobotomy
+    for name in ["blk.2.weird.weight", "unknown.weight"] {
+        assert_eq!(classify_tensor(name, false), TensorTier::Skip);
+        assert_eq!(classify_tensor(name, true), TensorTier::Skip);
+    }
+
+    // Layer index extraction unchanged
+    assert_eq!(extract_layer_index("blk.31.ffn_down.weight"), Some(31));
+    assert_eq!(extract_layer_index("token_embd.weight"), None);
+}
+
+#[test]
+fn ffn_q4k_lands_in_tier1_not_a_quant_specific_tier() {
+    let plan = build_allocation_plan(
+        &[tensor("blk.5.ffn_down.weight", &[256], GGML_TYPE_Q4_K_ID)],
+        AllocationMode::Standard,
+    );
+    assert_eq!(plan.tensors.len(), 1);
+    assert_eq!(plan.tensors[0].tier, TensorTier::Tier1);
+    assert_eq!(plan.tensors[0].quant_type, GgufQuantType::Q4K);
+}
+
+#[test]
+fn standard_mode_orders_tier1_then_tier2_with_layer_desc_tiebreak() {
+    let plan = build_allocation_plan(&sample_tensors(), AllocationMode::Standard);
+
+    let names: Vec<_> = plan
+        .tensors
+        .iter()
+        .map(|tensor| tensor.name.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            // Tier1 (FFN) sorted by layer descending, tie-broken by name
+            "blk.31.ffn_down.weight",
+            "blk.12.ffn_up.weight",
+            "blk.10.ffn_gate.weight",
+            "blk.1.ffn_down.weight",
+            // Tier2 (attention) sorted by layer descending
+            "blk.30.attn_output.weight",
+            "blk.9.attn_q.weight",
+            "blk.8.attn_v.weight",
+            "blk.3.attn_v.weight",
+        ]
+    );
+
+    let tiers: Vec<_> = plan
+        .tensors
+        .iter()
+        .map(|tensor| tensor.tier)
+        .collect();
+    assert_eq!(
+        tiers,
+        vec![
+            TensorTier::Tier1,
+            TensorTier::Tier1,
+            TensorTier::Tier1,
+            TensorTier::Tier1,
+            TensorTier::Tier2,
+            TensorTier::Tier2,
+            TensorTier::Tier2,
+            TensorTier::Tier2,
+        ]
+    );
+
+    // Standard mode skip list contains embedding, output, norms, unknown, and zero-bits.
+    let skipped: Vec<_> = plan
+        .skipped
+        .iter()
+        .map(|tensor| (tensor.name.as_str(), tensor.reason))
+        .collect();
+    assert_eq!(
+        skipped,
+        vec![
+            ("token_embd.weight", SkipReason::IneligibleInStandardMode),
+            ("output.weight", SkipReason::IneligibleInStandardMode),
+            (
+                "blk.7.ffn_norm.weight",
+                SkipReason::IneligibleInStandardMode
+            ),
+            ("blk.2.misc.weight", SkipReason::UnsupportedTensorRole),
+            ("blk.11.ffn_up.weight", SkipReason::NoStealableBits),
+        ]
+    );
+}
+
+#[test]
+fn lobotomy_mode_appends_lobotomy_tier_after_tier2() {
+    let plan = build_allocation_plan(&sample_tensors(), AllocationMode::Lobotomy);
+
+    // Lobotomy tier sort: layer desc (Some > None), then name asc. ffn_norm
+    // has layer Some(7); output and token_embd both have layer None, so they
+    // tie-break by name ("output" < "token_embd").
+    let tail: Vec<_> = plan
+        .tensors
+        .iter()
+        .rev()
+        .take(3)
+        .map(|tensor| (tensor.name.as_str(), tensor.tier))
+        .collect();
+    assert_eq!(
+        tail,
+        vec![
+            ("token_embd.weight", TensorTier::Lobotomy),
+            ("output.weight", TensorTier::Lobotomy),
+            ("blk.7.ffn_norm.weight", TensorTier::Lobotomy),
+        ]
+    );
+
+    // Tier1 and Tier2 still appear first, in the same order as standard mode.
+    let prefix: Vec<_> = plan
+        .tensors
+        .iter()
+        .take(8)
+        .map(|tensor| tensor.tier)
+        .collect();
+    assert_eq!(
+        prefix,
+        vec![
+            TensorTier::Tier1,
+            TensorTier::Tier1,
+            TensorTier::Tier1,
+            TensorTier::Tier1,
+            TensorTier::Tier2,
+            TensorTier::Tier2,
+            TensorTier::Tier2,
+            TensorTier::Tier2,
+        ]
+    );
+
+    // Lobotomy skip list drops IneligibleInStandardMode reasons.
+    let skipped: Vec<_> = plan
+        .skipped
+        .iter()
+        .map(|tensor| (tensor.name.as_str(), tensor.reason))
+        .collect();
+    assert_eq!(
+        skipped,
+        vec![
+            ("blk.2.misc.weight", SkipReason::UnsupportedTensorRole),
+            ("blk.11.ffn_up.weight", SkipReason::NoStealableBits),
+        ]
+    );
+}
+
+#[test]
 fn planner_skips_newly_declared_unsupported_variants_as_no_stealable_bits() {
     let tensors = vec![
         tensor("blk.0.ffn_down.weight", &[32], GGML_TYPE_Q4_0_ID),
@@ -140,130 +325,6 @@ fn planner_skips_newly_declared_unsupported_variants_as_no_stealable_bits() {
             ("blk.1.attn_q.weight", SkipReason::NoStealableBits),
             ("blk.1.attn_k.weight", SkipReason::NoStealableBits),
             ("blk.1.attn_v.weight", SkipReason::NoStealableBits),
-        ]
-    );
-}
-
-#[test]
-fn classifies_tensor_roles_and_layer_indices() {
-    assert_eq!(
-        classify_tensor_role("token_embd.weight"),
-        TensorRole::Embedding
-    );
-    assert_eq!(classify_tensor_role("output.weight"), TensorRole::Output);
-    assert_eq!(
-        classify_tensor_role("blk.7.ffn_norm.weight"),
-        TensorRole::LayerNorm
-    );
-    assert_eq!(
-        classify_tensor_role("blk.12.ffn_up.weight"),
-        TensorRole::Ffn
-    );
-    assert_eq!(
-        classify_tensor_role("blk.30.attn_output.weight"),
-        TensorRole::Attention
-    );
-    assert_eq!(
-        classify_tensor_role("blk.2.weird.weight"),
-        TensorRole::Unknown
-    );
-
-    assert_eq!(extract_layer_index("blk.31.ffn_down.weight"), Some(31));
-    assert_eq!(extract_layer_index("token_embd.weight"), None);
-}
-
-#[test]
-fn standard_mode_orders_eligible_tensors_by_tier_then_deepest_layer() {
-    let plan = build_allocation_plan(&sample_tensors(), AllocationMode::Standard);
-
-    let names: Vec<_> = plan
-        .tensors
-        .iter()
-        .map(|tensor| tensor.name.as_str())
-        .collect();
-    assert_eq!(
-        names,
-        vec![
-            "blk.31.ffn_down.weight",
-            "blk.12.ffn_up.weight",
-            "blk.1.ffn_down.weight",
-            "blk.9.attn_q.weight",
-            "blk.3.attn_v.weight",
-            "blk.30.attn_output.weight",
-            "blk.10.ffn_gate.weight",
-            "blk.8.attn_v.weight",
-        ]
-    );
-
-    let tiers: Vec<_> = plan
-        .tensors
-        .iter()
-        .map(|tensor| tensor.tier.as_u8())
-        .collect();
-    assert_eq!(tiers, vec![1, 1, 3, 5, 5, 8, 9, 12]);
-
-    assert_eq!(plan.total_capacity_bits, 3696);
-    assert_eq!(plan.total_capacity_bytes, 462);
-
-    let first = &plan.tensors[0];
-    assert_eq!(first.tier, AllocationTier::FfnQ80);
-    assert_eq!(first.capacity_bits, 2048);
-    assert_eq!(first.capacity_bytes_floor, 256);
-    assert_eq!(first.quant_type, GgufQuantType::Q8_0);
-
-    let skipped: Vec<_> = plan
-        .skipped
-        .iter()
-        .map(|tensor| (tensor.name.as_str(), tensor.reason))
-        .collect();
-    assert_eq!(
-        skipped,
-        vec![
-            ("token_embd.weight", SkipReason::IneligibleInStandardMode),
-            ("output.weight", SkipReason::IneligibleInStandardMode),
-            (
-                "blk.7.ffn_norm.weight",
-                SkipReason::IneligibleInStandardMode
-            ),
-            ("blk.2.misc.weight", SkipReason::UnsupportedTensorRole),
-            ("blk.11.ffn_up.weight", SkipReason::NoStealableBits),
-        ]
-    );
-}
-
-#[test]
-fn lobotomy_mode_appends_embedding_output_and_layernorm_tiers() {
-    let plan = build_allocation_plan(&sample_tensors(), AllocationMode::Lobotomy);
-
-    let trailing: Vec<_> = plan
-        .tensors
-        .iter()
-        .rev()
-        .take(3)
-        .map(|tensor| (tensor.name.as_str(), tensor.tier.as_u8()))
-        .collect();
-    assert_eq!(
-        trailing,
-        vec![
-            ("blk.7.ffn_norm.weight", 15),
-            ("output.weight", 14),
-            ("token_embd.weight", 13),
-        ]
-    );
-
-    assert_eq!(plan.total_capacity_bits, 4592);
-    assert_eq!(plan.total_capacity_bytes, 574);
-
-    let skipped: Vec<_> = plan
-        .skipped
-        .iter()
-        .map(|tensor| (tensor.name.as_str(), tensor.reason))
-        .collect();
-    assert_eq!(
-        skipped,
-        vec![
-            ("blk.2.misc.weight", SkipReason::UnsupportedTensorRole),
-            ("blk.11.ffn_up.weight", SkipReason::NoStealableBits),
         ]
     );
 }
