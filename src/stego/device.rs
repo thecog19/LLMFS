@@ -8,14 +8,17 @@ use thiserror::Error;
 
 use crate::gguf::parser::{self, GgufFile};
 use crate::gguf::quant::GgufQuantType;
+use crate::stego::freelist;
 use crate::stego::integrity::{
-    ENTRIES_PER_INTEGRITY_BLOCK, FreeListBlock, IntegrityBlock, IntegrityError, NO_BLOCK,
-    Superblock, SuperblockFields,
+    ENTRIES_PER_INTEGRITY_BLOCK, IntegrityBlock, IntegrityError, NO_BLOCK, Superblock,
+    SuperblockFields, encode_quant_profile,
 };
 use crate::stego::packing::{self, PackingError};
 use crate::stego::planner::{AllocationMode, AllocationPlan, build_allocation_plan};
+use crate::stego::redirection::{RedirectionError, RedirectionTable};
 
 const SUPERBLOCK_BLOCK: u32 = 0;
+const FILE_TABLE_INITIAL_BLOCKS: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceBootstrap {
@@ -41,6 +44,7 @@ pub struct StegoDevice {
     plan: AllocationPlan,
     slots: Vec<TensorByteSlot>,
     superblock: Superblock,
+    redirection: RedirectionTable,
     verbose: bool,
 }
 
@@ -70,11 +74,18 @@ impl StegoDevice {
     ) -> Result<Self, DeviceError> {
         let mut device = Self::open_internal(path, mode, options)?;
         device.superblock = device.load_superblock()?;
+        device.redirection = device.load_redirection_table()?;
         device.log_verbose(format!(
-            "opened device: total_blocks={}, integrity_head={}, free_list_head={}",
+            "opened device: total_blocks={}, integrity_head={}, free_list_head={}, \
+             redir_start={}, redir_len={}, file_start={}, file_len={}, data_region_start={}",
             device.superblock.fields.total_blocks,
             device.superblock.fields.integrity_chain_head,
             device.superblock.fields.free_list_head,
+            device.superblock.fields.redirection_table_start,
+            device.superblock.fields.redirection_table_length,
+            device.superblock.fields.file_table_start,
+            device.superblock.fields.file_table_length,
+            device.data_region_start(),
         ));
         Ok(device)
     }
@@ -92,18 +103,55 @@ impl StegoDevice {
     }
 
     pub fn integrity_block_count(&self) -> u32 {
-        integrity_block_count(self.total_blocks())
+        let sb = &self.superblock.fields;
+        if sb.integrity_chain_head == NO_BLOCK {
+            0
+        } else {
+            let redir_start = sb.redirection_table_start;
+            if redir_start == NO_BLOCK {
+                self.total_blocks().saturating_sub(1)
+            } else {
+                redir_start - sb.integrity_chain_head
+            }
+        }
+    }
+
+    pub fn redirection_block_count(&self) -> u32 {
+        self.superblock.fields.redirection_table_length
+    }
+
+    pub fn file_table_block_count(&self) -> u32 {
+        self.superblock.fields.file_table_length
     }
 
     pub fn data_region_start(&self) -> u32 {
-        1 + self.integrity_block_count()
+        let sb = &self.superblock.fields;
+        if sb.file_table_start != NO_BLOCK {
+            sb.file_table_start + sb.file_table_length
+        } else if sb.redirection_table_start != NO_BLOCK {
+            sb.redirection_table_start + sb.redirection_table_length
+        } else if sb.integrity_chain_head != NO_BLOCK {
+            sb.integrity_chain_head + compute_integrity_block_count(self.total_blocks())
+        } else {
+            1
+        }
     }
 
     pub fn read_block(&self, block_index: u32) -> Result<Vec<u8>, DeviceError> {
         self.ensure_data_block(block_index)?;
-        let bytes = self.read_logical_block_raw(block_index)?;
+        let physical = self
+            .redirection
+            .logical_to_physical(block_index)
+            .ok_or(DeviceError::BlockOutOfRange {
+                index: block_index,
+                total_blocks: self.total_blocks(),
+            })?;
+        let bytes = self.read_physical_block_raw(physical)?;
         self.verify_block_crc(block_index, &bytes)?;
-        self.log_verbose(format!("read data block {}", block_index));
+        self.log_verbose(format!(
+            "read block logical={} physical={}",
+            block_index, physical
+        ));
         Ok(bytes)
     }
 
@@ -116,10 +164,20 @@ impl StegoDevice {
             });
         }
 
-        self.write_logical_block_raw(block_index, data)?;
+        let physical = self
+            .redirection
+            .logical_to_physical(block_index)
+            .ok_or(DeviceError::BlockOutOfRange {
+                index: block_index,
+                total_blocks: self.total_blocks(),
+            })?;
+        self.write_physical_block_raw(physical, data)?;
         self.update_block_crc(block_index, data)?;
         self.flush()?;
-        self.log_verbose(format!("wrote data block {}", block_index));
+        self.log_verbose(format!(
+            "wrote block logical={} physical={}",
+            block_index, physical
+        ));
         Ok(())
     }
 
@@ -129,10 +187,17 @@ impl StegoDevice {
             return Err(DeviceError::OutOfSpace);
         }
 
-        let head_block = self.read_logical_block_raw(head)?;
+        let physical = self
+            .redirection
+            .logical_to_physical(head)
+            .ok_or(DeviceError::BlockOutOfRange {
+                index: head,
+                total_blocks: self.total_blocks(),
+            })?;
+        let head_block = self.read_physical_block_raw(physical)?;
         self.verify_block_crc(head, &head_block)?;
-        let free_block = FreeListBlock::decode(&head_block)?;
-        self.superblock.fields.free_list_head = free_block.next_free_block;
+        let next = freelist::decode_next(&head_block)?;
+        self.superblock.fields.free_list_head = next;
         self.persist_superblock()?;
         self.log_verbose(format!(
             "allocated block {} next_free={}",
@@ -145,10 +210,7 @@ impl StegoDevice {
         self.ensure_data_block(block_index)?;
 
         let previous_head = self.superblock.fields.free_list_head;
-        let free_block = FreeListBlock {
-            next_free_block: previous_head,
-        };
-        let bytes = free_block.encode();
+        let bytes = freelist::encode_head(previous_head);
         self.write_block(block_index, &bytes)?;
         self.superblock.fields.free_list_head = block_index;
         self.persist_superblock()?;
@@ -165,10 +227,17 @@ impl StegoDevice {
 
         while current != NO_BLOCK {
             self.ensure_data_block(current)?;
-            let bytes = self.read_logical_block_raw(current)?;
+            let physical = self
+                .redirection
+                .logical_to_physical(current)
+                .ok_or(DeviceError::BlockOutOfRange {
+                    index: current,
+                    total_blocks: self.total_blocks(),
+                })?;
+            let bytes = self.read_physical_block_raw(physical)?;
             self.verify_block_crc(current, &bytes)?;
-            let free_block = FreeListBlock::decode(&bytes)?;
-            current = free_block.next_free_block;
+            let next = freelist::decode_next(&bytes)?;
+            current = next;
             free_count = free_count.saturating_add(1);
         }
 
@@ -178,7 +247,11 @@ impl StegoDevice {
     pub fn verify_integrity(&self) -> Result<Vec<u32>, DeviceError> {
         let mut corrupted = Vec::new();
         for block_index in self.data_region_start()..self.total_blocks() {
-            let bytes = self.read_logical_block_raw(block_index)?;
+            let physical = self
+                .redirection
+                .logical_to_physical(block_index)
+                .unwrap_or(block_index);
+            let bytes = self.read_physical_block_raw(physical)?;
             match self.verify_block_crc(block_index, &bytes) {
                 Ok(()) => {}
                 Err(DeviceError::IntegrityMismatch { .. }) => corrupted.push(block_index),
@@ -210,6 +283,9 @@ impl StegoDevice {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
         let mmap = unsafe { MmapMut::map_mut(&file)? };
 
+        let total_blocks =
+            u32::try_from(plan.total_capacity_bytes / crate::BLOCK_SIZE as u64).unwrap_or(0);
+
         let device = Self {
             mmap,
             plan,
@@ -225,6 +301,7 @@ impl StegoDevice {
                 flags: 0,
                 quant_profile: 0,
             }),
+            redirection: RedirectionTable::identity(total_blocks),
             verbose: options.verbose,
         };
 
@@ -240,76 +317,86 @@ impl StegoDevice {
     fn format(&mut self) -> Result<(), DeviceError> {
         let total_blocks = u32::try_from(self.plan.total_capacity_bytes / crate::BLOCK_SIZE as u64)
             .map_err(|_| DeviceError::CapacityOverflow(self.plan.total_capacity_bytes))?;
-        let integrity_count = integrity_block_count(total_blocks);
-        let data_region_start = 1 + integrity_count;
 
-        if data_region_start >= total_blocks {
-            return Err(DeviceError::InsufficientCapacityForMetadata {
-                total_blocks,
-                integrity_blocks: integrity_count,
-            });
-        }
+        let layout = compute_layout(total_blocks)?;
 
-        let free_list_head = data_region_start;
+        let quant_types: Vec<_> = self.plan.tensors.iter().map(|t| t.quant_type).collect();
 
         self.superblock = Superblock::new(SuperblockFields {
             total_blocks,
-            free_list_head,
-            integrity_chain_head: if integrity_count > 0 { 1 } else { NO_BLOCK },
-            redirection_table_start: NO_BLOCK,
-            redirection_table_length: 0,
-            file_table_start: NO_BLOCK,
-            file_table_length: 0,
+            free_list_head: layout.data_region_start,
+            integrity_chain_head: if layout.integrity_count > 0 {
+                layout.integrity_start
+            } else {
+                NO_BLOCK
+            },
+            redirection_table_start: layout.redirection_start,
+            redirection_table_length: layout.redirection_count,
+            file_table_start: layout.file_table_start,
+            file_table_length: layout.file_table_count,
             flags: if self.plan.mode == AllocationMode::Lobotomy {
                 0x01
             } else {
                 0x00
             },
-            quant_profile: 0,
+            quant_profile: encode_quant_profile(&quant_types),
         });
 
+        self.redirection = RedirectionTable::identity(total_blocks);
+
         self.log_verbose(format!(
-            "formatting device: total_blocks={}, integrity_blocks={}, data_region_start={}",
-            total_blocks, integrity_count, data_region_start,
+            "formatting device: total_blocks={}, integrity={}, redir={}, filetable={}, \
+             data_region_start={}",
+            total_blocks,
+            layout.integrity_count,
+            layout.redirection_count,
+            layout.file_table_count,
+            layout.data_region_start,
         ));
 
-        for block_index in data_region_start..total_blocks {
-            let next = if block_index + 1 < total_blocks {
-                block_index + 1
-            } else {
-                NO_BLOCK
-            };
-            let bytes = FreeListBlock {
-                next_free_block: next,
-            }
-            .encode();
-            self.write_logical_block_raw(block_index, &bytes)?;
+        // Write free list chain for data blocks
+        let chain = freelist::build_free_chain(layout.data_region_start, total_blocks);
+        for (block_index, bytes) in &chain {
+            self.write_physical_block_raw(*block_index, bytes)?;
         }
 
-        self.initialize_integrity_blocks(integrity_count, data_region_start, total_blocks)?;
+        // Initialize integrity blocks
+        self.initialize_integrity_blocks(&layout, total_blocks)?;
+
+        // Write redirection table (identity mapping)
+        let redir_blocks = self.redirection.encode();
+        for (offset, raw) in redir_blocks.iter().enumerate() {
+            self.write_physical_block_raw(layout.redirection_start + offset as u32, raw)?;
+        }
+
+        // Write empty file table block(s)
+        for offset in 0..layout.file_table_count {
+            let empty = vec![0_u8; crate::BLOCK_SIZE];
+            self.write_physical_block_raw(layout.file_table_start + offset, &empty)?;
+        }
+
         self.persist_superblock()?;
         Ok(())
     }
 
     fn initialize_integrity_blocks(
         &mut self,
-        integrity_count: u32,
-        data_region_start: u32,
+        layout: &DeviceLayout,
         total_blocks: u32,
     ) -> Result<(), DeviceError> {
-        let data_block_count = total_blocks.saturating_sub(data_region_start);
+        let data_block_count = total_blocks.saturating_sub(layout.data_region_start);
 
-        for integrity_offset in 0..integrity_count {
+        for integrity_offset in 0..layout.integrity_count {
             let first_data_block =
-                data_region_start + integrity_offset * ENTRIES_PER_INTEGRITY_BLOCK as u32;
+                layout.data_region_start + integrity_offset * ENTRIES_PER_INTEGRITY_BLOCK as u32;
             let remaining = data_block_count
                 .saturating_sub(integrity_offset * ENTRIES_PER_INTEGRITY_BLOCK as u32);
             let entry_count = remaining.min(ENTRIES_PER_INTEGRITY_BLOCK as u32);
             let block = IntegrityBlock {
                 first_data_block,
                 entry_count,
-                next_integrity_block: if integrity_offset + 1 < integrity_count {
-                    1 + integrity_offset + 1
+                next_integrity_block: if integrity_offset + 1 < layout.integrity_count {
+                    layout.integrity_start + integrity_offset + 1
                 } else {
                     NO_BLOCK
                 },
@@ -317,12 +404,13 @@ impl StegoDevice {
             };
 
             let encoded = block.encode()?;
-            self.write_logical_block_raw(1 + integrity_offset, &encoded)?;
+            self.write_physical_block_raw(layout.integrity_start + integrity_offset, &encoded)?;
         }
 
-        for block_index in data_region_start..total_blocks {
-            let bytes = self.read_logical_block_raw(block_index)?;
-            self.update_block_crc(block_index, &bytes)?;
+        // Compute and store CRCs for all data blocks
+        for block_index in layout.data_region_start..total_blocks {
+            let bytes = self.read_physical_block_raw(block_index)?;
+            self.update_block_crc_for_data(block_index, layout.data_region_start, &bytes)?;
         }
 
         Ok(())
@@ -331,14 +419,30 @@ impl StegoDevice {
     fn persist_superblock(&mut self) -> Result<(), DeviceError> {
         let bytes = self.superblock.encode();
         self.log_verbose("persisting superblock");
-        self.write_logical_block_raw(SUPERBLOCK_BLOCK, &bytes)?;
+        self.write_physical_block_raw(SUPERBLOCK_BLOCK, &bytes)?;
         self.flush()?;
         Ok(())
     }
 
     fn load_superblock(&self) -> Result<Superblock, DeviceError> {
         let bytes = self.read_stego_bytes(0, crate::BLOCK_SIZE)?;
-        Superblock::decode(&bytes).map_err(|error| DeviceError::Integrity(error))
+        Superblock::decode(&bytes).map_err(DeviceError::Integrity)
+    }
+
+    fn load_redirection_table(&self) -> Result<RedirectionTable, DeviceError> {
+        let sb = &self.superblock.fields;
+        if sb.redirection_table_start == NO_BLOCK || sb.redirection_table_length == 0 {
+            return Ok(RedirectionTable::identity(sb.total_blocks));
+        }
+
+        let mut raw_blocks = Vec::with_capacity(sb.redirection_table_length as usize);
+        for offset in 0..sb.redirection_table_length {
+            let block_index = sb.redirection_table_start + offset;
+            let bytes = self.read_physical_block_raw(block_index)?;
+            raw_blocks.push(bytes);
+        }
+
+        Ok(RedirectionTable::decode(&raw_blocks)?)
     }
 
     fn ensure_valid_block(&self, block_index: u32) -> Result<(), DeviceError> {
@@ -363,17 +467,15 @@ impl StegoDevice {
         Ok(())
     }
 
-    fn read_logical_block_raw(&self, block_index: u32) -> Result<Vec<u8>, DeviceError> {
-        self.ensure_valid_block(block_index)?;
+    fn read_physical_block_raw(&self, block_index: u32) -> Result<Vec<u8>, DeviceError> {
         self.read_stego_bytes(block_index as usize * crate::BLOCK_SIZE, crate::BLOCK_SIZE)
     }
 
-    fn write_logical_block_raw(
+    fn write_physical_block_raw(
         &mut self,
         block_index: u32,
         data: &[u8],
     ) -> Result<(), DeviceError> {
-        self.ensure_valid_block(block_index)?;
         if data.len() != crate::BLOCK_SIZE {
             return Err(DeviceError::InvalidBlockWriteLength {
                 expected: crate::BLOCK_SIZE,
@@ -480,15 +582,7 @@ impl StegoDevice {
                 payload
             }
             GgufQuantType::F32 => packing::float::read_f32_payload(storage)?,
-            GgufQuantType::Q2K
-            | GgufQuantType::Q4_0
-            | GgufQuantType::Q4_1
-            | GgufQuantType::Q5_0
-            | GgufQuantType::Q5_1
-            | GgufQuantType::Q8_1
-            | GgufQuantType::Q8K => {
-                return Err(DeviceError::UnsupportedQuantType(slot.quant_type));
-            }
+            _ => return Err(DeviceError::UnsupportedQuantType(slot.quant_type)),
         };
 
         Ok(payload)
@@ -534,15 +628,7 @@ impl StegoDevice {
             )?,
             GgufQuantType::F16 => packing::float::write_f16_payload(storage, payload)?,
             GgufQuantType::F32 => packing::float::write_f32_payload(storage, payload)?,
-            GgufQuantType::Q2K
-            | GgufQuantType::Q4_0
-            | GgufQuantType::Q4_1
-            | GgufQuantType::Q5_0
-            | GgufQuantType::Q5_1
-            | GgufQuantType::Q8_1
-            | GgufQuantType::Q8K => {
-                return Err(DeviceError::UnsupportedQuantType(slot.quant_type));
-            }
+            _ => return Err(DeviceError::UnsupportedQuantType(slot.quant_type)),
         }
 
         Ok(())
@@ -564,13 +650,26 @@ impl StegoDevice {
     }
 
     fn update_block_crc(&mut self, block_index: u32, data: &[u8]) -> Result<(), DeviceError> {
-        if !self.tracks_crc_for_block(block_index)? {
+        self.update_block_crc_for_data(block_index, self.data_region_start(), data)
+    }
+
+    fn update_block_crc_for_data(
+        &mut self,
+        block_index: u32,
+        data_region_start: u32,
+        data: &[u8],
+    ) -> Result<(), DeviceError> {
+        if block_index < data_region_start || block_index >= self.total_blocks() {
             return Ok(());
         }
 
         let crc = crc32(data);
-        let (integrity_block_index, entry_index) = self.integrity_location(block_index)?;
-        let integrity_bytes = self.read_logical_block_raw(integrity_block_index)?;
+        let zero_based = block_index - data_region_start;
+        let integrity_offset = zero_based / ENTRIES_PER_INTEGRITY_BLOCK as u32;
+        let entry_index = (zero_based % ENTRIES_PER_INTEGRITY_BLOCK as u32) as usize;
+
+        let integrity_block_index = self.superblock.fields.integrity_chain_head + integrity_offset;
+        let integrity_bytes = self.read_physical_block_raw(integrity_block_index)?;
         let mut integrity_block = IntegrityBlock::decode(&integrity_bytes)?;
         if entry_index >= integrity_block.crc32_entries.len() {
             return Err(DeviceError::MissingIntegrityEntry {
@@ -580,21 +679,22 @@ impl StegoDevice {
         }
         integrity_block.crc32_entries[entry_index] = crc;
         let encoded = integrity_block.encode()?;
-        self.write_logical_block_raw(integrity_block_index, &encoded)?;
-        self.log_verbose(format!(
-            "updated crc for block {} in integrity block {} entry {}",
-            block_index, integrity_block_index, entry_index
-        ));
+        self.write_physical_block_raw(integrity_block_index, &encoded)?;
         Ok(())
     }
 
     fn read_crc_entry(&self, block_index: u32) -> Result<Option<u32>, DeviceError> {
-        if !self.tracks_crc_for_block(block_index)? {
+        let data_start = self.data_region_start();
+        if block_index < data_start || block_index >= self.total_blocks() {
             return Ok(None);
         }
 
-        let (integrity_block_index, entry_index) = self.integrity_location(block_index)?;
-        let integrity_bytes = self.read_logical_block_raw(integrity_block_index)?;
+        let zero_based = block_index - data_start;
+        let integrity_offset = zero_based / ENTRIES_PER_INTEGRITY_BLOCK as u32;
+        let entry_index = (zero_based % ENTRIES_PER_INTEGRITY_BLOCK as u32) as usize;
+
+        let integrity_block_index = self.superblock.fields.integrity_chain_head + integrity_offset;
+        let integrity_bytes = self.read_physical_block_raw(integrity_block_index)?;
         let integrity_block = IntegrityBlock::decode(&integrity_bytes)?;
         integrity_block
             .crc32_entries
@@ -607,26 +707,94 @@ impl StegoDevice {
             })
     }
 
-    fn integrity_location(&self, block_index: u32) -> Result<(u32, usize), DeviceError> {
-        self.ensure_data_block(block_index)?;
-
-        let zero_based = block_index - self.data_region_start();
-        let integrity_offset = zero_based / ENTRIES_PER_INTEGRITY_BLOCK as u32;
-        let integrity_block_index = 1 + integrity_offset;
-        let entry_index = (zero_based % ENTRIES_PER_INTEGRITY_BLOCK as u32) as usize;
-        Ok((integrity_block_index, entry_index))
-    }
-
-    fn tracks_crc_for_block(&self, block_index: u32) -> Result<bool, DeviceError> {
-        Ok(block_index >= self.data_region_start() && block_index < self.total_blocks())
-    }
-
     fn log_verbose(&self, message: impl AsRef<str>) {
         if self.verbose {
             eprintln!("[llmdb:device] {}", message.as_ref());
         }
     }
 }
+
+// -- Layout computation --
+
+struct DeviceLayout {
+    integrity_start: u32,
+    integrity_count: u32,
+    redirection_start: u32,
+    redirection_count: u32,
+    file_table_start: u32,
+    file_table_count: u32,
+    data_region_start: u32,
+}
+
+fn compute_layout(total_blocks: u32) -> Result<DeviceLayout, DeviceError> {
+    // Iteratively solve: metadata = 1 (super) + I + R + F, where I and R
+    // depend on data_blocks = total - metadata.
+    let file_table_count = FILE_TABLE_INITIAL_BLOCKS;
+    let mut integrity_count = 0_u32;
+    let mut redirection_count = 0_u32;
+
+    loop {
+        let metadata = 1 + integrity_count + redirection_count + file_table_count;
+        let data_blocks = total_blocks.saturating_sub(metadata);
+
+        let needed_integrity = if data_blocks == 0 {
+            0
+        } else {
+            (data_blocks as usize).div_ceil(ENTRIES_PER_INTEGRITY_BLOCK) as u32
+        };
+        let needed_redirection = if total_blocks == 0 {
+            0
+        } else {
+            (total_blocks as usize).div_ceil(crate::stego::redirection::ENTRIES_PER_BLOCK) as u32
+        };
+
+        if integrity_count >= needed_integrity && redirection_count >= needed_redirection {
+            break;
+        }
+        integrity_count = needed_integrity;
+        redirection_count = needed_redirection;
+    }
+
+    let integrity_start = 1;
+    let redirection_start = integrity_start + integrity_count;
+    let file_table_start = redirection_start + redirection_count;
+    let data_region_start = file_table_start + file_table_count;
+
+    if data_region_start >= total_blocks {
+        return Err(DeviceError::InsufficientCapacityForMetadata {
+            total_blocks,
+            integrity_blocks: integrity_count,
+        });
+    }
+
+    Ok(DeviceLayout {
+        integrity_start,
+        integrity_count,
+        redirection_start,
+        redirection_count,
+        file_table_start,
+        file_table_count,
+        data_region_start,
+    })
+}
+
+fn compute_integrity_block_count(total_blocks: u32) -> u32 {
+    let mut integrity_count = 0_u32;
+    loop {
+        let data_blocks = total_blocks.saturating_sub(1 + integrity_count);
+        let needed = if data_blocks == 0 {
+            0
+        } else {
+            (data_blocks as usize).div_ceil(ENTRIES_PER_INTEGRITY_BLOCK) as u32
+        };
+        if integrity_count >= needed {
+            return integrity_count;
+        }
+        integrity_count = needed;
+    }
+}
+
+// -- Tensor byte slots --
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TensorByteSlot {
@@ -697,13 +865,7 @@ fn tensor_storage_layout(
         GgufQuantType::Q3K => chunk_storage_len(weight_count, 256, packing::q3_k::BLOCK_BYTES)?,
         GgufQuantType::F16 => weight_count * 2,
         GgufQuantType::F32 => weight_count * 4,
-        GgufQuantType::Q2K
-        | GgufQuantType::Q4_0
-        | GgufQuantType::Q4_1
-        | GgufQuantType::Q5_0
-        | GgufQuantType::Q5_1
-        | GgufQuantType::Q8_1
-        | GgufQuantType::Q8K => return Err(DeviceError::UnsupportedQuantType(quant_type)),
+        _ => return Err(DeviceError::UnsupportedQuantType(quant_type)),
     };
 
     Ok(TensorStorageLayout { storage_len })
@@ -774,22 +936,6 @@ fn encode_blockwise(
     Ok(())
 }
 
-fn integrity_block_count(total_blocks: u32) -> u32 {
-    let mut integrity_count = 0_u32;
-    loop {
-        let data_blocks = total_blocks.saturating_sub(1 + integrity_count);
-        let needed = if data_blocks == 0 {
-            0
-        } else {
-            ((data_blocks as usize).div_ceil(ENTRIES_PER_INTEGRITY_BLOCK)) as u32
-        };
-        if integrity_count >= needed {
-            return integrity_count;
-        }
-        integrity_count = needed;
-    }
-}
-
 fn crc32(data: &[u8]) -> u32 {
     let mut hasher = Hasher::new();
     hasher.update(data);
@@ -804,6 +950,8 @@ pub enum DeviceError {
     Parse(#[from] parser::ParseError),
     #[error("metadata error: {0}")]
     Integrity(#[from] IntegrityError),
+    #[error("redirection error: {0}")]
+    Redirection(#[from] RedirectionError),
     #[error("packing error: {0}")]
     Packing(#[from] PackingError),
     #[error("insufficient capacity: {0} bytes")]

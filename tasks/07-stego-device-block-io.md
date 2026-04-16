@@ -1,6 +1,6 @@
 # Task 07: Stego Device Block I/O
 
-Status: todo
+Status: done
 Depends on: 06-redirection-table.md
 Spec refs: DESIGN-NEW.MD section "5. Stego Device" (Block Device Interface, Block Read Implementation, Block Write Implementation)
 
