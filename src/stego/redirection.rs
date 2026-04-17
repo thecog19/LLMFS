@@ -180,6 +180,21 @@ impl RedirectionTable {
         self.blocks.iter().map(|block| block.encode()).collect()
     }
 
+    /// Encode just the block that covers `logical`. Used by the hot
+    /// write path so we don't re-encode the entire table (which can
+    /// span many blocks) every time a single logical is updated.
+    pub fn encode_block_for(&self, logical: u32) -> Option<Vec<u8>> {
+        let block_index = logical as usize / ENTRIES_PER_BLOCK;
+        self.blocks.get(block_index).map(|block| block.encode())
+    }
+
+    /// The on-disk offset (0-based) of the redirection block that
+    /// covers `logical`. Callers add `redirection_table_start` to get
+    /// the physical block index.
+    pub fn block_offset_for(logical: u32) -> usize {
+        logical as usize / ENTRIES_PER_BLOCK
+    }
+
     pub fn decode(raw_blocks: &[Vec<u8>]) -> Result<Self, RedirectionError> {
         let mut blocks = Vec::with_capacity(raw_blocks.len());
         let mut total_entries = 0_u32;

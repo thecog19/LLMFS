@@ -885,12 +885,14 @@ impl StegoDevice {
         if redir_start == NO_BLOCK {
             return Ok(());
         }
-
+        // Encode only the single redirection block that covers
+        // `block_index`. We previously encoded the whole table (N
+        // blocks × 4 KiB each) and dropped all but one — wasted work
+        // on every overwrite. The on-disk block layout is unchanged.
         let redir_block_offset =
-            block_index as usize / crate::stego::redirection::ENTRIES_PER_BLOCK;
-        let encoded = self.redirection.encode();
-        if let Some(raw) = encoded.get(redir_block_offset) {
-            self.write_physical_block_raw(redir_start + redir_block_offset as u32, raw)?;
+            crate::stego::redirection::RedirectionTable::block_offset_for(block_index);
+        if let Some(raw) = self.redirection.encode_block_for(block_index) {
+            self.write_physical_block_raw(redir_start + redir_block_offset as u32, &raw)?;
         }
         Ok(())
     }
