@@ -10,6 +10,9 @@ use std::time::Duration;
 
 use clap::{ArgAction, CommandFactory, Parser, Subcommand};
 
+use llmdb::ask::AskError;
+use llmdb::ask::bridge::{AskSession, HttpChatClient};
+use llmdb::ask::server::LlamaServer;
 use llmdb::fs::file_ops::FsError;
 use llmdb::nbd::server::{NbdError, NbdServer, default_socket_path};
 use llmdb::stego::device::{DeviceError, DeviceOptions, StegoDevice};
@@ -188,7 +191,8 @@ fn dispatch(cmd: Command, mode: AllocationMode, options: DeviceOptions) -> Resul
             socket,
         } => cmd_mount(&model, &mount_point, format, yes, nbd, socket, mode, options),
         Command::Unmount { mount_point } => cmd_unmount(&mount_point),
-        Command::Dump { .. } | Command::Ask { .. } => Err(CliError::internal(format!(
+        Command::Ask { model } => cmd_ask(&model, mode, options),
+        Command::Dump { .. } => Err(CliError::internal(format!(
             "command not implemented yet: {}",
             command_name(&cmd)
         ))),
@@ -752,6 +756,82 @@ impl MountState {
         } else {
             Ok(())
         }
+    }
+}
+
+fn cmd_ask(
+    model: &Path,
+    alloc_mode: AllocationMode,
+    options: DeviceOptions,
+) -> Result<(), CliError> {
+    // We need the device for tool-call dispatch AND the model path for
+    // llama-server. The device opens normally, then we spawn the server
+    // on a free port.
+    let mut device = StegoDevice::open_with_options(model, alloc_mode, options).map_err(open_err)?;
+
+    let port = pick_free_port()?;
+    println!("spawning llama-server on port {port} …");
+    let server = LlamaServer::spawn(model, port).map_err(ask_err)?;
+    println!("llama-server ready at {}", server.base_url());
+
+    let client = HttpChatClient::new(server.base_url());
+    let mut session = AskSession::new(client, &mut device, "llmdb-ask");
+
+    println!("\n`ask` session ready. Type a question, or Ctrl-D / `exit` to quit.\n");
+
+    let stdin = io::stdin();
+    let mut line = String::new();
+    loop {
+        print!("> ");
+        io::stdout().flush().ok();
+        line.clear();
+        match stdin.read_line(&mut line) {
+            Ok(0) => break, // Ctrl-D
+            Ok(_) => {}
+            Err(e) => return Err(CliError::internal(format!("read_line: {e}"))),
+        }
+        let q = line.trim();
+        if q.is_empty() {
+            continue;
+        }
+        if matches!(q, "exit" | "quit") {
+            break;
+        }
+        match session.ask(q) {
+            Ok(answer) => println!("{answer}\n"),
+            Err(e) => {
+                eprintln!("ask error: {e}");
+                // non-fatal — next prompt
+            }
+        }
+    }
+
+    println!("goodbye");
+    // `server`'s Drop kills the subprocess.
+    drop(session);
+    drop(server);
+    Ok(())
+}
+
+fn pick_free_port() -> Result<u16, CliError> {
+    use std::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .map_err(|e| CliError::internal(format!("bind(0): {e}")))?;
+    let port = listener
+        .local_addr()
+        .map_err(|e| CliError::internal(format!("local_addr: {e}")))?
+        .port();
+    drop(listener);
+    Ok(port)
+}
+
+fn ask_err(e: AskError) -> CliError {
+    match e {
+        AskError::SpawnFailed(_)
+        | AskError::HealthTimeout { .. }
+        | AskError::InvalidToolCall(_)
+        | AskError::ToolCallLimitExceeded { .. } => CliError::user(e.to_string()),
+        _ => CliError::internal(e.to_string()),
     }
 }
 

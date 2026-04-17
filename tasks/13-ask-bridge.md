@@ -1,6 +1,6 @@
 # Task 13: Ask Bridge (llama-server + Tool Use)
 
-Status: todo
+Status: done (unit path; E2E with real llama-server gated on `LLMDB_E2E_ASK`, not verified locally because the binary isn't on PATH here)
 Depends on: 09-file-table-and-file-ops.md, 10-cli-file-commands.md
 Spec refs: DESIGN-NEW.MD section "8. `ask` Command"
 
