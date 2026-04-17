@@ -1,6 +1,6 @@
 # Task 12: NBD Server And Mount
 
-Status: in-progress (server and `serve` CLI landed; full `mount` orchestration deferred)
+Status: done
 Depends on: 11-nbd-protocol.md, 10-cli-file-commands.md
 Spec refs: DESIGN-NEW.MD section "7. NBD Server" (Implementation, Alignment, `llmdb mount`)
 
@@ -49,3 +49,26 @@ Acceptance criteria:
 - `cargo test --offline tests::nbd_alignment` passes.
 - With `LLMDB_E2E_NBD=1` and root on a Linux host: `cargo run -- mount <gguf> /mnt/llmdb --format`, then `echo hello > /mnt/llmdb/test.txt`, then `cargo run -- unmount /mnt/llmdb`, then re-mount, verify `cat /mnt/llmdb/test.txt` prints `hello`.
 - A Ctrl-C during `mount` cleanly unmounts, disconnects NBD, and clears the dirty flag (so the next open does not trigger recovery).
+
+Deviations from spec (intentional):
+
+- Handshake is newstyle, not oldstyle — modern `nbd-client` (≥ 3.10)
+  dropped oldstyle support entirely. The server emits the fixed
+  newstyle banner (`NBDMAGIC` + `IHAVEOPT` + flags) and handles
+  `NBD_OPT_EXPORT_NAME` / `NBD_OPT_GO` / `NBD_OPT_INFO` / `NBD_OPT_ABORT`;
+  anything else replies with `NBD_REP_ERR_UNSUP`.
+- Free-device discovery scans `/sys/block/nbdN/pid` (0..15). That file
+  exists when an nbd-client has bound the device; absent or empty → free.
+- mount/unmount communicate via a sidecar state file in
+  `/tmp/llmdb-mounts/<flattened-mount-path>.state` (plain key=value).
+  Contains the running mount PID, the chosen `/dev/nbdN`, the socket
+  path, and the mount point. `unmount` scans/reads it to find the
+  right nbd device; the in-process Ctrl-C handler runs the same
+  cleanup via `AtomicBool`.
+- `unmount` runs `umount` + `nbd-client -d` itself; the running mount
+  process's server thread then returns naturally (client disconnected)
+  and the mount shell exits. A second `umount` attempt may log
+  "not mounted" — harmless.
+- Wire-format diagnostics: `LLMDB_NBD_TRACE=<path>` env var emits a
+  tab-separated per-request log (offset, length, CRC32 of payload, free
+  list head, free count). Turned off by default; cheap to leave gated.
