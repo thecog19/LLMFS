@@ -1,6 +1,6 @@
 # Task 13: Ask Bridge (llama-server + Tool Use)
 
-Status: done (unit path; E2E with real llama-server gated on `LLMDB_E2E_ASK`, not verified locally because the binary isn't on PATH here)
+Status: done (unit path + gated E2E against real llama-server — see `tests/ask_e2e.rs` and the invocation block at the bottom of this file)
 Depends on: 09-file-table-and-file-ops.md, 10-cli-file-commands.md
 Spec refs: DESIGN-NEW.MD section "8. `ask` Command"
 
@@ -47,3 +47,46 @@ Acceptance criteria:
 - `LlamaServer::drop` reliably kills the subprocess (verifiable via `pgrep llama-server` returning empty after the handle is dropped).
 - Tool-call iteration limit prevents runaway loops: a malformed tool-call response that never yields a final answer returns `AskError::ToolCallLimitExceeded` after 8 iterations.
 - §14 open item: verify `llama-server --jinja` handles SmolLM3-3B's tool-call chat template correctly before declaring this task done. If the template is broken, document the workaround (manual chat-template formatting) inline.
+
+## E2E verification (2026-04-17)
+
+Verified against a from-source build of llama.cpp (commit `afe65aa28`)
+and `Qwen2.5-0.5B-Instruct-f16.gguf` as the cover file. The test at
+`tests/ask_e2e.rs` is gated — skipped silently when `LLMDB_E2E_ASK`
+is not `1`.
+
+Invocation:
+
+```
+LLMDB_E2E_ASK=1 \
+LLMDB_LLAMA_SERVER=/path/to/llama.cpp/build/bin/llama-server \
+LLMDB_E2E_GGUF=models/qwen2.5-0.5b-instruct-f16.gguf \
+cargo test --offline --test ask_e2e -- --nocapture
+```
+
+What the test exercises end-to-end:
+
+1. Copy the GGUF to a tempdir, run `StegoDevice::initialize` on it,
+   store two small text files, then `close()`.
+2. `LlamaServer::spawn` → `/health` comes up.
+3. `AskSession::ask` issues a prompt that requires calling
+   `read_file` on `passphrase.txt`.
+4. Assert the transcript contains a `read_file` tool call and the
+   passphrase content (`PURPLE ELEPHANT`) — proving the tool result
+   flowed from the stego device back into the model's context and
+   the model surfaced it in the final answer.
+
+The 135M F16 model is too small to reliably call tools; 0.5B
+instruct-tuned models (Qwen2.5, SmolLM3) work. Use **F16 only** for
+the cover file — Q8_0 covers collapse on `init` per DESIGN-NEW §2,
+and then inference produces gibberish before the first tool call.
+
+Notes on reliability:
+
+- Smaller models (≤135M) hallucinate tool calls as prose; they pass
+  infrastructure checks but fail the content assertion.
+- The model occasionally declines to chain `list_files → read_file`.
+  We work around this by prompting directly for `read_file`, which
+  all Qwen2.5 sizes handle cleanly.
+- Test wall time on CPU: ~90 s with Qwen2.5-0.5B-f16 (dominated by
+  model load; the chat roundtrip is sub-second).

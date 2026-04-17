@@ -56,6 +56,8 @@ First tagged release. V1 scope per `DESIGN-NEW.MD §2`.
 - Clippy clean with `-D warnings`; `cargo fmt` clean.
 
 ### Deferred to post-V1
-- Criterion benches (Task 15).
-- `ask` end-to-end test against a real `llama-server`.
-- `dump` subcommand body (tar archive of stored files).
+- Criterion benches (Task 15). **Landed post-v1.0.0.**
+- `ask` end-to-end test against a real `llama-server`. **Landed
+  post-v1.0.0** as `tests/ask_e2e.rs`, gated by `LLMDB_E2E_ASK=1`.
+- `dump` subcommand body (tar archive of stored files). **Landed
+  post-v1.0.0.**

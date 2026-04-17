@@ -42,7 +42,10 @@ impl LlamaServer {
         let model = model_path
             .to_str()
             .ok_or_else(|| AskError::SpawnFailed("non-utf8 model path".into()))?;
-        let mut cmd = Command::new("llama-server");
+        // Tests and exotic installs can point us at a specific binary
+        // without touching PATH. Default is the name on PATH.
+        let binary = std::env::var("LLMDB_LLAMA_SERVER").unwrap_or_else(|_| "llama-server".into());
+        let mut cmd = Command::new(&binary);
         cmd.args([
             "--model",
             model,
@@ -54,9 +57,11 @@ impl LlamaServer {
             "4096",
         ]);
         cmd.stdout(Stdio::null()).stderr(Stdio::null());
-        let process = cmd
-            .spawn()
-            .map_err(|e| AskError::SpawnFailed(format!("{e} (is `llama-server` on PATH?)")))?;
+        let process = cmd.spawn().map_err(|e| {
+            AskError::SpawnFailed(format!(
+                "{e} (is `{binary}` runnable? set LLMDB_LLAMA_SERVER to override)"
+            ))
+        })?;
         let base_url = format!("http://127.0.0.1:{port}");
         let srv = Self {
             process,
