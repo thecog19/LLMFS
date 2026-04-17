@@ -1,6 +1,6 @@
 # Task 14: Diagnostics And Status
 
-Status: todo
+Status: done
 Depends on: 09-file-table-and-file-ops.md
 Spec refs: DESIGN-NEW.MD section "9. CLI" (`status`), "5. Stego Device" (utilization), "13. Failure Modes" (dirty flag reporting)
 

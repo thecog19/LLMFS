@@ -259,34 +259,9 @@ fn cmd_status(
     options: DeviceOptions,
 ) -> Result<(), CliError> {
     let device = StegoDevice::open_with_options(model, mode, options).map_err(open_err)?;
-    let sb = device.superblock().clone();
-    let total = device.total_blocks();
-    let free = device.free_blocks().map_err(dev_err)?;
-    let used = total.saturating_sub(free);
-    let pct = if total == 0 {
-        0.0
-    } else {
-        (used as f64 / total as f64) * 100.0
-    };
-    let files = device.list_files().map_err(fs_err)?.len();
-    let profile = decode_quant_profile(sb.fields.quant_profile);
-
     println!("device:      {}", model.display());
-    println!("total:       {total} blocks");
-    println!("used:        {used} blocks");
-    println!("free:        {free} blocks");
-    println!("utilization: {pct:.1}%");
-    println!("files:       {files}");
-    println!("quant:       {profile:?}");
-    println!(
-        "lobotomy:    {}",
-        if sb.is_lobotomy() { "yes" } else { "no" }
-    );
-    println!(
-        "dirty:       {}",
-        if sb.is_dirty() { "yes" } else { "no" }
-    );
-
+    let status = llmdb::diagnostics::gather(&device).map_err(fs_err)?;
+    print!("{}", llmdb::diagnostics::format_human(&status));
     device.close().map_err(dev_err)?;
     Ok(())
 }

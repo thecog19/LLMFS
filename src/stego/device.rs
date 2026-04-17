@@ -66,6 +66,12 @@ pub struct StegoDevice {
     /// reservation, which is fine: on reopen the logical reads as
     /// unmapped (zeros) and re-allocates cleanly.
     reserved_logicals: HashSet<u32>,
+    /// True if the on-disk dirty flag was already set when we opened the
+    /// device — meaning the previous session didn't call `close()` and
+    /// recovery ran on this open. `open_with_options` flips dirty=true
+    /// for liveness after it loads the superblock; this field captures
+    /// the pre-flip value so `status` can report "was dirty" honestly.
+    was_dirty_on_open: bool,
     verbose: bool,
 }
 
@@ -98,6 +104,10 @@ impl StegoDevice {
         let mut device = Self::open_internal(path, mode, options)?;
         device.superblock = device.load_superblock()?;
         device.redirection = device.load_redirection_table()?;
+
+        // Capture the on-disk dirty state BEFORE we flip it for liveness,
+        // so `status` can report whether the last session closed cleanly.
+        device.was_dirty_on_open = device.superblock.is_dirty();
 
         if device.superblock.is_dirty() {
             device.log_verbose("unclean shutdown detected — running recovery");
@@ -355,6 +365,22 @@ impl StegoDevice {
         self.redirection.is_mapped(logical)
     }
 
+    /// The allocation plan this device was opened with — the set of
+    /// tensors contributing stego capacity, ordered by tier. Used by
+    /// `diagnostics::gather` to build per-tier breakdowns.
+    pub fn allocation_plan(&self) -> &AllocationPlan {
+        &self.plan
+    }
+
+    /// True if the on-disk dirty flag was already set when this handle
+    /// opened the device — i.e., the previous session did not close
+    /// cleanly and recovery ran on open. Used by `status` to surface
+    /// "was dirty" without confusing it with the live dirty flag that
+    /// `open_with_options` flips for liveness tracking.
+    pub fn was_dirty_on_open(&self) -> bool {
+        self.was_dirty_on_open
+    }
+
     /// Diagnostic accessor: read a physical block as the stego layer
     /// decodes it (no redirection, no CRC check). Used by `llmdb dump-block`.
     pub fn read_physical_block_for_diag(
@@ -456,6 +482,7 @@ impl StegoDevice {
             }),
             redirection: RedirectionTable::empty(total_blocks),
             reserved_logicals: HashSet::new(),
+            was_dirty_on_open: false,
             verbose: options.verbose,
         };
 
