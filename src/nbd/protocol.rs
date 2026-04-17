@@ -40,9 +40,67 @@ pub const REQUEST_HEADER_BYTES: usize = 28;
 /// On-wire size of a simple reply header (data, if any, follows separately).
 pub const REPLY_HEADER_BYTES: usize = 16;
 
-/// On-wire size of the oldstyle negotiation banner the server emits on
-/// connection accept.
+/// On-wire size of the oldstyle negotiation banner. Retained for parity
+/// tests; modern `nbd-client` (≥ 3.10) dropped oldstyle, so the server
+/// uses newstyle exclusively — see `encode_newstyle_header`.
 pub const OLDSTYLE_HANDSHAKE_BYTES: usize = 152;
+
+/// On-wire size of the fixed newstyle negotiation header the server emits
+/// on connection accept: 8 bytes NBDMAGIC + 8 bytes IHAVEOPT + 2 bytes of
+/// server handshake flags = 18 bytes.
+pub const NEWSTYLE_HEADER_BYTES: usize = 18;
+
+// -- Newstyle handshake flags --
+
+/// Server flag: we speak fixed newstyle (option haggling with reply magic,
+/// per NBD_PROTO_VERSION_FIXED_NEWSTYLE).
+pub const NBD_FLAG_FIXED_NEWSTYLE: u16 = 1 << 0;
+
+/// Server flag: the 124-byte zero tail after `NBD_OPT_EXPORT_NAME` is
+/// omitted when the client acknowledges this flag.
+pub const NBD_FLAG_NO_ZEROES: u16 = 1 << 1;
+
+/// Client flag: client speaks fixed newstyle.
+pub const NBD_FLAG_C_FIXED_NEWSTYLE: u32 = 1 << 0;
+/// Client flag: client supports the no-zeroes reply to NBD_OPT_EXPORT_NAME.
+pub const NBD_FLAG_C_NO_ZEROES: u32 = 1 << 1;
+
+// -- Option codes --
+
+pub const NBD_OPT_EXPORT_NAME: u32 = 1;
+pub const NBD_OPT_ABORT: u32 = 2;
+pub const NBD_OPT_LIST: u32 = 3;
+pub const NBD_OPT_STARTTLS: u32 = 5;
+pub const NBD_OPT_INFO: u32 = 6;
+pub const NBD_OPT_GO: u32 = 7;
+pub const NBD_OPT_STRUCTURED_REPLY: u32 = 8;
+
+/// Magic prefix on every option reply (NBD proto `NBD_REP_MAGIC`).
+pub const OPTION_REPLY_MAGIC: u64 = 0x0003_E889_0455_65A9;
+
+// -- Option reply types --
+
+pub const NBD_REP_ACK: u32 = 1;
+pub const NBD_REP_INFO: u32 = 3;
+pub const NBD_REP_ERR_UNSUP: u32 = 0x8000_0001;
+pub const NBD_REP_ERR_POLICY: u32 = 0x8000_0002;
+pub const NBD_REP_ERR_INVALID: u32 = 0x8000_0003;
+
+// -- Info record types (inside NBD_REP_INFO) --
+
+pub const NBD_INFO_EXPORT: u16 = 0;
+pub const NBD_INFO_NAME: u16 = 1;
+pub const NBD_INFO_DESCRIPTION: u16 = 2;
+pub const NBD_INFO_BLOCK_SIZE: u16 = 3;
+
+// -- Transmission flags (advertised per export) --
+
+pub const NBD_FLAG_HAS_FLAGS: u16 = 1 << 0;
+pub const NBD_FLAG_READ_ONLY: u16 = 1 << 1;
+pub const NBD_FLAG_SEND_FLUSH: u16 = 1 << 2;
+pub const NBD_FLAG_SEND_FUA: u16 = 1 << 3;
+pub const NBD_FLAG_ROTATIONAL: u16 = 1 << 4;
+pub const NBD_FLAG_SEND_TRIM: u16 = 1 << 5;
 
 // -- Command type --
 
@@ -209,12 +267,100 @@ pub fn encode_oldstyle_handshake(
     bytes
 }
 
+// -- Newstyle negotiation --
+//
+// Layout (big-endian), 18 bytes:
+//   0x00   8 bytes  "NBDMAGIC"
+//   0x08   8 bytes  "IHAVEOPT"
+//   0x10   2 bytes  handshake flags
+//
+// The client then sends 4 bytes of client flags, and option haggling
+// begins. After a successful `NBD_OPT_EXPORT_NAME` or `NBD_OPT_GO`
+// reply the connection transitions to the transmission phase (same
+// request/reply framing as oldstyle).
+
+pub fn encode_newstyle_header(
+    handshake_flags: u16,
+) -> [u8; NEWSTYLE_HEADER_BYTES] {
+    let mut bytes = [0_u8; NEWSTYLE_HEADER_BYTES];
+    bytes[0..8].copy_from_slice(&NBDMAGIC.to_be_bytes());
+    bytes[8..16].copy_from_slice(&IHAVEOPT.to_be_bytes());
+    bytes[16..18].copy_from_slice(&handshake_flags.to_be_bytes());
+    bytes
+}
+
+/// Reply to `NBD_OPT_EXPORT_NAME`. Not wrapped in the option-reply
+/// envelope — this is a raw frame in the NBD spec. `no_zeroes` controls
+/// whether the 124-byte reserved tail is omitted (when the client
+/// advertised `NBD_FLAG_C_NO_ZEROES` in its client flags).
+pub fn encode_export_name_reply(size: u64, flags: u16, no_zeroes: bool) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(if no_zeroes { 10 } else { 134 });
+    bytes.extend_from_slice(&size.to_be_bytes());
+    bytes.extend_from_slice(&flags.to_be_bytes());
+    if !no_zeroes {
+        bytes.extend_from_slice(&[0_u8; 124]);
+    }
+    bytes
+}
+
+/// Generic option-reply header + payload: magic + echoed option code +
+/// reply type + payload length + payload bytes.
+pub fn encode_option_reply(option: u32, reply_type: u32, payload: &[u8]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(20 + payload.len());
+    bytes.extend_from_slice(&OPTION_REPLY_MAGIC.to_be_bytes());
+    bytes.extend_from_slice(&option.to_be_bytes());
+    bytes.extend_from_slice(&reply_type.to_be_bytes());
+    bytes.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    bytes.extend_from_slice(payload);
+    bytes
+}
+
+/// Encode the `NBD_INFO_EXPORT` info record that `NBD_OPT_GO` / `NBD_OPT_INFO`
+/// replies wrap in an `NBD_REP_INFO` reply: 2 bytes info type + 8 bytes size
+/// + 2 bytes transmission flags = 12 bytes of payload.
+pub fn encode_info_export(size: u64, flags: u16) -> [u8; 12] {
+    let mut bytes = [0_u8; 12];
+    bytes[0..2].copy_from_slice(&NBD_INFO_EXPORT.to_be_bytes());
+    bytes[2..10].copy_from_slice(&size.to_be_bytes());
+    bytes[10..12].copy_from_slice(&flags.to_be_bytes());
+    bytes
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NbdOptionHeader {
+    pub option: u32,
+    pub data_len: u32,
+}
+
+/// Parse the 16-byte option header sent by the client. Does not consume
+/// the option payload bytes; the caller reads `data_len` bytes next.
+pub fn parse_option_header(bytes: &[u8]) -> Result<NbdOptionHeader, NbdProtoError> {
+    if bytes.len() < 16 {
+        return Err(NbdProtoError::TruncatedHeader {
+            have: bytes.len(),
+            need: 16,
+        });
+    }
+    let magic = u64::from_be_bytes(bytes[0..8].try_into().unwrap());
+    if magic != IHAVEOPT {
+        return Err(NbdProtoError::BadOptionMagic {
+            expected: IHAVEOPT,
+            actual: magic,
+        });
+    }
+    let option = u32::from_be_bytes(bytes[8..12].try_into().unwrap());
+    let data_len = u32::from_be_bytes(bytes[12..16].try_into().unwrap());
+    Ok(NbdOptionHeader { option, data_len })
+}
+
 // -- Errors --
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum NbdProtoError {
     #[error("bad magic: expected {expected:#010x}, got {actual:#010x}")]
     BadMagic { expected: u32, actual: u32 },
+    #[error("bad option magic: expected {expected:#018x}, got {actual:#018x}")]
+    BadOptionMagic { expected: u64, actual: u64 },
     #[error("unknown NBD command type: {0}")]
     UnknownCommand(u16),
     #[error("truncated header: have {have} bytes, need {need}")]

@@ -1,14 +1,9 @@
 use thiserror::Error;
 
+use crate::stego::integrity::NO_BLOCK;
+
 pub const ENTRIES_PER_BLOCK: usize = 1022;
 const HEADER_BYTES: usize = 8;
-
-/// High bit of a redirection entry marks "logical has been written at least
-/// once." Entries stored as `physical | WRITTEN_BIT` when written; a bare
-/// identity entry (`entries[L] == L`, high bit clear) means "never written".
-/// Physical indices are capped at 2^31 − 1 blocks (~8 TB at 4 KB).
-pub const WRITTEN_BIT: u32 = 0x8000_0000;
-pub const PHYSICAL_MASK: u32 = 0x7FFF_FFFF;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RedirectionBootstrap {
@@ -77,6 +72,13 @@ impl RedirectionTableBlock {
     }
 }
 
+/// Maps logical block indices to physical block indices, with `NO_BLOCK`
+/// (= `u32::MAX`) as the sentinel for "logical not currently bound to any
+/// physical." Logical and physical address spaces are intentionally
+/// separate: a redirection-table index is *only* a logical key, never an
+/// implicit physical address. The free list and any direct-addressing
+/// client (NBD) operate on physicals; the redirection layer is the
+/// translation in between.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RedirectionTable {
     blocks: Vec<RedirectionTableBlock>,
@@ -84,7 +86,12 @@ pub struct RedirectionTable {
 }
 
 impl RedirectionTable {
-    pub fn identity(total_blocks: u32) -> Self {
+    /// Build an empty redirection table sized for `total_blocks` logical
+    /// entries — every entry is `NO_BLOCK` (unmapped). Replaces the older
+    /// "identity" initializer that aliased logical L to physical L by
+    /// default; that aliasing is what made shadow-copy collide with
+    /// direct-addressing workloads.
+    pub fn empty(total_blocks: u32) -> Self {
         if total_blocks == 0 {
             return Self {
                 blocks: Vec::new(),
@@ -99,7 +106,7 @@ impl RedirectionTable {
 
         for _ in 0..block_count {
             let count = remaining.min(ENTRIES_PER_BLOCK as u32);
-            let entries: Vec<u32> = (cursor..cursor + count).collect();
+            let entries: Vec<u32> = vec![NO_BLOCK; count as usize];
             blocks.push(RedirectionTableBlock {
                 first_logical_block: cursor,
                 entry_count: count,
@@ -115,21 +122,22 @@ impl RedirectionTable {
         }
     }
 
-    /// Returns the physical block holding `logical`'s data, stripping the
-    /// written flag. For an identity entry this is `logical` itself.
+    /// Returns the physical block holding `logical`'s data, or `None` when
+    /// `logical` is unmapped (never written, or freed). Reads of unmapped
+    /// logicals at the device layer present as zeros.
     pub fn logical_to_physical(&self, logical: u32) -> Option<u32> {
-        self.raw_entry(logical)
-            .map(|entry| entry & PHYSICAL_MASK)
+        let raw = self.raw_entry(logical)?;
+        if raw == NO_BLOCK {
+            None
+        } else {
+            Some(raw)
+        }
     }
 
-    /// True iff the entry has been explicitly set via `set_mapping` (either
-    /// marking a direct first write or recording a shadow redirect). Used by
-    /// the device to distinguish "never written" identity from "written at
-    /// identity" for crash recovery and to decide direct vs shadow on write.
-    pub fn is_written(&self, logical: u32) -> bool {
-        self.raw_entry(logical)
-            .map(|entry| entry & WRITTEN_BIT != 0)
-            .unwrap_or(false)
+    /// True iff `logical` currently maps to a physical (i.e., has user data
+    /// somewhere). The complement of "unmapped".
+    pub fn is_mapped(&self, logical: u32) -> bool {
+        self.logical_to_physical(logical).is_some()
     }
 
     fn raw_entry(&self, logical: u32) -> Option<u32> {
@@ -144,32 +152,30 @@ impl RedirectionTable {
             .copied()
     }
 
-    /// Record that `logical` maps to `physical`, marking it as written.
-    /// Physical values with the high bit set are rejected — the high bit is
-    /// reserved for the written flag.
+    /// Bind `logical` to `physical`. `physical` must be a valid physical
+    /// block index (not `NO_BLOCK`). To unbind use `clear`.
     pub fn set_mapping(&mut self, logical: u32, physical: u32) {
         debug_assert!(
-            physical & WRITTEN_BIT == 0,
-            "physical index {physical:#x} exceeds 31-bit capacity"
+            physical != NO_BLOCK,
+            "set_mapping called with NO_BLOCK; use clear() to unmap"
         );
         let block_index = logical as usize / ENTRIES_PER_BLOCK;
         let entry_index = logical as usize % ENTRIES_PER_BLOCK;
         if let Some(block) = self.blocks.get_mut(block_index) {
             if entry_index < block.entries.len() {
-                block.entries[entry_index] = (physical & PHYSICAL_MASK) | WRITTEN_BIT;
+                block.entries[entry_index] = physical;
             }
         }
     }
 
-    /// Reset `logical` to unwritten identity (`entries[logical] == logical`,
-    /// no written flag). Used on `free_block` so the slot can be re-allocated
-    /// cleanly.
+    /// Mark `logical` as unmapped — `logical_to_physical` will return `None`
+    /// afterwards. Used by `free_block` and shadow-copy phase 3 cleanup.
     pub fn clear(&mut self, logical: u32) {
         let block_index = logical as usize / ENTRIES_PER_BLOCK;
         let entry_index = logical as usize % ENTRIES_PER_BLOCK;
         if let Some(block) = self.blocks.get_mut(block_index) {
             if entry_index < block.entries.len() {
-                block.entries[entry_index] = logical;
+                block.entries[entry_index] = NO_BLOCK;
             }
         }
     }

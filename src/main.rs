@@ -86,6 +86,12 @@ enum Command {
         #[arg(long)]
         socket: Option<PathBuf>,
     },
+    /// Diagnostic: hexdump a physical block as the stego layer decodes it.
+    /// Useful for chasing free-list / redirection corruption.
+    DumpBlock {
+        model: PathBuf,
+        block: u32,
+    },
     Ask {
         model: PathBuf,
     },
@@ -150,6 +156,7 @@ fn dispatch(cmd: Command, mode: AllocationMode, options: DeviceOptions) -> Resul
         Command::Verify { model } => cmd_verify(&model, mode, options),
         Command::Wipe { model, yes } => cmd_wipe(&model, yes, mode, options),
         Command::Serve { model, socket } => cmd_serve(&model, socket, mode, options),
+        Command::DumpBlock { model, block } => cmd_dump_block(&model, block, mode, options),
         Command::Dump { .. } | Command::Mount { .. } | Command::Unmount { .. } | Command::Ask { .. } => {
             Err(CliError::internal(format!(
                 "command not implemented yet: {}",
@@ -174,6 +181,7 @@ fn command_name(cmd: &Command) -> &'static str {
         Command::Dump { .. } => "dump",
         Command::Wipe { .. } => "wipe",
         Command::Serve { .. } => "serve",
+        Command::DumpBlock { .. } => "dump-block",
     }
 }
 
@@ -405,6 +413,27 @@ fn cmd_serve(
         .serve_on_unix_socket(&socket_path)
         .map_err(nbd_err)?;
     println!("nbd client disconnected; server exiting");
+    Ok(())
+}
+
+fn cmd_dump_block(
+    model: &Path,
+    block: u32,
+    alloc_mode: AllocationMode,
+    options: DeviceOptions,
+) -> Result<(), CliError> {
+    let device = StegoDevice::open_with_options(model, alloc_mode, options).map_err(open_err)?;
+    let bytes = device.read_physical_block_for_diag(block).map_err(dev_err)?;
+    let written = device.is_logical_written(block);
+    println!(
+        "physical block {block} (logical written? {written}); first 256 bytes:"
+    );
+    for (i, chunk) in bytes.chunks(16).take(16).enumerate() {
+        let hex: Vec<String> = chunk.iter().map(|b| format!("{b:02x}")).collect();
+        println!("  {:04x}: {}", i * 16, hex.join(" "));
+    }
+    let nonzero = bytes.iter().filter(|&&b| b != 0).count();
+    println!("(total nonzero bytes in this block: {nonzero}/4096)");
     Ok(())
 }
 

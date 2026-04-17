@@ -19,7 +19,8 @@ use std::time::Duration;
 use common::{SyntheticGgufVersion, SyntheticTensorSpec, write_custom_gguf_fixture};
 use llmdb::gguf::quant::GGML_TYPE_Q8_0_ID;
 use llmdb::nbd::protocol::{
-    NbdCommand, NbdRequest, OLDSTYLE_HANDSHAKE_BYTES, REPLY_HEADER_BYTES, encode_request,
+    IHAVEOPT, NBDMAGIC, NBD_FLAG_C_FIXED_NEWSTYLE, NBD_FLAG_C_NO_ZEROES, NBD_OPT_EXPORT_NAME,
+    NEWSTYLE_HEADER_BYTES, NbdCommand, NbdRequest, REPLY_HEADER_BYTES, encode_request,
     parse_reply_header,
 };
 use llmdb::nbd::server::NbdServer;
@@ -92,12 +93,35 @@ fn client_handshake_read_write_disc_over_unix_socket() {
     conn.set_read_timeout(Some(Duration::from_secs(5)))
         .expect("set read timeout");
 
-    // 1. Read and verify the oldstyle handshake.
-    let mut handshake = [0_u8; OLDSTYLE_HANDSHAKE_BYTES];
-    conn.read_exact(&mut handshake).expect("handshake");
-    let advertised =
-        u64::from_be_bytes(handshake[16..24].try_into().unwrap());
-    assert_eq!(advertised, export, "handshake exports wrong size");
+    // 1. Newstyle handshake: read banner (18 bytes), send client flags (4),
+    //    send NBD_OPT_EXPORT_NAME with empty export name, read the 10-byte
+    //    export reply (NO_ZEROES negotiated → no 124-byte tail).
+    let mut banner = [0_u8; NEWSTYLE_HEADER_BYTES];
+    conn.read_exact(&mut banner).expect("banner");
+    assert_eq!(
+        u64::from_be_bytes(banner[0..8].try_into().unwrap()),
+        NBDMAGIC
+    );
+    assert_eq!(
+        u64::from_be_bytes(banner[8..16].try_into().unwrap()),
+        IHAVEOPT
+    );
+
+    let client_flags = NBD_FLAG_C_FIXED_NEWSTYLE | NBD_FLAG_C_NO_ZEROES;
+    conn.write_all(&client_flags.to_be_bytes())
+        .expect("client flags");
+
+    // NBD_OPT_EXPORT_NAME with empty name.
+    let mut opt = Vec::new();
+    opt.extend_from_slice(&IHAVEOPT.to_be_bytes());
+    opt.extend_from_slice(&NBD_OPT_EXPORT_NAME.to_be_bytes());
+    opt.extend_from_slice(&0_u32.to_be_bytes());
+    conn.write_all(&opt).expect("send export_name option");
+
+    let mut export_reply = [0_u8; 10]; // 8 bytes size + 2 bytes flags (NO_ZEROES)
+    conn.read_exact(&mut export_reply).expect("export reply");
+    let advertised = u64::from_be_bytes(export_reply[0..8].try_into().unwrap());
+    assert_eq!(advertised, export, "export reply size mismatch");
 
     // 2. Send a Read request for block 0.
     let read_req = NbdRequest {
@@ -190,8 +214,8 @@ fn client_disconnect_without_disc_ends_cleanly() {
         thread::sleep(Duration::from_millis(10));
     }
     let mut conn = conn.expect("connect");
-    let mut handshake = [0_u8; OLDSTYLE_HANDSHAKE_BYTES];
-    conn.read_exact(&mut handshake).expect("handshake");
+    let mut banner = [0_u8; NEWSTYLE_HEADER_BYTES];
+    conn.read_exact(&mut banner).expect("banner");
     drop(conn);
 
     let server_result = server_thread.join().expect("server thread panic");

@@ -163,11 +163,12 @@ fn unclean_shutdown_sets_dirty_and_recovery_clears_it() {
 }
 
 #[test]
-fn overwrite_after_overwrite_reclaims_previous_shadow() {
-    // Covers the two-stage shadow transition: the first overwrite leaves the
-    // old physical in place (old == logical key), the second overwrite pushes
-    // the previous shadow back to the free list.
-    let fixture = make_fixture("shadow_double_overwrite.gguf");
+fn overwrites_consume_zero_net_blocks_under_split_namespace() {
+    // With logical and physical address spaces separated, every shadow-copy
+    // pops one new physical and pushes the old one back — net zero block
+    // consumption per overwrite. Run a long sequence and assert the free
+    // count stays flat.
+    let fixture = make_fixture("shadow_overwrite_churn.gguf");
 
     let mut device =
         StegoDevice::initialize_with_options(&fixture.path, AllocationMode::Standard, verbose())
@@ -175,35 +176,91 @@ fn overwrite_after_overwrite_reclaims_previous_shadow() {
 
     let block = device.alloc_block().expect("alloc");
 
-    let v1 = vec![0x01_u8; llmdb::BLOCK_SIZE];
-    let v2 = vec![0x02_u8; llmdb::BLOCK_SIZE];
-    let v3 = vec![0x03_u8; llmdb::BLOCK_SIZE];
+    // First write maps the logical to a physical: that's a one-block
+    // increase relative to the all-unmapped initial state.
+    device
+        .write_block(block, &vec![0_u8; llmdb::BLOCK_SIZE])
+        .expect("first write");
+    let used_baseline = device.used_blocks().expect("used baseline");
 
-    device.write_block(block, &v1).expect("write v1 (direct)");
-    let used_after_v1 = device.used_blocks().expect("used v1");
+    // Now hammer with overwrites — each one is shadow-copy under split
+    // namespace and must net to zero. Far more iterations than there are
+    // free blocks; if any overwrite leaks a block we'd OutOfSpace.
+    for i in 0..50_u8 {
+        device
+            .write_block(block, &vec![i; llmdb::BLOCK_SIZE])
+            .expect("overwrite churn");
+        let used_now = device.used_blocks().expect("used");
+        assert_eq!(
+            used_now, used_baseline,
+            "overwrite #{i} leaked a block (used was {used_baseline}, now {used_now})"
+        );
+    }
 
-    device.write_block(block, &v2).expect("write v2 (first shadow)");
-    let used_after_v2 = device.used_blocks().expect("used v2");
-    assert_eq!(
-        used_after_v2,
-        used_after_v1 + 1,
-        "first shadow consumes one block — old physical is kept as the logical key"
-    );
-
-    device.write_block(block, &v3).expect("write v3 (second shadow)");
-    let used_after_v3 = device.used_blocks().expect("used v3");
-    assert_eq!(
-        used_after_v3, used_after_v2,
-        "second shadow reclaims the previous shadow into the free list"
-    );
-
-    let read_back = device.read_block(block).expect("read v3");
-    assert_eq!(read_back, v3);
+    // Final read sees the last value written.
+    let read_back = device.read_block(block).expect("final read");
+    assert_eq!(read_back, vec![49_u8; llmdb::BLOCK_SIZE]);
 
     assert_eq!(
         device.verify_integrity().expect("verify"),
         Vec::<u32>::new(),
-        "integrity scan must be clean after overwrites"
+        "integrity scan must be clean after the churn"
+    );
+
+    device.close().expect("close");
+}
+
+#[test]
+fn write_to_logical_used_as_shadow_target_does_not_corrupt_original() {
+    // Regression for the NBD-mount integrity mismatch: after we shadow-copy
+    // logical L to physical Q, a subsequent direct-addressed write to
+    // logical Q (which an NBD client may issue with no awareness of our
+    // shadow bookkeeping) must take the shadow-copy path and leave L's
+    // bytes at physical Q intact.
+    let fixture = make_fixture("shadow_target_collision.gguf");
+
+    let mut device =
+        StegoDevice::initialize_with_options(&fixture.path, AllocationMode::Standard, verbose())
+            .expect("init");
+
+    let l = device.alloc_block().expect("alloc L");
+    let original = vec![0xA1_u8; llmdb::BLOCK_SIZE];
+    device.write_block(l, &original).expect("write L direct");
+
+    // The shadow target is the free-list head right before the overwrite.
+    let shadow_logical = device.superblock().fields.free_list_head;
+    assert_ne!(shadow_logical, llmdb::stego::integrity::NO_BLOCK);
+
+    let new = vec![0xB2_u8; llmdb::BLOCK_SIZE];
+    device.write_block(l, &new).expect("overwrite L (shadow)");
+    let used_before_collision = device.used_blocks().expect("used");
+
+    // Direct-addressed write to the logical that aliases the shadow target.
+    let collision = vec![0xC3_u8; llmdb::BLOCK_SIZE];
+    device
+        .write_block(shadow_logical, &collision)
+        .expect("write shadow_logical");
+
+    // L's data must still read as the value we shadowed in.
+    let read_back = device.read_block(l).expect("read L after collision");
+    assert_eq!(
+        read_back, new,
+        "L must survive a direct-addressed write to its shadow physical"
+    );
+
+    // The collision write itself should be a shadow-copy (consumed one
+    // additional free block) rather than an in-place clobber.
+    let used_after = device.used_blocks().expect("used after");
+    assert!(
+        used_after > used_before_collision,
+        "collision write must take the shadow path (consume a free block), \
+         not direct-overwrite L's storage"
+    );
+
+    assert_eq!(
+        device.verify_integrity().expect("verify"),
+        Vec::<u32>::new(),
+        "no block should report a CRC mismatch"
     );
 
     device.close().expect("close");

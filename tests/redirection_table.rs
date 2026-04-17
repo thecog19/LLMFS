@@ -1,51 +1,64 @@
+use llmdb::stego::integrity::NO_BLOCK;
 use llmdb::stego::redirection::{RedirectionError, RedirectionTable};
 
 #[test]
-fn identity_mapping_roundtrips_through_encode_decode() {
-    let table = RedirectionTable::identity(100);
+fn empty_table_reports_every_logical_as_unmapped() {
+    let table = RedirectionTable::empty(100);
 
     for logical in 0..100 {
         assert_eq!(
             table.logical_to_physical(logical),
-            Some(logical),
-            "identity mapping at {logical}"
+            None,
+            "fresh logical {logical} must be unmapped"
         );
+        assert!(!table.is_mapped(logical));
     }
-    assert_eq!(table.logical_to_physical(100), None);
+    assert_eq!(table.logical_to_physical(100), None); // out of range
 
     let encoded = table.encode();
     assert_eq!(encoded.len(), 1);
     assert_eq!(encoded[0].len(), llmdb::BLOCK_SIZE);
 
-    let decoded = RedirectionTable::decode(&encoded).expect("decode identity table");
+    let decoded = RedirectionTable::decode(&encoded).expect("decode empty table");
     for logical in 0..100 {
-        assert_eq!(decoded.logical_to_physical(logical), Some(logical));
+        assert_eq!(decoded.logical_to_physical(logical), None);
     }
 }
 
 #[test]
-fn set_mapping_overrides_identity_and_survives_roundtrip() {
-    let mut table = RedirectionTable::identity(20);
+fn set_mapping_binds_logical_to_physical_and_survives_roundtrip() {
+    let mut table = RedirectionTable::empty(20);
 
     table.set_mapping(5, 42);
     table.set_mapping(19, 0);
 
     assert_eq!(table.logical_to_physical(5), Some(42));
     assert_eq!(table.logical_to_physical(19), Some(0));
-    assert_eq!(table.logical_to_physical(6), Some(6));
+    assert_eq!(table.logical_to_physical(6), None);
 
     let encoded = table.encode();
-    let decoded = RedirectionTable::decode(&encoded).expect("decode updated table");
+    let decoded = RedirectionTable::decode(&encoded).expect("decode bound table");
 
     assert_eq!(decoded.logical_to_physical(5), Some(42));
     assert_eq!(decoded.logical_to_physical(19), Some(0));
-    assert_eq!(decoded.logical_to_physical(6), Some(6));
+    assert_eq!(decoded.logical_to_physical(6), None);
+}
+
+#[test]
+fn clear_unbinds_logical() {
+    let mut table = RedirectionTable::empty(10);
+    table.set_mapping(3, 100);
+    assert_eq!(table.logical_to_physical(3), Some(100));
+
+    table.clear(3);
+    assert_eq!(table.logical_to_physical(3), None);
+    assert!(!table.is_mapped(3));
 }
 
 #[test]
 fn cross_block_table_spans_multiple_blocks() {
     let total = 3000_u32;
-    let table = RedirectionTable::identity(total);
+    let table = RedirectionTable::empty(total);
 
     let encoded = table.encode();
     assert_eq!(encoded.len(), 3, "3000 entries need 3 blocks (1022+1022+956)");
@@ -55,18 +68,16 @@ fn cross_block_table_spans_multiple_blocks() {
 
     let decoded = RedirectionTable::decode(&encoded).expect("decode 3-block table");
 
-    assert_eq!(decoded.logical_to_physical(0), Some(0));
-    assert_eq!(decoded.logical_to_physical(1021), Some(1021));
-    assert_eq!(decoded.logical_to_physical(1022), Some(1022));
-    assert_eq!(decoded.logical_to_physical(2043), Some(2043));
-    assert_eq!(decoded.logical_to_physical(2044), Some(2044));
-    assert_eq!(decoded.logical_to_physical(2999), Some(2999));
-    assert_eq!(decoded.logical_to_physical(3000), None);
+    assert_eq!(decoded.logical_to_physical(0), None);
+    assert_eq!(decoded.logical_to_physical(1021), None);
+    assert_eq!(decoded.logical_to_physical(1022), None);
+    assert_eq!(decoded.logical_to_physical(2999), None);
+    assert_eq!(decoded.logical_to_physical(3000), None); // out of range
 }
 
 #[test]
 fn cross_block_set_mapping_targets_correct_block() {
-    let mut table = RedirectionTable::identity(3000);
+    let mut table = RedirectionTable::empty(3000);
 
     table.set_mapping(1500, 9999);
 
@@ -74,8 +85,8 @@ fn cross_block_set_mapping_targets_correct_block() {
     let decoded = RedirectionTable::decode(&encoded).expect("decode");
 
     assert_eq!(decoded.logical_to_physical(1500), Some(9999));
-    assert_eq!(decoded.logical_to_physical(1499), Some(1499));
-    assert_eq!(decoded.logical_to_physical(1501), Some(1501));
+    assert_eq!(decoded.logical_to_physical(1499), None);
+    assert_eq!(decoded.logical_to_physical(1501), None);
 }
 
 #[test]
@@ -90,9 +101,7 @@ fn decode_rejects_wrong_block_length() {
 #[test]
 fn decode_rejects_entry_count_exceeding_capacity() {
     let mut block = vec![0_u8; llmdb::BLOCK_SIZE];
-    // first_logical_block = 0
     block[0..4].copy_from_slice(&0_u32.to_le_bytes());
-    // entry_count = 2000 (exceeds 1022)
     block[4..8].copy_from_slice(&2000_u32.to_le_bytes());
 
     let result = RedirectionTable::decode(&[block]);
@@ -103,9 +112,26 @@ fn decode_rejects_entry_count_exceeding_capacity() {
 }
 
 #[test]
-fn identity_zero_blocks_produces_empty_table() {
-    let table = RedirectionTable::identity(0);
+fn empty_zero_blocks_produces_empty_table() {
+    let table = RedirectionTable::empty(0);
     assert_eq!(table.logical_to_physical(0), None);
     let encoded = table.encode();
     assert!(encoded.is_empty());
+}
+
+#[test]
+fn no_block_sentinel_round_trips_through_encoding() {
+    // An entry with NO_BLOCK sentinel must round-trip as "unmapped".
+    let mut table = RedirectionTable::empty(4);
+    table.set_mapping(2, 7);
+    table.clear(2);
+    let encoded = table.encode();
+    let decoded = RedirectionTable::decode(&encoded).expect("decode");
+    assert_eq!(decoded.logical_to_physical(2), None);
+    // Sanity: the on-disk byte representation is NO_BLOCK little-endian.
+    let entry_bytes = &encoded[0][8 + 2 * 4..8 + 2 * 4 + 4];
+    assert_eq!(
+        u32::from_le_bytes(entry_bytes.try_into().unwrap()),
+        NO_BLOCK
+    );
 }
