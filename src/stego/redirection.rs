@@ -3,6 +3,13 @@ use thiserror::Error;
 pub const ENTRIES_PER_BLOCK: usize = 1022;
 const HEADER_BYTES: usize = 8;
 
+/// High bit of a redirection entry marks "logical has been written at least
+/// once." Entries stored as `physical | WRITTEN_BIT` when written; a bare
+/// identity entry (`entries[L] == L`, high bit clear) means "never written".
+/// Physical indices are capped at 2^31 − 1 blocks (~8 TB at 4 KB).
+pub const WRITTEN_BIT: u32 = 0x8000_0000;
+pub const PHYSICAL_MASK: u32 = 0x7FFF_FFFF;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RedirectionBootstrap {
     pub entries_per_block: usize,
@@ -108,7 +115,24 @@ impl RedirectionTable {
         }
     }
 
+    /// Returns the physical block holding `logical`'s data, stripping the
+    /// written flag. For an identity entry this is `logical` itself.
     pub fn logical_to_physical(&self, logical: u32) -> Option<u32> {
+        self.raw_entry(logical)
+            .map(|entry| entry & PHYSICAL_MASK)
+    }
+
+    /// True iff the entry has been explicitly set via `set_mapping` (either
+    /// marking a direct first write or recording a shadow redirect). Used by
+    /// the device to distinguish "never written" identity from "written at
+    /// identity" for crash recovery and to decide direct vs shadow on write.
+    pub fn is_written(&self, logical: u32) -> bool {
+        self.raw_entry(logical)
+            .map(|entry| entry & WRITTEN_BIT != 0)
+            .unwrap_or(false)
+    }
+
+    fn raw_entry(&self, logical: u32) -> Option<u32> {
         if logical >= self.total_entries {
             return None;
         }
@@ -120,12 +144,32 @@ impl RedirectionTable {
             .copied()
     }
 
+    /// Record that `logical` maps to `physical`, marking it as written.
+    /// Physical values with the high bit set are rejected — the high bit is
+    /// reserved for the written flag.
     pub fn set_mapping(&mut self, logical: u32, physical: u32) {
+        debug_assert!(
+            physical & WRITTEN_BIT == 0,
+            "physical index {physical:#x} exceeds 31-bit capacity"
+        );
         let block_index = logical as usize / ENTRIES_PER_BLOCK;
         let entry_index = logical as usize % ENTRIES_PER_BLOCK;
         if let Some(block) = self.blocks.get_mut(block_index) {
             if entry_index < block.entries.len() {
-                block.entries[entry_index] = physical;
+                block.entries[entry_index] = (physical & PHYSICAL_MASK) | WRITTEN_BIT;
+            }
+        }
+    }
+
+    /// Reset `logical` to unwritten identity (`entries[logical] == logical`,
+    /// no written flag). Used on `free_block` so the slot can be re-allocated
+    /// cleanly.
+    pub fn clear(&mut self, logical: u32) {
+        let block_index = logical as usize / ENTRIES_PER_BLOCK;
+        let entry_index = logical as usize % ENTRIES_PER_BLOCK;
+        if let Some(block) = self.blocks.get_mut(block_index) {
+            if entry_index < block.entries.len() {
+                block.entries[entry_index] = logical;
             }
         }
     }

@@ -1,6 +1,6 @@
 # Task 12: NBD Server And Mount
 
-Status: todo
+Status: in-progress (server and `serve` CLI landed; full `mount` orchestration deferred)
 Depends on: 11-nbd-protocol.md, 10-cli-file-commands.md
 Spec refs: DESIGN-NEW.MD section "7. NBD Server" (Implementation, Alignment, `llmdb mount`)
 

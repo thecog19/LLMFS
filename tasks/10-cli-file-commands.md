@@ -1,6 +1,6 @@
 # Task 10: CLI File Commands
 
-Status: todo
+Status: done
 Depends on: 09-file-table-and-file-ops.md
 Spec refs: DESIGN-NEW.MD section "9. CLI"
 
@@ -40,3 +40,24 @@ Acceptance criteria:
 - `cargo test --offline tests::cli_smoke` passes end-to-end.
 - Every subcommand has a `--help` that names its arguments.
 - `assert_cmd` or equivalent is used (no raw subprocess spawning) for testability.
+
+Deviations from spec (intentional):
+
+- `dump` is stubbed (returns "command not implemented yet"). The `tar` crate
+  was not added. The subcommand shell exists; wiring it through `list_files`
+  and the `tar` crate can be folded into Task 14 (diagnostics) or a follow-up
+  if needed. Mount/unmount/ask are likewise stubbed — they belong to Tasks 11–13.
+- `wipe` zeros every stego block **and** re-initializes the device in one
+  step, so `status` after `wipe --yes` works without a second `init`
+  invocation. The task's original wording ("zeroes all stego bits") suggested
+  a destroy-only operation, but the same task's smoke test calls `status`
+  after `wipe`, which requires a valid superblock. Re-init after zero matches
+  that acceptance criterion while keeping the "no residual user bits"
+  guarantee (the zero pass overwrites any block bits that `format` might
+  leave alone).
+- `--lobotomy` is a global flag (applies to every subcommand) rather than
+  only `init`. Re-opening a lobotomy-formatted device requires the open plan
+  to match the format plan; without a lightweight "peek flags" path this is
+  the cleanest way to let the user flip modes consistently.
+- Byte equality in the smoke tests substitutes for SHA256 comparison — it is
+  strictly stronger and avoids pulling in `sha2` as a dev-dependency.

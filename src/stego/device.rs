@@ -20,6 +20,22 @@ use crate::stego::redirection::{RedirectionError, RedirectionTable};
 const SUPERBLOCK_BLOCK: u32 = 0;
 const FILE_TABLE_INITIAL_BLOCKS: u32 = 1;
 
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrashPoint {
+    AfterShadowFlush,
+    AfterRedirectionFlush,
+}
+
+impl CrashPoint {
+    fn as_stop_phase(self) -> u8 {
+        match self {
+            Self::AfterShadowFlush => 1,
+            Self::AfterRedirectionFlush => 2,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceBootstrap {
     pub block_size: usize,
@@ -60,6 +76,8 @@ impl StegoDevice {
     ) -> Result<Self, DeviceError> {
         let mut device = Self::open_internal(path, mode, options)?;
         device.format()?;
+        device.superblock.set_dirty(true);
+        device.persist_superblock()?;
         Ok(device)
     }
 
@@ -75,19 +93,31 @@ impl StegoDevice {
         let mut device = Self::open_internal(path, mode, options)?;
         device.superblock = device.load_superblock()?;
         device.redirection = device.load_redirection_table()?;
+
+        if device.superblock.is_dirty() {
+            device.log_verbose("unclean shutdown detected — running recovery");
+            device.recover()?;
+        }
+
+        device.superblock.set_dirty(true);
+        device.persist_superblock()?;
+
         device.log_verbose(format!(
-            "opened device: total_blocks={}, integrity_head={}, free_list_head={}, \
-             redir_start={}, redir_len={}, file_start={}, file_len={}, data_region_start={}",
+            "opened device: total_blocks={}, data_region_start={}, free_list_head={}",
             device.superblock.fields.total_blocks,
-            device.superblock.fields.integrity_chain_head,
-            device.superblock.fields.free_list_head,
-            device.superblock.fields.redirection_table_start,
-            device.superblock.fields.redirection_table_length,
-            device.superblock.fields.file_table_start,
-            device.superblock.fields.file_table_length,
             device.data_region_start(),
+            device.superblock.fields.free_list_head,
         ));
         Ok(device)
+    }
+
+    pub fn close(mut self) -> Result<(), DeviceError> {
+        self.superblock.set_dirty(false);
+        self.persist_superblock()?;
+        self.log_verbose("device closed cleanly");
+        // Prevent Drop from running (we already cleared dirty)
+        std::mem::forget(self);
+        Ok(())
     }
 
     pub fn superblock(&self) -> &Superblock {
@@ -139,6 +169,18 @@ impl StegoDevice {
 
     pub fn read_block(&self, block_index: u32) -> Result<Vec<u8>, DeviceError> {
         self.ensure_data_block(block_index)?;
+
+        // Unwritten logical blocks present as zeros to the caller. The
+        // underlying physical slot may hold the initial free-list chain
+        // encoding or a shadow target's content, but from the user's
+        // perspective the block has no data yet — NBD/ext4 and the file
+        // layer both rely on unwritten reads returning zeros rather than
+        // leaking stego bookkeeping.
+        if !self.redirection.is_written(block_index) {
+            self.log_verbose(format!("read unwritten block logical={} → zeros", block_index));
+            return Ok(vec![0_u8; crate::BLOCK_SIZE]);
+        }
+
         let physical = self
             .redirection
             .logical_to_physical(block_index)
@@ -156,6 +198,35 @@ impl StegoDevice {
     }
 
     pub fn write_block(&mut self, block_index: u32, data: &[u8]) -> Result<(), DeviceError> {
+        self.write_block_inner(block_index, data, 0)
+    }
+
+    #[doc(hidden)]
+    pub fn write_block_with_crash_after(
+        &mut self,
+        block_index: u32,
+        data: &[u8],
+        crash_point: CrashPoint,
+    ) -> Result<(), DeviceError> {
+        self.write_block_inner(block_index, data, crash_point.as_stop_phase())
+    }
+
+    /// The `stop_after_phase` parameter controls early exit for crash testing:
+    ///   0 = run to completion (normal write)
+    ///   1 = stop after flush 1 (shadow data durable, redirection not flipped)
+    ///   2 = stop after flush 2 (redirection flipped, old physical not freed)
+    ///
+    /// First writes to an unwritten block are direct (no shadow): alloc has
+    /// popped physical L from the free list, no live data exists yet at L, so
+    /// crash-safety is handled by the file-table commit (per DESIGN-NEW §13
+    /// File Store sequence). Overwrites of already-written blocks take the
+    /// shadow-copy path (§5 Block Write Implementation).
+    fn write_block_inner(
+        &mut self,
+        block_index: u32,
+        data: &[u8],
+        stop_after_phase: u8,
+    ) -> Result<(), DeviceError> {
         self.ensure_data_block(block_index)?;
         if data.len() != crate::BLOCK_SIZE {
             return Err(DeviceError::InvalidBlockWriteLength {
@@ -164,20 +235,74 @@ impl StegoDevice {
             });
         }
 
-        let physical = self
+        if !self.redirection.is_written(block_index) {
+            // First write since alloc: direct. `stop_after_phase` is ignored —
+            // crash tests target the shadow path only.
+            self.write_physical_block_raw(block_index, data)?;
+            self.update_block_crc(block_index, data)?;
+            self.redirection.set_mapping(block_index, block_index);
+            self.persist_redirection_block_for(block_index)?;
+            self.flush()?;
+            self.log_verbose(format!(
+                "direct write (first): block={} physical={}",
+                block_index, block_index
+            ));
+            return Ok(());
+        }
+
+        let old_physical = self
             .redirection
             .logical_to_physical(block_index)
             .ok_or(DeviceError::BlockOutOfRange {
                 index: block_index,
                 total_blocks: self.total_blocks(),
             })?;
-        self.write_physical_block_raw(physical, data)?;
-        self.update_block_crc(block_index, data)?;
+
+        let shadow = self.pop_free_block().ok_or(DeviceError::OutOfSpace)?;
+
+        // Phase 1: shadow data written + free-list pop durable. CRC NOT
+        // updated yet — the integrity table still reflects the old canonical
+        // data so a crash here is recovered by orphan-scan (shadow reclaimed,
+        // old data at `old_physical` remains authoritative).
+        self.write_physical_block_raw(shadow, data)?;
+        self.persist_superblock()?;
         self.flush()?;
         self.log_verbose(format!(
-            "wrote block logical={} physical={}",
-            block_index, physical
+            "shadow flush 1: block={} shadow_physical={}",
+            block_index, shadow
         ));
+
+        if stop_after_phase == 1 {
+            return Ok(());
+        }
+
+        // Phase 2: flip redirection + update CRC atomically. After this
+        // flush, read_block sees the new data with matching CRC.
+        self.redirection.set_mapping(block_index, shadow);
+        self.update_block_crc(block_index, data)?;
+        self.persist_redirection_block_for(block_index)?;
+        self.flush()?;
+        self.log_verbose(format!(
+            "shadow flush 2: redirection flipped block={} old={} new={}",
+            block_index, old_physical, shadow
+        ));
+
+        if stop_after_phase == 2 {
+            return Ok(());
+        }
+
+        // Phase 3: reclaim the old physical. On the first shadow for a block
+        // its old physical equals `block_index` itself — that slot is still
+        // the logical key and must not be pushed back or alloc_block would
+        // hand it out as a new logical (double-use). It stays "wasted" until
+        // free_block(L) is called. On subsequent shadows the old physical is
+        // a prior shadow target with no logical-key role and is reclaimed.
+        if old_physical != block_index {
+            self.push_free_block(old_physical)?;
+            self.persist_superblock()?;
+            self.flush()?;
+        }
+
         Ok(())
     }
 
@@ -187,15 +312,8 @@ impl StegoDevice {
             return Err(DeviceError::OutOfSpace);
         }
 
-        let physical = self
-            .redirection
-            .logical_to_physical(head)
-            .ok_or(DeviceError::BlockOutOfRange {
-                index: head,
-                total_blocks: self.total_blocks(),
-            })?;
-        let head_block = self.read_physical_block_raw(physical)?;
-        self.verify_block_crc(head, &head_block)?;
+        // Free list uses physical block indices directly
+        let head_block = self.read_physical_block_raw(head)?;
         let next = freelist::decode_next(&head_block)?;
         self.superblock.fields.free_list_head = next;
         self.persist_superblock()?;
@@ -209,44 +327,61 @@ impl StegoDevice {
     pub fn free_block(&mut self, block_index: u32) -> Result<(), DeviceError> {
         self.ensure_data_block(block_index)?;
 
-        let previous_head = self.superblock.fields.free_list_head;
-        let bytes = freelist::encode_head(previous_head);
-        self.write_block(block_index, &bytes)?;
-        self.superblock.fields.free_list_head = block_index;
+        let physical = self
+            .redirection
+            .logical_to_physical(block_index)
+            .unwrap_or(block_index);
+
+        // Push the current physical (where live data lives). If the block was
+        // shadow'd, also push `block_index` itself — that slot was reserved
+        // as the logical key and kept out of the free list during the first
+        // shadow. Freeing reclaims it.
+        self.push_free_block(physical)?;
+        if physical != block_index {
+            self.push_free_block(block_index)?;
+        }
+
+        self.redirection.clear(block_index);
+        self.persist_redirection_block_for(block_index)?;
         self.persist_superblock()?;
+        self.flush()?;
         self.log_verbose(format!(
-            "freed block {} new_free_head={}",
-            block_index, self.superblock.fields.free_list_head
+            "freed block logical={} physical={} new_free_head={}",
+            block_index, physical, self.superblock.fields.free_list_head
         ));
         Ok(())
     }
 
     pub fn used_blocks(&self) -> Result<u32, DeviceError> {
+        let free = self.free_blocks()?;
+        Ok(self.total_blocks().saturating_sub(free))
+    }
+
+    pub fn free_blocks(&self) -> Result<u32, DeviceError> {
         let mut free_count = 0_u32;
         let mut current = self.superblock.fields.free_list_head;
 
         while current != NO_BLOCK {
-            self.ensure_data_block(current)?;
-            let physical = self
-                .redirection
-                .logical_to_physical(current)
-                .ok_or(DeviceError::BlockOutOfRange {
-                    index: current,
-                    total_blocks: self.total_blocks(),
-                })?;
-            let bytes = self.read_physical_block_raw(physical)?;
-            self.verify_block_crc(current, &bytes)?;
+            let bytes = self.read_physical_block_raw(current)?;
             let next = freelist::decode_next(&bytes)?;
             current = next;
             free_count = free_count.saturating_add(1);
         }
 
-        Ok(self.total_blocks().saturating_sub(free_count))
+        Ok(free_count)
     }
 
     pub fn verify_integrity(&self) -> Result<Vec<u32>, DeviceError> {
         let mut corrupted = Vec::new();
         for block_index in self.data_region_start()..self.total_blocks() {
+            // Unwritten logicals have no user-authored content — their
+            // physical slots may have been drawn as shadow targets and now
+            // hold some other logical's data. Skip them; callers reading an
+            // unwritten block go through redirection identity, which returns
+            // the same bytes, but there is no CRC contract on them.
+            if !self.redirection.is_written(block_index) {
+                continue;
+            }
             let physical = self
                 .redirection
                 .logical_to_physical(block_index)
@@ -264,6 +399,25 @@ impl StegoDevice {
     pub fn flush(&mut self) -> Result<(), DeviceError> {
         self.log_verbose("flushing mmap");
         self.mmap.flush()?;
+        Ok(())
+    }
+
+    /// Zero every stego block (destroying any residual user data) and then
+    /// re-initialize the device in place. After `wipe`, the handle is valid
+    /// and reflects a freshly formatted device — equivalent to `init` with
+    /// the same allocation mode, but with the guarantee that no old stego
+    /// bits survive in the non-metadata remainder of any block.
+    pub fn wipe(&mut self) -> Result<(), DeviceError> {
+        let total = self.total_blocks();
+        let zero = vec![0_u8; crate::BLOCK_SIZE];
+        for block_index in 0..total {
+            self.write_physical_block_raw(block_index, &zero)?;
+        }
+        self.flush()?;
+        self.format()?;
+        self.superblock.set_dirty(true);
+        self.persist_superblock()?;
+        self.log_verbose("device wiped and re-initialized");
         Ok(())
     }
 
@@ -467,11 +621,14 @@ impl StegoDevice {
         Ok(())
     }
 
-    fn read_physical_block_raw(&self, block_index: u32) -> Result<Vec<u8>, DeviceError> {
+    pub(crate) fn read_physical_block_raw(
+        &self,
+        block_index: u32,
+    ) -> Result<Vec<u8>, DeviceError> {
         self.read_stego_bytes(block_index as usize * crate::BLOCK_SIZE, crate::BLOCK_SIZE)
     }
 
-    fn write_physical_block_raw(
+    pub(crate) fn write_physical_block_raw(
         &mut self,
         block_index: u32,
         data: &[u8],
@@ -707,10 +864,134 @@ impl StegoDevice {
             })
     }
 
+    /// Pop the head of the free list. The free list stores PHYSICAL block
+    /// indices — reads/writes go directly to physical stego space, bypassing
+    /// the redirection table.
+    fn pop_free_block(&mut self) -> Option<u32> {
+        let head = self.superblock.fields.free_list_head;
+        if head == NO_BLOCK {
+            return None;
+        }
+
+        let bytes = match self.read_physical_block_raw(head) {
+            Ok(bytes) => bytes,
+            Err(_) => return None,
+        };
+        let next = match freelist::decode_next(&bytes) {
+            Ok(next) => next,
+            Err(_) => return None,
+        };
+        self.superblock.fields.free_list_head = next;
+        Some(head)
+    }
+
+    /// Push a PHYSICAL block index onto the free list. Writes directly to
+    /// the physical stego space, bypassing the redirection table. Also
+    /// updates the integrity CRC for this block so `verify_integrity` reading
+    /// the logical that maps here (identity after reclaim) does not report a
+    /// spurious mismatch against the stale pre-push content.
+    fn push_free_block(&mut self, physical_block: u32) -> Result<(), DeviceError> {
+        let previous_head = self.superblock.fields.free_list_head;
+        let bytes = freelist::encode_head(previous_head);
+        self.write_physical_block_raw(physical_block, &bytes)?;
+        self.update_block_crc(physical_block, &bytes)?;
+        self.superblock.fields.free_list_head = physical_block;
+        Ok(())
+    }
+
+    fn persist_redirection_block_for(&mut self, block_index: u32) -> Result<(), DeviceError> {
+        let redir_start = self.superblock.fields.redirection_table_start;
+        if redir_start == NO_BLOCK {
+            return Ok(());
+        }
+
+        let redir_block_offset =
+            block_index as usize / crate::stego::redirection::ENTRIES_PER_BLOCK;
+        let encoded = self.redirection.encode();
+        if let Some(raw) = encoded.get(redir_block_offset) {
+            self.write_physical_block_raw(redir_start + redir_block_offset as u32, raw)?;
+        }
+        Ok(())
+    }
+
+    fn recover(&mut self) -> Result<(), DeviceError> {
+        use std::collections::HashSet;
+
+        let data_start = self.data_region_start();
+        let total = self.total_blocks();
+
+        // In-use set = physicals reachable through any live logical PLUS the
+        // live logical keys themselves. A shadow'd logical's key slot is
+        // reserved even though its data now lives at the shadow physical; we
+        // must exclude the key from the orphan list or the next alloc hands
+        // out a duplicate.
+        let mut in_use = HashSet::new();
+        for logical in data_start..total {
+            if self.redirection.is_written(logical) {
+                in_use.insert(logical);
+                let physical = self
+                    .redirection
+                    .logical_to_physical(logical)
+                    .unwrap_or(logical);
+                in_use.insert(physical);
+            }
+        }
+
+        // Physicals currently on the free list. The free list chains by
+        // physical index, so we walk directly without redirection.
+        let mut free_set = HashSet::new();
+        let mut current = self.superblock.fields.free_list_head;
+        while current != NO_BLOCK {
+            if current < data_start || current >= total {
+                break;
+            }
+            if !free_set.insert(current) {
+                break; // cycle
+            }
+            let bytes = self.read_physical_block_raw(current)?;
+            current = freelist::decode_next(&bytes)?;
+        }
+
+        // Orphans = data physicals that are neither in-use nor on the free
+        // list. These are shadows from an interrupted write, or blocks lost
+        // between alloc and first write.
+        let mut orphans = Vec::new();
+        for block in data_start..total {
+            if !in_use.contains(&block) && !free_set.contains(&block) {
+                orphans.push(block);
+            }
+        }
+
+        if !orphans.is_empty() {
+            self.log_verbose(format!(
+                "recovery: reclaiming {} orphan block(s)",
+                orphans.len()
+            ));
+            for orphan in orphans {
+                self.push_free_block(orphan)?;
+            }
+            self.persist_superblock()?;
+            self.flush()?;
+        }
+
+        self.superblock.set_dirty(false);
+        self.persist_superblock()?;
+
+        self.log_verbose("recovery complete");
+        Ok(())
+    }
+
     fn log_verbose(&self, message: impl AsRef<str>) {
         if self.verbose {
             eprintln!("[llmdb:device] {}", message.as_ref());
         }
+    }
+}
+
+impl Drop for StegoDevice {
+    fn drop(&mut self) {
+        self.superblock.set_dirty(false);
+        let _ = self.persist_superblock();
     }
 }
 

@@ -1,8 +1,16 @@
 # Task 09: File Table And File Operations
 
-Status: todo
+Status: done
 Depends on: 08-shadow-copy-and-recovery.md
 Spec refs: DESIGN-NEW.MD section "6. File Storage Layer"
+
+Note on block layout — this task follows `DESIGN-NEW.MD §6` verbatim:
+**data blocks are clean 4096 bytes with no internal chain pointer**, and
+`FileEntry` carries `block_count + overflow_block_index + inline_block_map[28]`
+per §6. An earlier draft of this task said `ceil(size / 4092)` and "chaining
+via 4-byte next-pointer", which would shear ext4 pages once NBD (Task 12) is
+plumbed through — NBD hands 4096-byte slices straight from `read_block` to
+the kernel, so any in-block metadata corrupts the filesystem above.
 
 Objective:
 Implement the flat file table and the store / get / ls / rm operations on top
@@ -56,3 +64,29 @@ Acceptance criteria:
 - A 10-KB file roundtrips with SHA256 equality.
 - `delete_file` followed by `list_files` excludes the deleted entry; `device.used_blocks()` returns to the pre-store count.
 - Attempting to store a file whose block count exceeds free blocks returns `FsError::FileTooLarge` without partial allocation.
+
+Deviations from spec (intentional):
+
+- `delete_file` writes the tombstone **before** freeing blocks, reversing the
+  sequence in the task scope. Tombstoning with zeroed `block_count /
+  overflow_block / inline_blocks` is the atomic commit point: a crash after
+  the tombstone leaves an orphaned block set that recovery's orphan scan
+  reclaims on next open. The spec order (free blocks first, then tombstone)
+  would risk the symmetric failure where a partially-freed file still shows
+  up in `list_files` with block references pointing at free-list entries.
+  `name`, `size_bytes`, and timestamps stay on the tombstone for forensics.
+
+- `store_bytes` is a public sibling of `store_file` that accepts an
+  in-memory payload. Task 09 mandated file-from-disk only; the in-memory
+  variant avoids unnecessary temp-file churn in tests and will be reused by
+  the NBD and `ask` layers.
+
+- Content comparison in tests uses byte-equality rather than SHA256. Adding
+  `sha2` as a dev-dependency buys nothing beyond what `assert_eq!` on `Vec<u8>`
+  already covers; the end-to-end CRC32 check inside `read_file_bytes`
+  guarantees retrieval matches what was stored.
+
+- V1's same-name-after-delete rule: `store_bytes` rejects a name that a
+  tombstone currently holds with `FsError::DuplicateName`. The task called
+  this out as a V1 decision; there is no "vacuum" operation that frees the
+  slot, so a name is permanently reserved once used.

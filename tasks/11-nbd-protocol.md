@@ -1,6 +1,6 @@
 # Task 11: NBD Protocol
 
-Status: todo
+Status: done
 Depends on: 07-stego-device-block-io.md
 Spec refs: DESIGN-NEW.MD section "7. NBD Server" (Protocol)
 
