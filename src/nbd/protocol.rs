@@ -254,10 +254,7 @@ pub fn parse_reply_header(bytes: &[u8]) -> Result<(u32, u64), NbdProtoError> {
 //   0x1A   2 bytes  reserved (zero)
 //   0x1C 124 bytes  reserved zero padding
 
-pub fn encode_oldstyle_handshake(
-    export_size: u64,
-    flags: u16,
-) -> [u8; OLDSTYLE_HANDSHAKE_BYTES] {
+pub fn encode_oldstyle_handshake(export_size: u64, flags: u16) -> [u8; OLDSTYLE_HANDSHAKE_BYTES] {
     let mut bytes = [0_u8; OLDSTYLE_HANDSHAKE_BYTES];
     bytes[0..8].copy_from_slice(&NBDMAGIC.to_be_bytes());
     bytes[8..16].copy_from_slice(&CLISERV_MAGIC.to_be_bytes());
@@ -279,9 +276,7 @@ pub fn encode_oldstyle_handshake(
 // reply the connection transitions to the transmission phase (same
 // request/reply framing as oldstyle).
 
-pub fn encode_newstyle_header(
-    handshake_flags: u16,
-) -> [u8; NEWSTYLE_HEADER_BYTES] {
+pub fn encode_newstyle_header(handshake_flags: u16) -> [u8; NEWSTYLE_HEADER_BYTES] {
     let mut bytes = [0_u8; NEWSTYLE_HEADER_BYTES];
     bytes[0..8].copy_from_slice(&NBDMAGIC.to_be_bytes());
     bytes[8..16].copy_from_slice(&IHAVEOPT.to_be_bytes());

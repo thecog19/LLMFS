@@ -45,8 +45,14 @@ fn init_reports_capacity_summary() {
     let out = llmdb().arg("init").arg(&fx.path).assert().success();
     let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
 
-    assert!(stdout.contains("total blocks"), "missing total blocks: {stdout}");
-    assert!(stdout.contains("data blocks"), "missing data blocks: {stdout}");
+    assert!(
+        stdout.contains("total blocks"),
+        "missing total blocks: {stdout}"
+    );
+    assert!(
+        stdout.contains("data blocks"),
+        "missing data blocks: {stdout}"
+    );
     assert!(
         stdout.contains("quant profile"),
         "missing quant profile: {stdout}"
@@ -133,7 +139,10 @@ fn wipe_yes_leaves_device_fresh_with_zero_files() {
 
     let status = llmdb().arg("status").arg(&fx.path).assert().success();
     let stdout = String::from_utf8_lossy(&status.get_output().stdout).into_owned();
-    assert!(stdout.contains("files:"), "status missing files line: {stdout}");
+    assert!(
+        stdout.contains("files:"),
+        "status missing files line: {stdout}"
+    );
     assert!(
         stdout.lines().any(|line| line.trim() == "files:       0"),
         "wipe should leave 0 files visible, status was:\n{stdout}"
@@ -239,7 +248,9 @@ fn get_unknown_file_exits_with_user_error() {
 fn help_flag_lists_subcommands() {
     let out = llmdb().arg("--help").assert().success();
     let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
-    for sub in ["init", "status", "store", "get", "ls", "rm", "verify", "wipe"] {
+    for sub in [
+        "init", "status", "store", "get", "ls", "rm", "verify", "wipe",
+    ] {
         assert!(
             stdout.contains(sub),
             "top-level --help missing subcommand {sub}:\n{stdout}"

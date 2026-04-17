@@ -6,8 +6,6 @@
 //! until the model produces an assistant message with no further tool
 //! calls (or hits the iteration cap).
 
-use std::path::PathBuf;
-
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -146,13 +144,12 @@ impl ChatClient for HttpChatClient {
         let text = response
             .into_string()
             .map_err(|e| AskError::HttpError(e.to_string()))?;
-        let parsed: ChatResponse =
-            serde_json::from_str(&text).map_err(|_e| {
-                AskError::MalformedResponse(format!(
-                    "could not parse chat response body: {}",
-                    truncate_for_log(&text, 400)
-                ))
-            })?;
+        let parsed: ChatResponse = serde_json::from_str(&text).map_err(|_e| {
+            AskError::MalformedResponse(format!(
+                "could not parse chat response body: {}",
+                truncate_for_log(&text, 400)
+            ))
+        })?;
         Ok(parsed)
     }
 }
@@ -206,7 +203,8 @@ impl<'a, C: ChatClient> AskSession<'a, C> {
                 Some(calls) if !calls.is_empty() => {
                     for call in calls {
                         let result = self.dispatch_tool_call(call)?;
-                        self.messages.push(ChatMessage::tool(call.id.clone(), result));
+                        self.messages
+                            .push(ChatMessage::tool(call.id.clone(), result));
                     }
                     // Loop back: feed tool results to the model.
                 }
@@ -240,12 +238,9 @@ impl<'a, C: ChatClient> AskSession<'a, C> {
                 Ok(serde_json::to_string(&payload)?)
             }
             "read_file" => {
-                let name = args
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| AskError::InvalidToolCall(
-                        "read_file requires a `name` string argument".into(),
-                    ))?;
+                let name = args.get("name").and_then(Value::as_str).ok_or_else(|| {
+                    AskError::InvalidToolCall("read_file requires a `name` string argument".into())
+                })?;
                 let mut bytes = self.device.read_file_bytes(name)?;
                 let truncated = bytes.len() > READ_FILE_MAX_BYTES;
                 if truncated {
@@ -260,12 +255,9 @@ impl<'a, C: ChatClient> AskSession<'a, C> {
                 Ok(serde_json::to_string(&payload)?)
             }
             "file_info" => {
-                let name = args
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| AskError::InvalidToolCall(
-                        "file_info requires a `name` string argument".into(),
-                    ))?;
+                let name = args.get("name").and_then(Value::as_str).ok_or_else(|| {
+                    AskError::InvalidToolCall("file_info requires a `name` string argument".into())
+                })?;
                 let entry = self
                     .device
                     .list_files()?
@@ -285,9 +277,7 @@ impl<'a, C: ChatClient> AskSession<'a, C> {
                 });
                 Ok(serde_json::to_string(&payload)?)
             }
-            other => Err(AskError::InvalidToolCall(format!(
-                "unknown tool: {other}"
-            ))),
+            other => Err(AskError::InvalidToolCall(format!("unknown tool: {other}"))),
         }
     }
 }
@@ -338,12 +328,6 @@ pub fn tool_definitions() -> Vec<Value> {
             }
         }),
     ]
-}
-
-/// Convenience: suppress noisy pathbuf formatting in a dispatch.
-#[allow(dead_code)]
-fn path_string(p: &PathBuf) -> String {
-    p.to_string_lossy().into_owned()
 }
 
 fn truncate_for_log(s: &str, max: usize) -> String {

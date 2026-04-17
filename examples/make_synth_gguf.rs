@@ -27,16 +27,15 @@ fn main() -> ExitCode {
              Generates a synthetic Q8_0 GGUF v3 with `tensor_count` tensors\n\
              (default 16), each 8192 weights. Each tensor gives one block\n\
              of stego capacity.",
-            args.first().map(String::as_str).unwrap_or("make_synth_gguf")
+            args.first()
+                .map(String::as_str)
+                .unwrap_or("make_synth_gguf")
         );
         return ExitCode::from(1);
     }
 
     let output = PathBuf::from(&args[1]);
-    let tensor_count: usize = args
-        .get(2)
-        .map(|s| s.parse().unwrap_or(16))
-        .unwrap_or(16);
+    let tensor_count: usize = args.get(2).map(|s| s.parse().unwrap_or(16)).unwrap_or(16);
 
     let tensors = build_tensor_specs(tensor_count);
     let bytes = encode_gguf_v3(&tensors);

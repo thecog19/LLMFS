@@ -241,9 +241,8 @@ fn decode_rejects_non_null_terminated_filename() {
     let mut bytes = [0_u8; ENTRY_BYTES];
     bytes[0] = 1; // regular
     bytes[0x2C..0x30].copy_from_slice(&NO_BLOCK.to_le_bytes()); // overflow_block
-    for i in 0x30..0x90 {
-        bytes[i] = b'x'; // fill filename field with no null
-    }
+    // Fill the filename field with no null terminator.
+    bytes[0x30..0x90].fill(b'x');
     let result = FileEntry::decode(&bytes);
     assert!(matches!(
         result,
@@ -258,8 +257,7 @@ fn overflow_block_roundtrips_full_capacity() {
     let bytes = block.encode().expect("encode");
     assert_eq!(bytes.len(), llmdb::BLOCK_SIZE);
 
-    let decoded =
-        OverflowBlock::decode(&bytes, OVERFLOW_ENTRIES_PER_BLOCK).expect("decode");
+    let decoded = OverflowBlock::decode(&bytes, OVERFLOW_ENTRIES_PER_BLOCK).expect("decode");
     assert_eq!(decoded.next, NO_BLOCK);
     assert_eq!(decoded.entries, entries);
 }

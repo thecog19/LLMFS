@@ -383,10 +383,7 @@ impl StegoDevice {
 
     /// Diagnostic accessor: read a physical block as the stego layer
     /// decodes it (no redirection, no CRC check). Used by `llmdb dump-block`.
-    pub fn read_physical_block_for_diag(
-        &self,
-        block_index: u32,
-    ) -> Result<Vec<u8>, DeviceError> {
+    pub fn read_physical_block_for_diag(&self, block_index: u32) -> Result<Vec<u8>, DeviceError> {
         self.read_physical_block_raw(block_index)
     }
 
@@ -649,10 +646,7 @@ impl StegoDevice {
         Ok(())
     }
 
-    pub(crate) fn read_physical_block_raw(
-        &self,
-        block_index: u32,
-    ) -> Result<Vec<u8>, DeviceError> {
+    pub(crate) fn read_physical_block_raw(&self, block_index: u32) -> Result<Vec<u8>, DeviceError> {
         self.read_stego_bytes(block_index as usize * crate::BLOCK_SIZE, crate::BLOCK_SIZE)
     }
 
@@ -738,30 +732,15 @@ impl StegoDevice {
         start_in_slot: usize,
         data: &[u8],
     ) -> Result<(), DeviceError> {
-        let storage =
-            &mut self.mmap[slot.file_offset..slot.file_offset + slot.storage_len];
+        let storage = &mut self.mmap[slot.file_offset..slot.file_offset + slot.storage_len];
         match slot.quant_type {
-            GgufQuantType::Q8_0 => {
-                packing::q8_0::write_stego_range(storage, start_in_slot, data)?
-            }
-            GgufQuantType::Q6K => {
-                packing::q6_k::write_stego_range(storage, start_in_slot, data)?
-            }
-            GgufQuantType::Q5K => {
-                packing::q5_k::write_stego_range(storage, start_in_slot, data)?
-            }
-            GgufQuantType::Q4K => {
-                packing::q4_k::write_stego_range(storage, start_in_slot, data)?
-            }
-            GgufQuantType::Q3K => {
-                packing::q3_k::write_stego_range(storage, start_in_slot, data)?
-            }
-            GgufQuantType::F16 => {
-                packing::float::write_f16_range(storage, start_in_slot, data)?
-            }
-            GgufQuantType::F32 => {
-                packing::float::write_f32_range(storage, start_in_slot, data)?
-            }
+            GgufQuantType::Q8_0 => packing::q8_0::write_stego_range(storage, start_in_slot, data)?,
+            GgufQuantType::Q6K => packing::q6_k::write_stego_range(storage, start_in_slot, data)?,
+            GgufQuantType::Q5K => packing::q5_k::write_stego_range(storage, start_in_slot, data)?,
+            GgufQuantType::Q4K => packing::q4_k::write_stego_range(storage, start_in_slot, data)?,
+            GgufQuantType::Q3K => packing::q3_k::write_stego_range(storage, start_in_slot, data)?,
+            GgufQuantType::F16 => packing::float::write_f16_range(storage, start_in_slot, data)?,
+            GgufQuantType::F32 => packing::float::write_f32_range(storage, start_in_slot, data)?,
             _ => return Err(DeviceError::UnsupportedQuantType(slot.quant_type)),
         }
         Ok(())
@@ -780,12 +759,8 @@ impl StegoDevice {
             GgufQuantType::Q5K => packing::q5_k::read_stego_range(storage, start_in_slot, len)?,
             GgufQuantType::Q4K => packing::q4_k::read_stego_range(storage, start_in_slot, len)?,
             GgufQuantType::Q3K => packing::q3_k::read_stego_range(storage, start_in_slot, len)?,
-            GgufQuantType::F16 => {
-                packing::float::read_f16_range(storage, start_in_slot, len)?
-            }
-            GgufQuantType::F32 => {
-                packing::float::read_f32_range(storage, start_in_slot, len)?
-            }
+            GgufQuantType::F16 => packing::float::read_f16_range(storage, start_in_slot, len)?,
+            GgufQuantType::F32 => packing::float::read_f32_range(storage, start_in_slot, len)?,
             _ => return Err(DeviceError::UnsupportedQuantType(slot.quant_type)),
         })
     }
@@ -1148,7 +1123,7 @@ fn chunk_storage_len(
     weights_per_chunk: usize,
     bytes_per_chunk: usize,
 ) -> Result<usize, DeviceError> {
-    if weight_count % weights_per_chunk != 0 {
+    if !weight_count.is_multiple_of(weights_per_chunk) {
         return Err(DeviceError::InvalidTensorWeightCount {
             weight_count,
             weights_per_chunk,

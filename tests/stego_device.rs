@@ -8,7 +8,6 @@ use llmdb::gguf::quant::{
     GGML_TYPE_Q8_0_ID,
 };
 use llmdb::stego::device::{DeviceOptions, StegoDevice};
-use llmdb::stego::integrity::NO_BLOCK;
 use llmdb::stego::planner::{AllocationMode, build_allocation_plan};
 
 #[test]
@@ -216,10 +215,7 @@ fn mixed_quant_device_roundtrips_across_reopen_and_integrity_scan() {
 
         data_start = device.data_region_start();
         let data_blocks = device.total_blocks() - data_start;
-        assert!(
-            data_blocks >= 5,
-            "need >=5 data blocks, got {data_blocks}"
-        );
+        assert!(data_blocks >= 5, "need >=5 data blocks, got {data_blocks}");
 
         let mut allocated = Vec::new();
         for payload in &payloads {

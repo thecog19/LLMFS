@@ -195,11 +195,7 @@ fn standard_mode_orders_tier1_then_tier2_with_layer_desc_tiebreak() {
         ]
     );
 
-    let tiers: Vec<_> = plan
-        .tensors
-        .iter()
-        .map(|tensor| tensor.tier)
-        .collect();
+    let tiers: Vec<_> = plan.tensors.iter().map(|tensor| tensor.tier).collect();
     assert_eq!(
         tiers,
         vec![

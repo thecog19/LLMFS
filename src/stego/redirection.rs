@@ -127,11 +127,7 @@ impl RedirectionTable {
     /// logicals at the device layer present as zeros.
     pub fn logical_to_physical(&self, logical: u32) -> Option<u32> {
         let raw = self.raw_entry(logical)?;
-        if raw == NO_BLOCK {
-            None
-        } else {
-            Some(raw)
-        }
+        if raw == NO_BLOCK { None } else { Some(raw) }
     }
 
     /// True iff `logical` currently maps to a physical (i.e., has user data
@@ -161,10 +157,10 @@ impl RedirectionTable {
         );
         let block_index = logical as usize / ENTRIES_PER_BLOCK;
         let entry_index = logical as usize % ENTRIES_PER_BLOCK;
-        if let Some(block) = self.blocks.get_mut(block_index) {
-            if entry_index < block.entries.len() {
-                block.entries[entry_index] = physical;
-            }
+        if let Some(block) = self.blocks.get_mut(block_index)
+            && entry_index < block.entries.len()
+        {
+            block.entries[entry_index] = physical;
         }
     }
 
@@ -173,10 +169,10 @@ impl RedirectionTable {
     pub fn clear(&mut self, logical: u32) {
         let block_index = logical as usize / ENTRIES_PER_BLOCK;
         let entry_index = logical as usize % ENTRIES_PER_BLOCK;
-        if let Some(block) = self.blocks.get_mut(block_index) {
-            if entry_index < block.entries.len() {
-                block.entries[entry_index] = NO_BLOCK;
-            }
+        if let Some(block) = self.blocks.get_mut(block_index)
+            && entry_index < block.entries.len()
+        {
+            block.entries[entry_index] = NO_BLOCK;
         }
     }
 

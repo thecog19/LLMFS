@@ -189,7 +189,16 @@ fn dispatch(cmd: Command, mode: AllocationMode, options: DeviceOptions) -> Resul
             yes,
             nbd,
             socket,
-        } => cmd_mount(&model, &mount_point, format, yes, nbd, socket, mode, options),
+        } => cmd_mount(
+            &model,
+            &mount_point,
+            format,
+            yes,
+            nbd,
+            socket,
+            mode,
+            options,
+        ),
         Command::Unmount { mount_point } => cmd_unmount(&mount_point),
         Command::Ask { model } => cmd_ask(&model, mode, options),
         Command::Dump { .. } => Err(CliError::internal(format!(
@@ -242,7 +251,10 @@ fn cmd_init(model: &Path, mode: AllocationMode, options: DeviceOptions) -> Resul
     println!("  total blocks:     {total}");
     println!("  metadata blocks:  {metadata}");
     println!("  data blocks:      {data_blocks}");
-    println!("  total capacity:   {} bytes", device.total_capacity_bytes());
+    println!(
+        "  total capacity:   {} bytes",
+        device.total_capacity_bytes()
+    );
     println!("  quant profile:    {profile_str}");
     println!(
         "  lobotomy:         {}",
@@ -253,11 +265,7 @@ fn cmd_init(model: &Path, mode: AllocationMode, options: DeviceOptions) -> Resul
     Ok(())
 }
 
-fn cmd_status(
-    model: &Path,
-    mode: AllocationMode,
-    options: DeviceOptions,
-) -> Result<(), CliError> {
+fn cmd_status(model: &Path, mode: AllocationMode, options: DeviceOptions) -> Result<(), CliError> {
     let device = StegoDevice::open_with_options(model, mode, options).map_err(open_err)?;
     println!("device:      {}", model.display());
     let status = llmdb::diagnostics::gather(&device).map_err(fs_err)?;
@@ -371,7 +379,10 @@ fn cmd_verify(
     let corrupted = device.verify_integrity().map_err(dev_err)?;
 
     if corrupted.is_empty() {
-        println!("verify: OK ({} live blocks)", device.used_blocks().map_err(dev_err)?);
+        println!(
+            "verify: OK ({} live blocks)",
+            device.used_blocks().map_err(dev_err)?
+        );
     } else {
         println!("verify: {} corrupted block(s)", corrupted.len());
         for block in &corrupted {
@@ -403,7 +414,10 @@ fn cmd_serve(
     let pid = std::process::id();
     let socket_path = socket.unwrap_or_else(|| default_socket_path(pid));
 
-    println!("llmdb serve: export {} bytes ({} data blocks)", export, data_blocks);
+    println!(
+        "llmdb serve: export {} bytes ({} data blocks)",
+        export, data_blocks
+    );
     println!("socket: {}", socket_path.display());
     println!();
     println!("In another shell (root required):");
@@ -417,13 +431,12 @@ fn cmd_serve(
     println!("To stop: sudo umount /mnt/llmdb && sudo nbd-client -d /dev/nbd0");
     println!("waiting for nbd client to connect...");
 
-    server
-        .serve_on_unix_socket(&socket_path)
-        .map_err(nbd_err)?;
+    server.serve_on_unix_socket(&socket_path).map_err(nbd_err)?;
     println!("nbd client disconnected; server exiting");
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_mount(
     model: &Path,
     mount_point: &Path,
@@ -492,11 +505,9 @@ fn cmd_mount(
     ])?;
 
     // 2. optional mkfs.ext4
-    if format {
-        if let Err(e) = run_cmd(&["mkfs.ext4", "-F", nbd_dev.to_str().unwrap()]) {
-            run_cmd(&["nbd-client", "-d", nbd_dev.to_str().unwrap()]).ok();
-            return Err(e);
-        }
+    if format && let Err(e) = run_cmd(&["mkfs.ext4", "-F", nbd_dev.to_str().unwrap()]) {
+        run_cmd(&["nbd-client", "-d", nbd_dev.to_str().unwrap()]).ok();
+        return Err(e);
     }
 
     // 3. mkdir -p mount_point
@@ -742,7 +753,8 @@ fn cmd_ask(
     // We need the device for tool-call dispatch AND the model path for
     // llama-server. The device opens normally, then we spawn the server
     // on a free port.
-    let mut device = StegoDevice::open_with_options(model, alloc_mode, options).map_err(open_err)?;
+    let mut device =
+        StegoDevice::open_with_options(model, alloc_mode, options).map_err(open_err)?;
 
     let port = pick_free_port()?;
     println!("spawning llama-server on port {port} …");
@@ -817,11 +829,11 @@ fn cmd_dump_block(
     options: DeviceOptions,
 ) -> Result<(), CliError> {
     let device = StegoDevice::open_with_options(model, alloc_mode, options).map_err(open_err)?;
-    let bytes = device.read_physical_block_for_diag(block).map_err(dev_err)?;
+    let bytes = device
+        .read_physical_block_for_diag(block)
+        .map_err(dev_err)?;
     let written = device.is_logical_written(block);
-    println!(
-        "physical block {block} (logical written? {written}); first 256 bytes:"
-    );
+    println!("physical block {block} (logical written? {written}); first 256 bytes:");
     for (i, chunk) in bytes.chunks(16).take(16).enumerate() {
         let hex: Vec<String> = chunk.iter().map(|b| format!("{b:02x}")).collect();
         println!("  {:04x}: {}", i * 16, hex.join(" "));
@@ -865,7 +877,9 @@ fn parse_octal_mode(raw: &str) -> Result<u16, CliError> {
 
 fn confirm(prompt: &str) -> Result<bool, CliError> {
     print!("{prompt} [y/N]: ");
-    io::stdout().flush().map_err(|e| CliError::internal(e.to_string()))?;
+    io::stdout()
+        .flush()
+        .map_err(|e| CliError::internal(e.to_string()))?;
     let mut line = String::new();
     io::stdin()
         .read_line(&mut line)

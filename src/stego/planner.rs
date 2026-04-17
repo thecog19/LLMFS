@@ -191,9 +191,7 @@ fn skip_reason_for(name: &str, mode: AllocationMode) -> SkipReason {
     // mode, not because the tensor is unrecognized. Everything else without a
     // matched tier is an unknown tensor pattern.
     if matches!(mode, AllocationMode::Standard)
-        && (name.contains("token_embd")
-            || name.contains("output.weight")
-            || name.contains("_norm"))
+        && (name.contains("token_embd") || name.contains("output.weight") || name.contains("_norm"))
     {
         SkipReason::IneligibleInStandardMode
     } else {

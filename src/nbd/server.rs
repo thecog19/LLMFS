@@ -9,10 +9,10 @@ use thiserror::Error;
 
 use crate::nbd::protocol::{
     NBD_FLAG_C_NO_ZEROES, NBD_FLAG_FIXED_NEWSTYLE, NBD_FLAG_HAS_FLAGS, NBD_FLAG_NO_ZEROES,
-    NBD_FLAG_SEND_FLUSH, NBD_OPT_ABORT, NBD_OPT_EXPORT_NAME, NBD_OPT_GO, NBD_OPT_INFO,
-    NBD_REP_ACK, NBD_REP_ERR_UNSUP, NBD_REP_INFO, NbdCommand, NbdProtoError, NbdRequest,
-    REQUEST_HEADER_BYTES, encode_export_name_reply, encode_info_export, encode_newstyle_header,
-    encode_option_reply, encode_reply_header, parse_option_header, parse_request,
+    NBD_FLAG_SEND_FLUSH, NBD_OPT_ABORT, NBD_OPT_EXPORT_NAME, NBD_OPT_GO, NBD_OPT_INFO, NBD_REP_ACK,
+    NBD_REP_ERR_UNSUP, NBD_REP_INFO, NbdCommand, NbdProtoError, NbdRequest, REQUEST_HEADER_BYTES,
+    encode_export_name_reply, encode_info_export, encode_newstyle_header, encode_option_reply,
+    encode_reply_header, parse_option_header, parse_request,
 };
 use crate::stego::device::{DeviceError, StegoDevice};
 
@@ -94,10 +94,10 @@ impl NbdServer {
     }
 
     fn trace(&self, line: &str) {
-        if let Some(file) = &self.trace {
-            if let Ok(mut guard) = file.lock() {
-                let _ = writeln!(guard, "{line}");
-            }
+        if let Some(file) = &self.trace
+            && let Ok(mut guard) = file.lock()
+        {
+            let _ = writeln!(guard, "{line}");
         }
     }
 
@@ -177,8 +177,8 @@ impl NbdServer {
             let logical = self.data_region_start + nbd_block as u32;
             let block_byte_start = nbd_block * block_size;
             let in_start = offset.saturating_sub(block_byte_start) as usize;
-            let in_end = ((offset + length as u64).saturating_sub(block_byte_start))
-                .min(block_size) as usize;
+            let in_end = ((offset + length as u64).saturating_sub(block_byte_start)).min(block_size)
+                as usize;
             let copy_len = in_end - in_start;
 
             // Track whether this logical block has been touched before so
@@ -330,11 +330,8 @@ impl NbdServer {
                     // Raw (non-option-reply) frame — size + flags, optional
                     // 124-byte zero tail when the client did not ack
                     // NO_ZEROES.
-                    let reply = encode_export_name_reply(
-                        self.export_bytes,
-                        transmission_flags,
-                        no_zeroes,
-                    );
+                    let reply =
+                        encode_export_name_reply(self.export_bytes, transmission_flags, no_zeroes);
                     conn.write_all(&reply)?;
                     conn.flush()?;
                     return Ok(OptionOutcome::Transmission);
@@ -344,8 +341,7 @@ impl NbdServer {
                     // The client's `data` field carries a requested-info
                     // list we ignore — INFO_EXPORT is mandatory to send.
                     let info = encode_info_export(self.export_bytes, transmission_flags);
-                    let info_reply =
-                        encode_option_reply(parsed.option, NBD_REP_INFO, &info);
+                    let info_reply = encode_option_reply(parsed.option, NBD_REP_INFO, &info);
                     conn.write_all(&info_reply)?;
 
                     let ack = encode_option_reply(parsed.option, NBD_REP_ACK, &[]);
@@ -364,8 +360,7 @@ impl NbdServer {
                     return Ok(OptionOutcome::Abort);
                 }
                 other => {
-                    let err =
-                        encode_option_reply(other, NBD_REP_ERR_UNSUP, &[]);
+                    let err = encode_option_reply(other, NBD_REP_ERR_UNSUP, &[]);
                     conn.write_all(&err)?;
                     conn.flush()?;
                 }

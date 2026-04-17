@@ -15,8 +15,8 @@ use std::rc::Rc;
 use common::{SyntheticGgufVersion, SyntheticTensorSpec, write_custom_gguf_fixture};
 use llmdb::ask::AskError;
 use llmdb::ask::bridge::{
-    AskSession, ChatChoice, ChatClient, ChatMessage, ChatRequest, ChatResponse, MAX_TOOL_ITERATIONS,
-    ToolCall, ToolCallFunction,
+    AskSession, ChatChoice, ChatClient, ChatMessage, ChatRequest, ChatResponse,
+    MAX_TOOL_ITERATIONS, ToolCall, ToolCallFunction,
 };
 use llmdb::gguf::quant::GGML_TYPE_Q8_0_ID;
 use llmdb::stego::device::{DeviceOptions, StegoDevice};
@@ -150,10 +150,7 @@ fn list_files_tool_call_reads_real_device_state() {
     // The second round of input to the model must include a `tool` msg
     // carrying the JSON payload.
     assert!(seen.len() >= 2);
-    let tool_msgs: Vec<&ChatMessage> = seen[1]
-        .iter()
-        .filter(|m| m.role == "tool")
-        .collect();
+    let tool_msgs: Vec<&ChatMessage> = seen[1].iter().filter(|m| m.role == "tool").collect();
     assert_eq!(tool_msgs.len(), 1);
     let content = tool_msgs[0].content.as_deref().unwrap_or_default();
     assert!(content.contains("alpha.txt"));
@@ -168,7 +165,11 @@ fn read_file_tool_call_returns_stored_content() {
         .expect("store");
 
     let client = MockChatClient::new(vec![
-        tool_reply(vec![tool_call("c1", "read_file", r#"{"name":"secret.txt"}"#)]),
+        tool_reply(vec![tool_call(
+            "c1",
+            "read_file",
+            r#"{"name":"secret.txt"}"#,
+        )]),
         final_reply("The secret is 42."),
     ]);
     let seen = client.seen_handle();
@@ -194,7 +195,11 @@ fn file_info_tool_call_returns_metadata_not_content() {
         .expect("store");
 
     let client = MockChatClient::new(vec![
-        tool_reply(vec![tool_call("c1", "file_info", r#"{"name":"report.bin"}"#)]),
+        tool_reply(vec![tool_call(
+            "c1",
+            "file_info",
+            r#"{"name":"report.bin"}"#,
+        )]),
         final_reply("report.bin is 16 bytes."),
     ]);
     let seen = client.seen_handle();
@@ -202,10 +207,7 @@ fn file_info_tool_call_returns_metadata_not_content() {
     session.ask("tell me about report.bin").expect("ask");
 
     let seen = seen.borrow();
-    let tool_msg = seen[1]
-        .iter()
-        .find(|m| m.role == "tool")
-        .expect("tool msg");
+    let tool_msg = seen[1].iter().find(|m| m.role == "tool").expect("tool msg");
     let content = tool_msg.content.as_deref().unwrap_or_default();
     assert!(content.contains("\"size_bytes\":16"));
     assert!(content.contains("\"mode\":\"600\""));
@@ -241,11 +243,7 @@ fn tool_call_loop_caps_iterations() {
 fn invalid_tool_name_surfaces_as_error() {
     let (_fx, mut device) = open_device("ask_bad.gguf");
 
-    let client = MockChatClient::new(vec![tool_reply(vec![tool_call(
-        "c1",
-        "not_a_tool",
-        "{}",
-    )])]);
+    let client = MockChatClient::new(vec![tool_reply(vec![tool_call("c1", "not_a_tool", "{}")])]);
     let mut session = AskSession::new(client, &mut device, "test-model");
     let result = session.ask("hi");
     assert!(

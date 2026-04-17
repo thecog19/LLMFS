@@ -101,8 +101,7 @@ impl Superblock {
         bytes[0x25] = self.fields.quant_profile;
 
         let crc = superblock_crc32(&bytes);
-        bytes[SUPERBLOCK_CRC_OFFSET..SUPERBLOCK_CRC_OFFSET + 4]
-            .copy_from_slice(&crc.to_le_bytes());
+        bytes[SUPERBLOCK_CRC_OFFSET..SUPERBLOCK_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
         bytes
     }
 
@@ -149,12 +148,8 @@ impl Superblock {
                 total_blocks: u32::from_le_bytes(bytes[0x08..0x0C].try_into().unwrap()),
                 free_list_head: u32::from_le_bytes(bytes[0x0C..0x10].try_into().unwrap()),
                 integrity_chain_head: u32::from_le_bytes(bytes[0x10..0x14].try_into().unwrap()),
-                redirection_table_start: u32::from_le_bytes(
-                    bytes[0x14..0x18].try_into().unwrap(),
-                ),
-                redirection_table_length: u32::from_le_bytes(
-                    bytes[0x18..0x1C].try_into().unwrap(),
-                ),
+                redirection_table_start: u32::from_le_bytes(bytes[0x14..0x18].try_into().unwrap()),
+                redirection_table_length: u32::from_le_bytes(bytes[0x18..0x1C].try_into().unwrap()),
                 file_table_start: u32::from_le_bytes(bytes[0x1C..0x20].try_into().unwrap()),
                 file_table_length: u32::from_le_bytes(bytes[0x20..0x24].try_into().unwrap()),
                 flags: bytes[0x24],
@@ -185,13 +180,27 @@ pub fn encode_quant_profile(types: &[GgufQuantType]) -> u8 {
 
 pub fn decode_quant_profile(profile: u8) -> Vec<GgufQuantType> {
     let mut types = Vec::new();
-    if profile & 0x01 != 0 { types.push(GgufQuantType::Q8_0); }
-    if profile & 0x02 != 0 { types.push(GgufQuantType::Q6K); }
-    if profile & 0x04 != 0 { types.push(GgufQuantType::Q5K); }
-    if profile & 0x08 != 0 { types.push(GgufQuantType::Q4K); }
-    if profile & 0x10 != 0 { types.push(GgufQuantType::Q3K); }
-    if profile & 0x20 != 0 { types.push(GgufQuantType::F16); }
-    if profile & 0x40 != 0 { types.push(GgufQuantType::F32); }
+    if profile & 0x01 != 0 {
+        types.push(GgufQuantType::Q8_0);
+    }
+    if profile & 0x02 != 0 {
+        types.push(GgufQuantType::Q6K);
+    }
+    if profile & 0x04 != 0 {
+        types.push(GgufQuantType::Q5K);
+    }
+    if profile & 0x08 != 0 {
+        types.push(GgufQuantType::Q4K);
+    }
+    if profile & 0x10 != 0 {
+        types.push(GgufQuantType::Q3K);
+    }
+    if profile & 0x20 != 0 {
+        types.push(GgufQuantType::F16);
+    }
+    if profile & 0x40 != 0 {
+        types.push(GgufQuantType::F32);
+    }
     types
 }
 

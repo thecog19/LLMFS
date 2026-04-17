@@ -179,11 +179,7 @@ pub fn format_human(status: &DeviceStatus) -> String {
     let _ = writeln!(out, "free:        {} blocks", status.free_blocks);
     let _ = writeln!(out, "utilization: {:.1}%", status.utilization_pct);
     let _ = writeln!(out, "files:       {}", status.file_count);
-    let _ = writeln!(
-        out,
-        "stored:      {} bytes",
-        status.total_stored_bytes
-    );
+    let _ = writeln!(out, "stored:      {} bytes", status.total_stored_bytes);
     let _ = writeln!(out, "quant:       {:?}", status.quant_profile);
     let _ = writeln!(
         out,

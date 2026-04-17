@@ -12,11 +12,7 @@ fn verbose() -> DeviceOptions {
 /// 12 tensors × 8192 Q8_0 weights = 12 blocks. Layout: 4 metadata + 8 data.
 /// Enough room for shadow-copy operations.
 fn make_fixture(name: &str) -> common::FixtureHandle {
-    write_custom_gguf_fixture(
-        SyntheticGgufVersion::V3,
-        name,
-        &make_q8_tensors(12),
-    )
+    write_custom_gguf_fixture(SyntheticGgufVersion::V3, name, &make_q8_tensors(12))
 }
 
 #[test]
@@ -29,9 +25,12 @@ fn crash_after_shadow_write_leaves_old_block_intact() {
     let used_before;
 
     {
-        let mut device =
-            StegoDevice::initialize_with_options(&fixture.path, AllocationMode::Standard, verbose())
-                .expect("init");
+        let mut device = StegoDevice::initialize_with_options(
+            &fixture.path,
+            AllocationMode::Standard,
+            verbose(),
+        )
+        .expect("init");
 
         block_index = device.alloc_block().expect("alloc");
         device
@@ -51,9 +50,8 @@ fn crash_after_shadow_write_leaves_old_block_intact() {
     }
 
     // Reopen — dirty flag triggers recovery
-    let device =
-        StegoDevice::open_with_options(&fixture.path, AllocationMode::Standard, verbose())
-            .expect("reopen");
+    let device = StegoDevice::open_with_options(&fixture.path, AllocationMode::Standard, verbose())
+        .expect("reopen");
 
     let read_back = device.read_block(block_index).expect("read after crash");
     assert_eq!(
@@ -78,9 +76,12 @@ fn crash_after_redirection_flip_sees_new_value() {
     let block_index;
 
     {
-        let mut device =
-            StegoDevice::initialize_with_options(&fixture.path, AllocationMode::Standard, verbose())
-                .expect("init");
+        let mut device = StegoDevice::initialize_with_options(
+            &fixture.path,
+            AllocationMode::Standard,
+            verbose(),
+        )
+        .expect("init");
 
         block_index = device.alloc_block().expect("alloc");
         device
@@ -100,9 +101,8 @@ fn crash_after_redirection_flip_sees_new_value() {
         std::mem::forget(device);
     }
 
-    let device =
-        StegoDevice::open_with_options(&fixture.path, AllocationMode::Standard, verbose())
-            .expect("reopen");
+    let device = StegoDevice::open_with_options(&fixture.path, AllocationMode::Standard, verbose())
+        .expect("reopen");
 
     let read_back = device.read_block(block_index).expect("read after crash");
     assert_eq!(
@@ -116,9 +116,12 @@ fn unclean_shutdown_sets_dirty_and_recovery_clears_it() {
     let fixture = make_fixture("shadow_dirty.gguf");
 
     {
-        let mut device =
-            StegoDevice::initialize_with_options(&fixture.path, AllocationMode::Standard, verbose())
-                .expect("init");
+        let mut device = StegoDevice::initialize_with_options(
+            &fixture.path,
+            AllocationMode::Standard,
+            verbose(),
+        )
+        .expect("init");
 
         // Device open should have set dirty flag
         let block = device.alloc_block().expect("alloc");
@@ -312,9 +315,12 @@ fn recovery_is_idempotent() {
     let fixture = make_fixture("shadow_idempotent.gguf");
 
     {
-        let mut device =
-            StegoDevice::initialize_with_options(&fixture.path, AllocationMode::Standard, verbose())
-                .expect("init");
+        let mut device = StegoDevice::initialize_with_options(
+            &fixture.path,
+            AllocationMode::Standard,
+            verbose(),
+        )
+        .expect("init");
 
         let block = device.alloc_block().expect("alloc");
         device

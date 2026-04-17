@@ -113,8 +113,7 @@ impl StegoDevice {
             let chunk_end = (chunk_start + crate::BLOCK_SIZE).min(data.len());
             let mut buf = vec![0_u8; crate::BLOCK_SIZE];
             if chunk_start < chunk_end {
-                buf[..chunk_end - chunk_start]
-                    .copy_from_slice(&data[chunk_start..chunk_end]);
+                buf[..chunk_end - chunk_start].copy_from_slice(&data[chunk_start..chunk_end]);
             }
             self.write_block(logical, &buf)?;
         }
@@ -307,10 +306,7 @@ impl StegoDevice {
         Ok(None)
     }
 
-    fn find_live_entry(
-        &self,
-        name: &str,
-    ) -> Result<Option<(EntryLocation, FileEntry)>, FsError> {
+    fn find_live_entry(&self, name: &str) -> Result<Option<(EntryLocation, FileEntry)>, FsError> {
         match self.find_entry_by_name(name)? {
             Some((loc, entry)) if entry.is_live() => Ok(Some((loc, entry))),
             _ => Ok(None),
@@ -365,7 +361,7 @@ fn validate_filename(name: &str) -> Result<(), FsError> {
             reason: "empty filename",
         });
     }
-    if name.as_bytes().len() > MAX_FILENAME_BYTES {
+    if name.len() > MAX_FILENAME_BYTES {
         return Err(FsError::InvalidFilename {
             reason: "filename exceeds 95 bytes",
         });
@@ -387,7 +383,7 @@ fn blocks_for_size(size: u64) -> u32 {
     if size == 0 {
         return 0;
     }
-    ((size + crate::BLOCK_SIZE as u64 - 1) / crate::BLOCK_SIZE as u64) as u32
+    size.div_ceil(crate::BLOCK_SIZE as u64) as u32
 }
 
 fn overflow_blocks_for_count(block_count: u32) -> u32 {
@@ -395,7 +391,7 @@ fn overflow_blocks_for_count(block_count: u32) -> u32 {
         return 0;
     }
     let remaining = block_count as usize - MAX_INLINE_BLOCKS;
-    ((remaining + OVERFLOW_ENTRIES_PER_BLOCK - 1) / OVERFLOW_ENTRIES_PER_BLOCK) as u32
+    remaining.div_ceil(OVERFLOW_ENTRIES_PER_BLOCK) as u32
 }
 
 fn unix_now() -> u64 {

@@ -23,11 +23,7 @@ fn q8_tensors(count: usize) -> Vec<SyntheticTensorSpec> {
 }
 
 fn open_fresh_server(name: &str, tensor_count: usize) -> (common::FixtureHandle, NbdServer) {
-    let fx = write_custom_gguf_fixture(
-        SyntheticGgufVersion::V3,
-        name,
-        &q8_tensors(tensor_count),
-    );
+    let fx = write_custom_gguf_fixture(SyntheticGgufVersion::V3, name, &q8_tensors(tensor_count));
     let device = StegoDevice::initialize_with_options(
         &fx.path,
         AllocationMode::Standard,
@@ -43,7 +39,10 @@ fn fresh_device_read_returns_zeros_across_data_region() {
     let (_fx, server) = open_fresh_server("nbd_align_zero.gguf", 12);
     let data = server.handle_read(0, 4096).expect("read full block");
     assert_eq!(data.len(), 4096);
-    assert!(data.iter().all(|&b| b == 0), "fresh data block should read as zeros");
+    assert!(
+        data.iter().all(|&b| b == 0),
+        "fresh data block should read as zeros"
+    );
 }
 
 #[test]
@@ -111,14 +110,19 @@ fn write_spanning_three_blocks_splices_middle_whole_block() {
     let total = first_partial + middle_full + last_partial;
 
     let payload: Vec<u8> = (0..total).map(|i| ((i * 7) % 251) as u8).collect();
-    server.handle_write(100, &payload).expect("three-block write");
+    server
+        .handle_write(100, &payload)
+        .expect("three-block write");
 
     let readback = server.handle_read(100, total as u32).expect("read back");
     assert_eq!(readback, payload);
 
     // Confirm the middle block is readable as a full aligned block.
     let middle = server.handle_read(4096, 4096).expect("middle aligned read");
-    assert_eq!(&middle[..], &payload[first_partial..first_partial + middle_full]);
+    assert_eq!(
+        &middle[..],
+        &payload[first_partial..first_partial + middle_full]
+    );
 }
 
 #[test]

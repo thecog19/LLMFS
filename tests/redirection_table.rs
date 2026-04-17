@@ -61,7 +61,11 @@ fn cross_block_table_spans_multiple_blocks() {
     let table = RedirectionTable::empty(total);
 
     let encoded = table.encode();
-    assert_eq!(encoded.len(), 3, "3000 entries need 3 blocks (1022+1022+956)");
+    assert_eq!(
+        encoded.len(),
+        3,
+        "3000 entries need 3 blocks (1022+1022+956)"
+    );
     for block in &encoded {
         assert_eq!(block.len(), llmdb::BLOCK_SIZE);
     }

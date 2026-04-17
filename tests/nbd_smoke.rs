@@ -19,7 +19,7 @@ use std::time::Duration;
 use common::{SyntheticGgufVersion, SyntheticTensorSpec, write_custom_gguf_fixture};
 use llmdb::gguf::quant::GGML_TYPE_Q8_0_ID;
 use llmdb::nbd::protocol::{
-    IHAVEOPT, NBDMAGIC, NBD_FLAG_C_FIXED_NEWSTYLE, NBD_FLAG_C_NO_ZEROES, NBD_OPT_EXPORT_NAME,
+    IHAVEOPT, NBD_FLAG_C_FIXED_NEWSTYLE, NBD_FLAG_C_NO_ZEROES, NBD_OPT_EXPORT_NAME, NBDMAGIC,
     NEWSTYLE_HEADER_BYTES, NbdCommand, NbdRequest, REPLY_HEADER_BYTES, encode_request,
     parse_reply_header,
 };
@@ -39,11 +39,7 @@ fn q8_tensors(count: usize) -> Vec<SyntheticTensorSpec> {
 }
 
 fn make_server(name: &str, tensor_count: usize) -> (common::FixtureHandle, NbdServer) {
-    let fx = write_custom_gguf_fixture(
-        SyntheticGgufVersion::V3,
-        name,
-        &q8_tensors(tensor_count),
-    );
+    let fx = write_custom_gguf_fixture(SyntheticGgufVersion::V3, name, &q8_tensors(tensor_count));
     let device = StegoDevice::initialize_with_options(
         &fx.path,
         AllocationMode::Standard,
@@ -131,7 +127,8 @@ fn client_handshake_read_write_disc_over_unix_socket() {
         offset: 0,
         length: 4096,
     };
-    conn.write_all(&encode_request(&read_req)).expect("send read");
+    conn.write_all(&encode_request(&read_req))
+        .expect("send read");
 
     let mut reply = [0_u8; REPLY_HEADER_BYTES];
     conn.read_exact(&mut reply).expect("read reply");
@@ -141,7 +138,10 @@ fn client_handshake_read_write_disc_over_unix_socket() {
 
     let mut data = vec![0_u8; 4096];
     conn.read_exact(&mut data).expect("read data");
-    assert!(data.iter().all(|&b| b == 0), "fresh device should read zeros");
+    assert!(
+        data.iter().all(|&b| b == 0),
+        "fresh device should read zeros"
+    );
 
     // 3. Send a Write request: put a known pattern in block 1.
     let payload: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
@@ -152,7 +152,8 @@ fn client_handshake_read_write_disc_over_unix_socket() {
         offset: 4096,
         length: 4096,
     };
-    conn.write_all(&encode_request(&write_req)).expect("send write");
+    conn.write_all(&encode_request(&write_req))
+        .expect("send write");
     conn.write_all(&payload).expect("send write payload");
 
     let mut reply = [0_u8; REPLY_HEADER_BYTES];
@@ -169,7 +170,8 @@ fn client_handshake_read_write_disc_over_unix_socket() {
         offset: 4096,
         length: 4096,
     };
-    conn.write_all(&encode_request(&read_back_req)).expect("send read2");
+    conn.write_all(&encode_request(&read_back_req))
+        .expect("send read2");
     let mut reply = [0_u8; REPLY_HEADER_BYTES];
     conn.read_exact(&mut reply).expect("read2 reply");
     let (error, _) = parse_reply_header(&reply).expect("parse reply");
@@ -186,7 +188,8 @@ fn client_handshake_read_write_disc_over_unix_socket() {
         offset: 0,
         length: 0,
     };
-    conn.write_all(&encode_request(&disc_req)).expect("send disc");
+    conn.write_all(&encode_request(&disc_req))
+        .expect("send disc");
     drop(conn);
 
     let server_result = server_thread.join().expect("server thread panic");

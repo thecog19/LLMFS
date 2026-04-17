@@ -65,9 +65,7 @@ fn store_list_get_roundtrips_small_file() {
     assert_eq!(listed[0].filename, "notes.txt");
 
     let out_path = tempfile::NamedTempFile::new().expect("out temp");
-    device
-        .get_file("notes.txt", out_path.path())
-        .expect("get");
+    device.get_file("notes.txt", out_path.path()).expect("get");
     let readback = std::fs::read(out_path.path()).expect("read out");
     assert_eq!(readback, data, "bytewise roundtrip");
 }
@@ -77,10 +75,11 @@ fn ten_kb_file_spans_three_blocks_and_roundtrips() {
     let (_fixture, mut device) = open_device("file_ops_10kb.gguf", 12);
 
     let data = patterned_bytes(10 * 1024, 0x42);
-    let stored = device
-        .store_bytes(&data, "big.bin", 0o644)
-        .expect("store");
-    assert_eq!(stored.block_count, 3, "10KB should span ceil(10240/4096)=3 blocks");
+    let stored = device.store_bytes(&data, "big.bin", 0o644).expect("store");
+    assert_eq!(
+        stored.block_count, 3,
+        "10KB should span ceil(10240/4096)=3 blocks"
+    );
     assert_eq!(stored.inline_blocks.len(), 3);
     assert_eq!(
         stored.overflow_block,
@@ -99,7 +98,9 @@ fn delete_returns_all_data_blocks_to_free_list() {
     let used_pre = device.used_blocks().expect("used pre");
 
     let data = patterned_bytes(9000, 0x55);
-    device.store_bytes(&data, "deleteme.bin", 0o644).expect("store");
+    device
+        .store_bytes(&data, "deleteme.bin", 0o644)
+        .expect("store");
     let used_post_store = device.used_blocks().expect("used post store");
     assert!(used_post_store > used_pre);
 
@@ -122,7 +123,9 @@ fn v1_disallows_store_with_same_name_even_after_delete() {
     let (_fixture, mut device) = open_device("file_ops_dupe.gguf", 12);
 
     let data = patterned_bytes(256, 0xA1);
-    device.store_bytes(&data, "once.txt", 0o644).expect("first store");
+    device
+        .store_bytes(&data, "once.txt", 0o644)
+        .expect("first store");
     device.delete_file("once.txt").expect("delete");
 
     let result = device.store_bytes(&data, "once.txt", 0o644);
@@ -195,7 +198,9 @@ fn corrupted_file_block_triggers_crc_mismatch_on_get() {
     let (_fixture, mut device) = open_device("file_ops_crc.gguf", 12);
 
     let data = patterned_bytes(4096 * 2, 0xEE);
-    let entry = device.store_bytes(&data, "target.bin", 0o644).expect("store");
+    let entry = device
+        .store_bytes(&data, "target.bin", 0o644)
+        .expect("store");
 
     // Tamper with the first data block's bytes (via the public write path).
     let victim = entry.inline_blocks[0];
@@ -220,7 +225,10 @@ fn invalid_filenames_are_rejected() {
 
     let too_long = "x".repeat(96);
     let too_long_result = device.store_bytes(&data, &too_long, 0o644);
-    assert!(matches!(too_long_result, Err(FsError::InvalidFilename { .. })));
+    assert!(matches!(
+        too_long_result,
+        Err(FsError::InvalidFilename { .. })
+    ));
 
     let with_slash = device.store_bytes(&data, "a/b.txt", 0o644);
     assert!(matches!(with_slash, Err(FsError::InvalidFilename { .. })));
@@ -245,6 +253,8 @@ fn large_file_uses_overflow_block_and_roundtrips() {
     assert_eq!(entry.inline_blocks.len(), 28);
     assert_ne!(entry.overflow_block, llmdb::stego::integrity::NO_BLOCK);
 
-    let readback = device.read_file_bytes("overflow.bin").expect("read overflow");
+    let readback = device
+        .read_file_bytes("overflow.bin")
+        .expect("read overflow");
     assert_eq!(readback, data);
 }

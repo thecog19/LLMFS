@@ -34,10 +34,7 @@ impl QuantPacker for F16Packer {
     fn embed(&self, block_bytes: &[u8], data: &[u8]) -> Vec<u8> {
         assert_eq!(block_bytes.len(), F16_BYTES_PER_VALUE, "f16 block size");
         assert_eq!(data.len(), 1, "f16 data nibble");
-        vec![
-            (block_bytes[0] & 0xF0) | (data[0] & 0x0F),
-            block_bytes[1],
-        ]
+        vec![(block_bytes[0] & 0xF0) | (data[0] & 0x0F), block_bytes[1]]
     }
     fn stealable_byte_offsets(&self) -> Vec<usize> {
         vec![0]
@@ -304,14 +301,14 @@ fn validate_value_storage(
     storage_len: usize,
     bytes_per_value: usize,
 ) -> Result<(), PackingError> {
-    if storage_len % bytes_per_value != 0 {
+    if storage_len.is_multiple_of(bytes_per_value) {
+        Ok(())
+    } else {
         Err(PackingError::InvalidStorageLength {
             context,
             unit: bytes_per_value,
             actual: storage_len,
         })
-    } else {
-        Ok(())
     }
 }
 

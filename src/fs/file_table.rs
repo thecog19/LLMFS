@@ -176,12 +176,17 @@ impl FileEntry {
         let gid = u32::from_le_bytes(bytes[OFFSET_GID..OFFSET_GID + 4].try_into().unwrap());
         let size_bytes =
             u64::from_le_bytes(bytes[OFFSET_SIZE..OFFSET_SIZE + 8].try_into().unwrap());
-        let created =
-            u64::from_le_bytes(bytes[OFFSET_CREATED..OFFSET_CREATED + 8].try_into().unwrap());
-        let modified =
-            u64::from_le_bytes(bytes[OFFSET_MODIFIED..OFFSET_MODIFIED + 8].try_into().unwrap());
-        let crc32 =
-            u32::from_le_bytes(bytes[OFFSET_CRC32..OFFSET_CRC32 + 4].try_into().unwrap());
+        let created = u64::from_le_bytes(
+            bytes[OFFSET_CREATED..OFFSET_CREATED + 8]
+                .try_into()
+                .unwrap(),
+        );
+        let modified = u64::from_le_bytes(
+            bytes[OFFSET_MODIFIED..OFFSET_MODIFIED + 8]
+                .try_into()
+                .unwrap(),
+        );
+        let crc32 = u32::from_le_bytes(bytes[OFFSET_CRC32..OFFSET_CRC32 + 4].try_into().unwrap());
         let block_count = u32::from_le_bytes(
             bytes[OFFSET_BLOCK_COUNT..OFFSET_BLOCK_COUNT + 4]
                 .try_into()
@@ -193,9 +198,8 @@ impl FileEntry {
                 .unwrap(),
         );
 
-        let filename = decode_filename(
-            &bytes[OFFSET_FILENAME..OFFSET_FILENAME + FILENAME_FIELD_BYTES],
-        )?;
+        let filename =
+            decode_filename(&bytes[OFFSET_FILENAME..OFFSET_FILENAME + FILENAME_FIELD_BYTES])?;
 
         let inline_len = (block_count as usize).min(MAX_INLINE_BLOCKS);
         let mut inline_blocks = Vec::with_capacity(inline_len);

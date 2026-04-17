@@ -1,11 +1,11 @@
 use llmdb::nbd::protocol::{
-    CLISERV_MAGIC, IHAVEOPT, NBDMAGIC, NBD_FLAG_FIXED_NEWSTYLE, NBD_FLAG_HAS_FLAGS,
-    NBD_FLAG_NO_ZEROES, NBD_FLAG_SEND_FLUSH, NBD_INFO_EXPORT, NBD_OPT_EXPORT_NAME, NBD_OPT_GO,
-    NBD_REPLY_MAGIC, NBD_REP_ACK, NBD_REP_ERR_UNSUP, NBD_REP_INFO, NBD_REQUEST_MAGIC,
-    NEWSTYLE_HEADER_BYTES, NbdCommand, NbdProtoError, NbdRequest, OLDSTYLE_HANDSHAKE_BYTES,
-    OPTION_REPLY_MAGIC, REPLY_HEADER_BYTES, REQUEST_HEADER_BYTES, encode_export_name_reply,
-    encode_info_export, encode_newstyle_header, encode_oldstyle_handshake, encode_option_reply,
-    encode_reply_header, encode_request, parse_option_header, parse_reply_header, parse_request,
+    CLISERV_MAGIC, IHAVEOPT, NBD_FLAG_FIXED_NEWSTYLE, NBD_FLAG_HAS_FLAGS, NBD_FLAG_NO_ZEROES,
+    NBD_FLAG_SEND_FLUSH, NBD_INFO_EXPORT, NBD_OPT_EXPORT_NAME, NBD_OPT_GO, NBD_REP_ACK,
+    NBD_REP_ERR_UNSUP, NBD_REPLY_MAGIC, NBD_REQUEST_MAGIC, NBDMAGIC, NEWSTYLE_HEADER_BYTES,
+    NbdCommand, NbdProtoError, NbdRequest, OLDSTYLE_HANDSHAKE_BYTES, OPTION_REPLY_MAGIC,
+    REPLY_HEADER_BYTES, REQUEST_HEADER_BYTES, encode_export_name_reply, encode_info_export,
+    encode_newstyle_header, encode_oldstyle_handshake, encode_option_reply, encode_reply_header,
+    encode_request, parse_option_header, parse_reply_header, parse_request,
 };
 
 #[test]
@@ -132,10 +132,7 @@ fn oldstyle_handshake_is_exactly_152_bytes_with_advertised_size() {
         u64::from_be_bytes(bytes[8..16].try_into().unwrap()),
         CLISERV_MAGIC
     );
-    assert_eq!(
-        u64::from_be_bytes(bytes[16..24].try_into().unwrap()),
-        size
-    );
+    assert_eq!(u64::from_be_bytes(bytes[16..24].try_into().unwrap()), size);
     // Tail padding must be zero.
     assert!(bytes[28..].iter().all(|&b| b == 0));
 }
@@ -176,7 +173,10 @@ fn newstyle_header_is_18_bytes_with_magic_prefix() {
 fn export_name_reply_no_zeroes_is_10_bytes() {
     let reply = encode_export_name_reply(0x123456789, 0x5, true);
     assert_eq!(reply.len(), 10);
-    assert_eq!(u64::from_be_bytes(reply[0..8].try_into().unwrap()), 0x123456789);
+    assert_eq!(
+        u64::from_be_bytes(reply[0..8].try_into().unwrap()),
+        0x123456789
+    );
     assert_eq!(u16::from_be_bytes(reply[8..10].try_into().unwrap()), 0x5);
 }
 
@@ -219,7 +219,10 @@ fn option_reply_with_payload_appends_it_after_length() {
 fn info_export_is_12_bytes_with_size_and_flags() {
     let info = encode_info_export(4096, NBD_FLAG_HAS_FLAGS | NBD_FLAG_SEND_FLUSH);
     assert_eq!(info.len(), 12);
-    assert_eq!(u16::from_be_bytes(info[0..2].try_into().unwrap()), NBD_INFO_EXPORT);
+    assert_eq!(
+        u16::from_be_bytes(info[0..2].try_into().unwrap()),
+        NBD_INFO_EXPORT
+    );
     assert_eq!(u64::from_be_bytes(info[2..10].try_into().unwrap()), 4096);
     assert_eq!(
         u16::from_be_bytes(info[10..12].try_into().unwrap()),
