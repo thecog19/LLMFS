@@ -53,6 +53,85 @@ pub trait QuantPacker: Sync {
     fn stealable_byte_offsets(&self) -> Vec<usize>;
 }
 
+/// Generic "update only the quant blocks that back this payload range" writer.
+/// Avoids the whole-tensor decode-modify-encode cycle that `write_stego_bytes`
+/// used to perform — for a 4 KB NBD write that used to replay every quant
+/// block in a 1–2 MB tensor, this only touches the handful of blocks that
+/// actually overlap the range. See `src/stego/packing/q8_0.rs` for a caller.
+pub fn blockwise_write_range<const P: usize>(
+    storage: &mut [u8],
+    block_bytes: usize,
+    start_in_payload: usize,
+    data: &[u8],
+    read_block: fn(&[u8]) -> Result<[u8; P], PackingError>,
+    write_block: fn(&mut [u8], &[u8]) -> Result<(), PackingError>,
+) -> Result<(), PackingError> {
+    let end_in_payload = start_in_payload + data.len();
+    let first_block = start_in_payload / P;
+    let last_block_excl = end_in_payload.div_ceil(P);
+
+    let mut data_cursor = 0_usize;
+    for block_idx in first_block..last_block_excl {
+        let block_storage_start = block_idx * block_bytes;
+        let block = &mut storage[block_storage_start..block_storage_start + block_bytes];
+
+        let block_payload_start = block_idx * P;
+        let block_payload_end = block_payload_start + P;
+        let overlap_start = start_in_payload.max(block_payload_start);
+        let overlap_end = end_in_payload.min(block_payload_end);
+        let within_start = overlap_start - block_payload_start;
+        let within_end = overlap_end - block_payload_start;
+        let copy_len = within_end - within_start;
+
+        if within_start == 0 && within_end == P {
+            // Full block overwrite — skip the decode.
+            write_block(block, &data[data_cursor..data_cursor + copy_len])?;
+        } else {
+            // Partial block — read current payload, splice, write back.
+            let mut payload = read_block(block)?;
+            payload[within_start..within_end]
+                .copy_from_slice(&data[data_cursor..data_cursor + copy_len]);
+            write_block(block, &payload)?;
+        }
+        data_cursor += copy_len;
+    }
+    Ok(())
+}
+
+/// Companion reader for `blockwise_write_range`. Decodes only the blocks that
+/// overlap the requested payload range.
+pub fn blockwise_read_range<const P: usize>(
+    storage: &[u8],
+    block_bytes: usize,
+    start_in_payload: usize,
+    len: usize,
+    read_block: fn(&[u8]) -> Result<[u8; P], PackingError>,
+) -> Result<Vec<u8>, PackingError> {
+    let end_in_payload = start_in_payload + len;
+    let first_block = start_in_payload / P;
+    let last_block_excl = end_in_payload.div_ceil(P);
+
+    let mut out = vec![0_u8; len];
+    let mut cursor = 0_usize;
+    for block_idx in first_block..last_block_excl {
+        let block_storage_start = block_idx * block_bytes;
+        let block = &storage[block_storage_start..block_storage_start + block_bytes];
+        let payload = read_block(block)?;
+
+        let block_payload_start = block_idx * P;
+        let block_payload_end = block_payload_start + P;
+        let overlap_start = start_in_payload.max(block_payload_start);
+        let overlap_end = end_in_payload.min(block_payload_end);
+        let within_start = overlap_start - block_payload_start;
+        let within_end = overlap_end - block_payload_start;
+        let copy_len = within_end - within_start;
+
+        out[cursor..cursor + copy_len].copy_from_slice(&payload[within_start..within_end]);
+        cursor += copy_len;
+    }
+    Ok(out)
+}
+
 pub fn supported_packers() -> &'static [&'static str] {
     &[
         q8_0::NAME,

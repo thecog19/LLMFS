@@ -109,6 +109,107 @@ pub fn read_f16_payload(storage: &[u8]) -> Result<Vec<u8>, PackingError> {
     Ok(payload)
 }
 
+/// Touch only the f16 values that back `data` when it lands at
+/// `start_in_payload` within the tensor's full payload range. Avoids the
+/// `write_f16_payload` full-tensor walk — the optimisation that turned a
+/// ~25-minute mkfs into something interactive.
+pub fn write_f16_range(
+    storage: &mut [u8],
+    start_in_payload: usize,
+    data: &[u8],
+) -> Result<(), PackingError> {
+    validate_value_storage(NAME, storage.len(), F16_BYTES_PER_VALUE)?;
+    let value_count = storage.len() / F16_BYTES_PER_VALUE;
+    for (offset, &byte) in data.iter().enumerate() {
+        let payload_idx = start_in_payload + offset;
+        let weight_even = payload_idx * 2;
+        let weight_odd = weight_even + 1;
+        if weight_even < value_count {
+            write_f16_nibble(storage, weight_even, byte & 0x0F)?;
+        }
+        if weight_odd < value_count {
+            write_f16_nibble(storage, weight_odd, (byte >> 4) & 0x0F)?;
+        }
+    }
+    Ok(())
+}
+
+pub fn read_f16_range(
+    storage: &[u8],
+    start_in_payload: usize,
+    len: usize,
+) -> Result<Vec<u8>, PackingError> {
+    validate_value_storage(NAME, storage.len(), F16_BYTES_PER_VALUE)?;
+    let value_count = storage.len() / F16_BYTES_PER_VALUE;
+    let max_payload_bytes = value_count.div_ceil(2);
+    if start_in_payload.saturating_add(len) > max_payload_bytes {
+        return Err(PackingError::PayloadTooLarge {
+            context: NAME,
+            max_payload_bytes,
+            actual: start_in_payload.saturating_add(len),
+        });
+    }
+    let mut out = vec![0_u8; len];
+    for (offset, dst) in out.iter_mut().enumerate() {
+        let payload_idx = start_in_payload + offset;
+        let weight_even = payload_idx * 2;
+        let weight_odd = weight_even + 1;
+        let lo = if weight_even < value_count {
+            read_f16_nibble(storage, weight_even)?
+        } else {
+            0
+        };
+        let hi = if weight_odd < value_count {
+            read_f16_nibble(storage, weight_odd)?
+        } else {
+            0
+        };
+        *dst = lo | (hi << 4);
+    }
+    Ok(out)
+}
+
+pub fn write_f32_range(
+    storage: &mut [u8],
+    start_in_payload: usize,
+    data: &[u8],
+) -> Result<(), PackingError> {
+    validate_value_storage(NAME, storage.len(), F32_BYTES_PER_VALUE)?;
+    let value_count = storage.len() / F32_BYTES_PER_VALUE;
+    if start_in_payload.saturating_add(data.len()) > value_count {
+        return Err(PackingError::PayloadTooLarge {
+            context: NAME,
+            max_payload_bytes: value_count,
+            actual: start_in_payload.saturating_add(data.len()),
+        });
+    }
+    for (offset, &byte) in data.iter().enumerate() {
+        write_f32_byte(storage, start_in_payload + offset, byte)?;
+    }
+    Ok(())
+}
+
+pub fn read_f32_range(
+    storage: &[u8],
+    start_in_payload: usize,
+    len: usize,
+) -> Result<Vec<u8>, PackingError> {
+    validate_value_storage(NAME, storage.len(), F32_BYTES_PER_VALUE)?;
+    let value_count = storage.len() / F32_BYTES_PER_VALUE;
+    if start_in_payload.saturating_add(len) > value_count {
+        return Err(PackingError::PayloadTooLarge {
+            context: NAME,
+            max_payload_bytes: value_count,
+            actual: start_in_payload.saturating_add(len),
+        });
+    }
+    let mut out = vec![0_u8; len];
+    for (offset, dst) in out.iter_mut().enumerate() {
+        *dst = read_f32_byte(storage, start_in_payload + offset)?;
+    }
+    Ok(out)
+}
+
 pub fn write_f16_payload(storage: &mut [u8], payload: &[u8]) -> Result<(), PackingError> {
     validate_value_storage(NAME, storage.len(), F16_BYTES_PER_VALUE)?;
 

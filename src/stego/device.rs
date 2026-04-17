@@ -660,15 +660,14 @@ impl StegoDevice {
             if end <= slot.byte_start || start >= slot.byte_end {
                 continue;
             }
-
-            let decoded = self.decode_slot(slot)?;
             let overlap_start = start.max(slot.byte_start);
             let overlap_end = end.min(slot.byte_end);
-            let src_start = overlap_start - slot.byte_start;
-            let src_end = overlap_end - slot.byte_start;
+            let within_slot_start = overlap_start - slot.byte_start;
+            let within_slot_len = overlap_end - overlap_start;
             let dst_start = overlap_start - start;
             let dst_end = overlap_end - start;
-            out[dst_start..dst_end].copy_from_slice(&decoded[src_start..src_end]);
+            let piece = self.read_slot_range(slot, within_slot_start, within_slot_len)?;
+            out[dst_start..dst_end].copy_from_slice(&piece);
         }
 
         Ok(out)
@@ -691,105 +690,77 @@ impl StegoDevice {
             if end <= slot.byte_start || start >= slot.byte_end {
                 continue;
             }
-
-            let mut decoded = self.decode_slot(&slot)?;
             let overlap_start = start.max(slot.byte_start);
             let overlap_end = end.min(slot.byte_end);
+            let within_slot_start = overlap_start - slot.byte_start;
             let src_start = overlap_start - start;
             let src_end = overlap_end - start;
-            let dst_start = overlap_start - slot.byte_start;
-            let dst_end = overlap_end - slot.byte_start;
-            decoded[dst_start..dst_end].copy_from_slice(&data[src_start..src_end]);
-            self.encode_slot(&slot, &decoded)?;
+            self.write_slot_range(&slot, within_slot_start, &data[src_start..src_end])?;
         }
 
         Ok(())
     }
 
-    fn decode_slot(&self, slot: &TensorByteSlot) -> Result<Vec<u8>, DeviceError> {
-        let storage = &self.mmap[slot.file_offset..slot.file_offset + slot.storage_len];
-        let payload = match slot.quant_type {
-            GgufQuantType::Q8_0 => decode_blockwise(
-                storage,
-                packing::q8_0::BLOCK_BYTES,
-                packing::q8_0::read_payload_block,
-            )?,
-            GgufQuantType::Q6K => decode_blockwise(
-                storage,
-                packing::q6_k::BLOCK_BYTES,
-                packing::q6_k::read_payload_block,
-            )?,
-            GgufQuantType::Q5K => decode_blockwise(
-                storage,
-                packing::q5_k::BLOCK_BYTES,
-                packing::q5_k::read_payload_block,
-            )?,
-            GgufQuantType::Q4K => decode_blockwise(
-                storage,
-                packing::q4_k::BLOCK_BYTES,
-                packing::q4_k::read_payload_block,
-            )?,
-            GgufQuantType::Q3K => decode_blockwise(
-                storage,
-                packing::q3_k::BLOCK_BYTES,
-                packing::q3_k::read_payload_block,
-            )?,
-            GgufQuantType::F16 => {
-                let mut payload = packing::float::read_f16_payload(storage)?;
-                payload.truncate(slot.capacity_bytes);
-                payload
-            }
-            GgufQuantType::F32 => packing::float::read_f32_payload(storage)?,
-            _ => return Err(DeviceError::UnsupportedQuantType(slot.quant_type)),
-        };
-
-        Ok(payload)
-    }
-
-    fn encode_slot(&mut self, slot: &TensorByteSlot, payload: &[u8]) -> Result<(), DeviceError> {
-        let storage = &mut self.mmap[slot.file_offset..slot.file_offset + slot.storage_len];
+    /// Update only the quant blocks in `slot` that back the payload byte
+    /// range `[start_in_slot, start_in_slot + data.len())`. Replaces the
+    /// former decode-whole-tensor / splice / encode-whole-tensor cycle
+    /// — see `src/stego/packing/mod.rs::blockwise_write_range`.
+    fn write_slot_range(
+        &mut self,
+        slot: &TensorByteSlot,
+        start_in_slot: usize,
+        data: &[u8],
+    ) -> Result<(), DeviceError> {
+        let storage =
+            &mut self.mmap[slot.file_offset..slot.file_offset + slot.storage_len];
         match slot.quant_type {
-            GgufQuantType::Q8_0 => encode_blockwise(
-                storage,
-                packing::q8_0::BLOCK_BYTES,
-                packing::q8_0::PAYLOAD_BYTES_PER_BLOCK,
-                payload,
-                packing::q8_0::write_payload_block,
-            )?,
-            GgufQuantType::Q6K => encode_blockwise(
-                storage,
-                packing::q6_k::BLOCK_BYTES,
-                packing::q6_k::PAYLOAD_BYTES_PER_BLOCK,
-                payload,
-                packing::q6_k::write_payload_block,
-            )?,
-            GgufQuantType::Q5K => encode_blockwise(
-                storage,
-                packing::q5_k::BLOCK_BYTES,
-                packing::q5_k::PAYLOAD_BYTES_PER_BLOCK,
-                payload,
-                packing::q5_k::write_payload_block,
-            )?,
-            GgufQuantType::Q4K => encode_blockwise(
-                storage,
-                packing::q4_k::BLOCK_BYTES,
-                packing::q4_k::PAYLOAD_BYTES_PER_BLOCK,
-                payload,
-                packing::q4_k::write_payload_block,
-            )?,
-            GgufQuantType::Q3K => encode_blockwise(
-                storage,
-                packing::q3_k::BLOCK_BYTES,
-                packing::q3_k::PAYLOAD_BYTES_PER_BLOCK,
-                payload,
-                packing::q3_k::write_payload_block,
-            )?,
-            GgufQuantType::F16 => packing::float::write_f16_payload(storage, payload)?,
-            GgufQuantType::F32 => packing::float::write_f32_payload(storage, payload)?,
+            GgufQuantType::Q8_0 => {
+                packing::q8_0::write_stego_range(storage, start_in_slot, data)?
+            }
+            GgufQuantType::Q6K => {
+                packing::q6_k::write_stego_range(storage, start_in_slot, data)?
+            }
+            GgufQuantType::Q5K => {
+                packing::q5_k::write_stego_range(storage, start_in_slot, data)?
+            }
+            GgufQuantType::Q4K => {
+                packing::q4_k::write_stego_range(storage, start_in_slot, data)?
+            }
+            GgufQuantType::Q3K => {
+                packing::q3_k::write_stego_range(storage, start_in_slot, data)?
+            }
+            GgufQuantType::F16 => {
+                packing::float::write_f16_range(storage, start_in_slot, data)?
+            }
+            GgufQuantType::F32 => {
+                packing::float::write_f32_range(storage, start_in_slot, data)?
+            }
             _ => return Err(DeviceError::UnsupportedQuantType(slot.quant_type)),
         }
-
         Ok(())
+    }
+
+    fn read_slot_range(
+        &self,
+        slot: &TensorByteSlot,
+        start_in_slot: usize,
+        len: usize,
+    ) -> Result<Vec<u8>, DeviceError> {
+        let storage = &self.mmap[slot.file_offset..slot.file_offset + slot.storage_len];
+        Ok(match slot.quant_type {
+            GgufQuantType::Q8_0 => packing::q8_0::read_stego_range(storage, start_in_slot, len)?,
+            GgufQuantType::Q6K => packing::q6_k::read_stego_range(storage, start_in_slot, len)?,
+            GgufQuantType::Q5K => packing::q5_k::read_stego_range(storage, start_in_slot, len)?,
+            GgufQuantType::Q4K => packing::q4_k::read_stego_range(storage, start_in_slot, len)?,
+            GgufQuantType::Q3K => packing::q3_k::read_stego_range(storage, start_in_slot, len)?,
+            GgufQuantType::F16 => {
+                packing::float::read_f16_range(storage, start_in_slot, len)?
+            }
+            GgufQuantType::F32 => {
+                packing::float::read_f32_range(storage, start_in_slot, len)?
+            }
+            _ => return Err(DeviceError::UnsupportedQuantType(slot.quant_type)),
+        })
     }
 
     fn verify_block_crc(&self, block_index: u32, data: &[u8]) -> Result<(), DeviceError> {
@@ -1160,56 +1131,6 @@ fn chunk_storage_len(
     Ok((weight_count / weights_per_chunk) * bytes_per_chunk)
 }
 
-fn decode_blockwise<const PAYLOAD_BYTES: usize>(
-    storage: &[u8],
-    block_bytes: usize,
-    reader: fn(&[u8]) -> Result<[u8; PAYLOAD_BYTES], PackingError>,
-) -> Result<Vec<u8>, DeviceError> {
-    if storage.len() % block_bytes != 0 {
-        return Err(DeviceError::InvalidPhysicalStorageLength {
-            len: storage.len(),
-            block_bytes,
-        });
-    }
-
-    let mut payload = Vec::new();
-    for chunk in storage.chunks_exact(block_bytes) {
-        payload.extend_from_slice(&reader(chunk)?);
-    }
-    Ok(payload)
-}
-
-fn encode_blockwise(
-    storage: &mut [u8],
-    block_bytes: usize,
-    payload_bytes_per_block: usize,
-    payload: &[u8],
-    writer: fn(&mut [u8], &[u8]) -> Result<(), PackingError>,
-) -> Result<(), DeviceError> {
-    if storage.len() % block_bytes != 0 {
-        return Err(DeviceError::InvalidPhysicalStorageLength {
-            len: storage.len(),
-            block_bytes,
-        });
-    }
-
-    if payload.len() != (storage.len() / block_bytes) * payload_bytes_per_block {
-        return Err(DeviceError::PayloadLengthMismatch {
-            expected: (storage.len() / block_bytes) * payload_bytes_per_block,
-            actual: payload.len(),
-        });
-    }
-
-    for (chunk, payload_chunk) in storage
-        .chunks_exact_mut(block_bytes)
-        .zip(payload.chunks_exact(payload_bytes_per_block))
-    {
-        writer(chunk, payload_chunk)?;
-    }
-
-    Ok(())
-}
-
 fn crc32(data: &[u8]) -> u32 {
     let mut hasher = Hasher::new();
     hasher.update(data);
@@ -1250,10 +1171,6 @@ pub enum DeviceError {
         weight_count: usize,
         weights_per_chunk: usize,
     },
-    #[error("invalid physical storage length {len} for block size {block_bytes}")]
-    InvalidPhysicalStorageLength { len: usize, block_bytes: usize },
-    #[error("payload length mismatch: expected {expected}, got {actual}")]
-    PayloadLengthMismatch { expected: usize, actual: usize },
     #[error("block index {index} out of range, total blocks {total_blocks}")]
     BlockOutOfRange { index: u32, total_blocks: u32 },
     #[error("block {index} is reserved metadata, first data block is {data_region_start}")]

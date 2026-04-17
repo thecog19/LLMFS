@@ -56,6 +56,35 @@ pub fn read_payload_block(block: &[u8]) -> Result<[u8; PAYLOAD_BYTES_PER_BLOCK],
     Ok(payload)
 }
 
+pub fn write_stego_range(
+    storage: &mut [u8],
+    start_in_payload: usize,
+    data: &[u8],
+) -> Result<(), PackingError> {
+    super::blockwise_write_range::<PAYLOAD_BYTES_PER_BLOCK>(
+        storage,
+        BLOCK_BYTES,
+        start_in_payload,
+        data,
+        read_payload_block,
+        write_payload_block,
+    )
+}
+
+pub fn read_stego_range(
+    storage: &[u8],
+    start_in_payload: usize,
+    len: usize,
+) -> Result<Vec<u8>, PackingError> {
+    super::blockwise_read_range::<PAYLOAD_BYTES_PER_BLOCK>(
+        storage,
+        BLOCK_BYTES,
+        start_in_payload,
+        len,
+        read_payload_block,
+    )
+}
+
 pub fn write_payload_block(block: &mut [u8], payload: &[u8]) -> Result<(), PackingError> {
     if block.len() != BLOCK_BYTES {
         return Err(PackingError::InvalidStorageLength {
