@@ -1,6 +1,6 @@
 # Task 15: Benchmarks And Quality Harness
 
-Status: deferred (post-V1)
+Status: done
 Depends on: 09-file-table-and-file-ops.md
 Spec refs: DESIGN-NEW.MD section "11. Testing Strategy" (Benchmarks)
 
@@ -63,3 +63,33 @@ automatically and bake them into `cargo bench` output so we can track
 quality regressions over time. See the DESIGN-NEW.MD §2 V1 "Cover-file
 viability" paragraph for the root-cause explanation (int-quant packer
 destroys magnitude; float packer preserves sign+exponent).
+
+## Invocation
+
+```
+cargo bench --offline --bench block_read
+cargo bench --offline --bench block_write
+cargo bench --offline --bench address_translation
+cargo bench --offline --bench file_roundtrip
+LLMDB_E2E_GGUF=/path/to/model.gguf LLMDB_LLAMA_CLI=/path/to/llama-cli \
+    cargo bench --offline --bench quality
+```
+
+## Baseline (WSL2, Ryzen laptop, 2026-04-17, `--quick`)
+
+| Bench | Result |
+|-------|--------|
+| `block_read / 4KiB_random` | ~15 µs / block, 250 MiB/s |
+| `block_write / 4KiB_overwrite` (shadow-copy path) | ~3.5 ms / block, 1.1 MiB/s |
+| `address_translation / map_logical_byte` | ~110 ns / call, 9 Melem/s |
+| `file_roundtrip / 1KiB` | 12.4 ms (store+read+delete) |
+| `file_roundtrip / 100KiB` | 83 ms, 1.2 MiB/s |
+| `file_roundtrip / 1MiB` | 735 ms, 1.36 MiB/s |
+
+The 225× read/write asymmetry on `block_write` is the shadow-copy
+path cost: every overwrite pops a fresh physical, re-encodes it
+end-to-end, persists the redirection table, and pushes the old
+physical back to the free list. `file_roundtrip` at larger sizes
+saturates to the same ~1.3 MiB/s wall that raw block writes hit,
+which is consistent with the cost model and tracks what real ext4
+workloads see through the NBD bridge.
