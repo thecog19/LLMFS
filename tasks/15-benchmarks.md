@@ -42,3 +42,24 @@ Acceptance criteria:
 - Output includes blocks/sec and MB/sec for read and write.
 - Address-translation benchmark shows operations/sec.
 - The quality harness runs with `LLMDB_E2E_GGUF=...` set and produces a comparison line without crashing.
+
+Prior empirical data (2026-04-17, ad-hoc smoke test, not yet harnessed):
+
+Ran `llmdb init` + `llmdb store` on real GGUFs with greedy
+temperature=0 completion as the quality signal.
+
+- **F16 cover** (SmolLM2-135M-f16, 53 MB stego capacity): inference
+  survives end-to-end. Post-init output identical to baseline. At
+  48% utilization (25 MB stored) outputs diverge in minor word-choice
+  on a few prompts but stay coherent. At 97% utilization (50 MB
+  stored, ~50M weight nibbles randomized) the model still produces
+  fluent English and correct Python for a Fibonacci prompt.
+- **Q8_0 cover** (stories15M-q8_0, smollm2-135m-q8_0): inference
+  collapses into degenerate-repetition garbage after `llmdb init`
+  alone (before any user data is stored).
+
+When this task lands, the harness should reproduce both results
+automatically and bake them into `cargo bench` output so we can track
+quality regressions over time. See the DESIGN-NEW.MD §2 V1 "Cover-file
+viability" paragraph for the root-cause explanation (int-quant packer
+destroys magnitude; float packer preserves sign+exponent).

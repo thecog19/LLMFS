@@ -28,6 +28,25 @@ Rust. Dependencies: `memmap2` (mmap), `clap` (CLI), `crc32fast` (integrity), `nb
 - `ask` command (model queries its own files)
 - Diagnostics (utilization, degradation estimate)
 
+**Cover-file viability (empirical, 2026-04-17):** V1's dual-use property
+— the GGUF remains a functional model while carrying stego data — holds
+for **F16 and F32** cover files only. Those packers steal bits strictly
+from the low mantissa (mask `0xFFF0` / `0xFFFF_FF00`), preserving sign
+and exponent, so weight magnitudes survive at reduced precision only.
+SmolLM2-135M-f16 at 97% utilization still produces fluent, on-topic
+completions; baseline and post-stego outputs diverge only in minor
+word-choice details on some prompts.
+
+The **int-quantized** packers (Q8_0, Q6_K, Q5_K, Q4_K, Q3_K) cannot
+offer the dual-use property in V1: Q8_0 masks with `0xF0`, destroying
+half of every int8 weight's precision including its magnitude. Both
+stories15M-q8_0 and smollm2-135m-q8_0 collapse into degenerate
+repetition (`ushushush…`, `bianbian…`) after `llmdb init` alone —
+before any user data is stored. For Q8_0 / K-quant cover files V1 is a
+**storage-only** device; the model is a write-once casualty. Restoring
+dual-use on int-quantized covers is explicitly V2's job (sensitivity-
+aware allocation), not a V1 tuning fix.
+
 ### V2 — Optimal Embedding + Compression
 
 - Progressive background calibration (AWQ fast, Hessian full)
