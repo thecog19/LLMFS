@@ -253,8 +253,11 @@ impl StegoDevice {
             self.update_block_crc(block_index, data)?;
             self.redirection.set_mapping(block_index, physical);
             self.persist_redirection_block_for(block_index)?;
+            // One msync makes the shadow bytes, integrity CRC, redirection
+            // flip, and free-list head all durable together. The commit
+            // point is this msync; anything earlier on this path is
+            // recoverable via orphan scan.
             self.persist_superblock()?;
-            self.flush()?;
             self.log_verbose(format!(
                 "first write: block={} → physical={}",
                 block_index, physical
@@ -269,8 +272,8 @@ impl StegoDevice {
         // old data at `old_physical`. If we crash here, orphan-scan reclaims
         // the shadow and the old block remains authoritative.
         self.write_physical_block_raw(shadow, data)?;
+        // persist_superblock calls flush internally; no second msync needed.
         self.persist_superblock()?;
-        self.flush()?;
         self.log_verbose(format!(
             "shadow flush 1: block={} shadow_physical={}",
             block_index, shadow
@@ -280,7 +283,10 @@ impl StegoDevice {
             return Ok(());
         }
 
-        // Phase 2: flip redirection + update CRC atomically.
+        // Phase 2: flip redirection + update CRC atomically. The flush
+        // barrier here is the *required* ordering guarantee — readers
+        // must not see the new redirection mapping until the shadow
+        // bytes and CRC it points at are durable.
         self.redirection.set_mapping(block_index, shadow);
         self.update_block_crc(block_index, data)?;
         self.persist_redirection_block_for(block_index)?;
@@ -294,11 +300,12 @@ impl StegoDevice {
             return Ok(());
         }
 
-        // Phase 3: reclaim the old physical. Always — there's no aliasing
-        // risk with split namespaces, the freed physical is just storage.
+        // Phase 3: reclaim the old physical. No flush here — if we crash
+        // before the next flush, recovery's orphan scan picks up
+        // old_physical as "in data region, unreferenced, not on free list"
+        // and reclaims it. The next persist_superblock call (either from
+        // another write or from close) batches the durability.
         self.push_free_block(old_physical)?;
-        self.persist_superblock()?;
-        self.flush()?;
 
         Ok(())
     }

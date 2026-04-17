@@ -169,7 +169,9 @@ fn churning_deletes_reuses_slots_instead_of_leaking() {
         if device.read_file_bytes(&name).is_ok() {
             device.delete_file(&name).expect("delete churn");
         }
-        device.store_bytes(&data, &name, 0o644).expect("store churn");
+        device
+            .store_bytes(&data, &name, 0o644)
+            .expect("store churn");
     }
 
     // At the end there are at most 4 live files.
