@@ -67,7 +67,10 @@ impl StegoDevice {
     ) -> Result<FileEntry, FsError> {
         validate_filename(stego_name)?;
 
-        if self.find_entry_by_name(stego_name)?.is_some() {
+        // Live files collide; tombstones don't — a deleted entry's name
+        // must be reusable, otherwise the file table leaks capacity on
+        // every delete+recreate cycle.
+        if self.find_live_entry(stego_name)?.is_some() {
             return Err(FsError::DuplicateName(stego_name.to_owned()));
         }
 
@@ -314,13 +317,17 @@ impl StegoDevice {
     }
 
     fn find_free_slot(&self) -> Result<Option<EntryLocation>, FsError> {
+        // A slot is reusable if it's never been used (Free) or if it holds
+        // only a tombstone (deleted). Without the tombstone branch we'd
+        // leak a file-table slot per delete, which fills the table up in
+        // workloads that churn names (ext4 journal, CI logs, etc.).
         let length = self.file_table_length_blocks();
         let start = self.file_table_start_block();
         for offset in 0..length {
             let block_index = start + offset;
             let block = self.read_file_table_block(block_index)?;
             for (slot, entry) in block.entries.iter().enumerate() {
-                if entry.is_free() {
+                if entry.is_free() || entry.is_deleted() {
                     return Ok(Some(EntryLocation { block_index, slot }));
                 }
             }

@@ -119,19 +119,65 @@ fn delete_returns_all_data_blocks_to_free_list() {
 }
 
 #[test]
-fn v1_disallows_store_with_same_name_even_after_delete() {
+fn delete_releases_name_for_reuse() {
+    // Regression: tombstones used to shadow the name in find_entry_by_name,
+    // so delete-then-recreate with the same name failed with DuplicateName.
+    // A shell user deleting `notes.txt` and then re-storing `notes.txt`
+    // hits this — no reason to keep the name reserved past the delete.
     let (_fixture, mut device) = open_device("file_ops_dupe.gguf", 12);
 
-    let data = patterned_bytes(256, 0xA1);
+    let data_a = patterned_bytes(256, 0xA1);
     device
-        .store_bytes(&data, "once.txt", 0o644)
+        .store_bytes(&data_a, "once.txt", 0o644)
         .expect("first store");
     device.delete_file("once.txt").expect("delete");
 
-    let result = device.store_bytes(&data, "once.txt", 0o644);
+    let data_b = patterned_bytes(256, 0xB2);
+    device
+        .store_bytes(&data_b, "once.txt", 0o644)
+        .expect("second store after delete must succeed");
+
+    let read_back = device.read_file_bytes("once.txt").expect("read");
+    assert_eq!(read_back, data_b, "recreated file must carry new contents");
+}
+
+#[test]
+fn live_duplicate_is_still_rejected() {
+    let (_fixture, mut device) = open_device("file_ops_live_dupe.gguf", 12);
+    let data = patterned_bytes(256, 0xA1);
+    device
+        .store_bytes(&data, "live.txt", 0o644)
+        .expect("first store");
+    let result = device.store_bytes(&data, "live.txt", 0o644);
     assert!(
-        matches!(result, Err(FsError::DuplicateName(ref n)) if n == "once.txt"),
-        "V1 keeps tombstone name reserved, got: {result:?}"
+        matches!(result, Err(FsError::DuplicateName(ref n)) if n == "live.txt"),
+        "overwriting a live file without delete must still fail, got: {result:?}"
+    );
+}
+
+#[test]
+fn churning_deletes_reuses_slots_instead_of_leaking() {
+    // File table capacity is bounded; if delete+recreate leaked a slot
+    // per cycle, a long-running workload (ext4 journal, CI log rotation)
+    // would exhaust the table. Verify reuse by churning well past the
+    // per-block slot count.
+    let (_fixture, mut device) = open_device("file_ops_churn.gguf", 12);
+
+    let data = patterned_bytes(128, 0x33);
+    for i in 0..64 {
+        let name = format!("slot_churn_{}.bin", i % 4);
+        if device.read_file_bytes(&name).is_ok() {
+            device.delete_file(&name).expect("delete churn");
+        }
+        device.store_bytes(&data, &name, 0o644).expect("store churn");
+    }
+
+    // At the end there are at most 4 live files.
+    let live = device.list_files().expect("list");
+    assert!(
+        live.len() <= 4,
+        "expected ≤4 live files after churn, got {}",
+        live.len()
     );
 }
 
