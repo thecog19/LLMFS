@@ -201,29 +201,7 @@ fn dispatch(cmd: Command, mode: AllocationMode, options: DeviceOptions) -> Resul
         ),
         Command::Unmount { mount_point } => cmd_unmount(&mount_point),
         Command::Ask { model } => cmd_ask(&model, mode, options),
-        Command::Dump { .. } => Err(CliError::internal(format!(
-            "command not implemented yet: {}",
-            command_name(&cmd)
-        ))),
-    }
-}
-
-fn command_name(cmd: &Command) -> &'static str {
-    match cmd {
-        Command::Init { .. } => "init",
-        Command::Status { .. } => "status",
-        Command::Store { .. } => "store",
-        Command::Get { .. } => "get",
-        Command::Ls { .. } => "ls",
-        Command::Rm { .. } => "rm",
-        Command::Verify { .. } => "verify",
-        Command::Mount { .. } => "mount",
-        Command::Unmount { .. } => "unmount",
-        Command::Ask { .. } => "ask",
-        Command::Dump { .. } => "dump",
-        Command::Wipe { .. } => "wipe",
-        Command::Serve { .. } => "serve",
-        Command::DumpBlock { .. } => "dump-block",
+        Command::Dump { model } => cmd_dump(&model, mode, options),
     }
 }
 
@@ -840,6 +818,29 @@ fn cmd_dump_block(
     }
     let nonzero = bytes.iter().filter(|&&b| b != 0).count();
     println!("(total nonzero bytes in this block: {nonzero}/4096)");
+    Ok(())
+}
+
+fn cmd_dump(
+    model: &Path,
+    alloc_mode: AllocationMode,
+    options: DeviceOptions,
+) -> Result<(), CliError> {
+    let device = StegoDevice::open_with_options(model, alloc_mode, options).map_err(open_err)?;
+    let entries = device.list_files().map_err(fs_err)?;
+
+    let stdout = io::stdout();
+    let mut guard = stdout.lock();
+    let mut writer = llmdb::fs::tar::TarWriter::new(&mut guard);
+    for entry in entries {
+        let bytes = device.read_file_bytes(&entry.filename).map_err(fs_err)?;
+        writer
+            .append(&entry.filename, entry.mode, entry.modified, &bytes)
+            .map_err(|e| CliError::internal(format!("tar write: {e}")))?;
+    }
+    writer
+        .finish()
+        .map_err(|e| CliError::internal(format!("tar finalize: {e}")))?;
     Ok(())
 }
 

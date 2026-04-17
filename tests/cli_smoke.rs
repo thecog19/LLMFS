@@ -245,6 +245,67 @@ fn get_unknown_file_exits_with_user_error() {
 }
 
 #[test]
+fn dump_emits_ustar_archive_of_stored_files() {
+    let fx = fixture("cli_dump.gguf", 12);
+    init(&fx.path);
+
+    for (name, payload) in [
+        ("alpha.txt", b"alpha bytes" as &[u8]),
+        ("beta.bin", &[0xAA; 2048]),
+    ] {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.as_file().write_all(payload).unwrap();
+        llmdb()
+            .arg("store")
+            .arg(&fx.path)
+            .arg(tmp.path())
+            .arg("--name")
+            .arg(name)
+            .assert()
+            .success();
+    }
+
+    let out = llmdb().arg("dump").arg(&fx.path).assert().success();
+    let stdout = out.get_output().stdout.clone();
+
+    // Must be a multiple of 512 (tar blocks).
+    assert!(
+        stdout.len() >= 512 * 4,
+        "dump too short: {} bytes",
+        stdout.len()
+    );
+    assert_eq!(stdout.len() % 512, 0, "dump must be multiple of 512 bytes");
+
+    // Both filenames must appear at the start of a 512-byte block (header).
+    let alpha_hit = stdout
+        .chunks_exact(512)
+        .any(|block| block.starts_with(b"alpha.txt\0"));
+    let beta_hit = stdout
+        .chunks_exact(512)
+        .any(|block| block.starts_with(b"beta.bin\0"));
+    assert!(alpha_hit, "alpha.txt header missing from dump");
+    assert!(beta_hit, "beta.bin header missing from dump");
+
+    // Last two blocks are the zero terminator.
+    let tail_start = stdout.len() - 1024;
+    assert!(
+        stdout[tail_start..].iter().all(|&b| b == 0),
+        "dump must end with two zero blocks (ustar terminator)"
+    );
+
+    // `alpha bytes` payload must follow its header block at 512-byte alignment.
+    let alpha_block = stdout
+        .chunks_exact(512)
+        .position(|block| block.starts_with(b"alpha.txt\0"))
+        .unwrap();
+    let alpha_payload_start = (alpha_block + 1) * 512;
+    assert_eq!(
+        &stdout[alpha_payload_start..alpha_payload_start + b"alpha bytes".len()],
+        b"alpha bytes"
+    );
+}
+
+#[test]
 fn help_flag_lists_subcommands() {
     let out = llmdb().arg("--help").assert().success();
     let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
