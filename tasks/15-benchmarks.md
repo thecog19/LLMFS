@@ -1,6 +1,6 @@
 # Task 15: Benchmarks And Quality Harness
 
-Status: todo
+Status: deferred (post-V1)
 Depends on: 09-file-table-and-file-ops.md
 Spec refs: DESIGN-NEW.MD section "11. Testing Strategy" (Benchmarks)
 

@@ -1,6 +1,6 @@
 # Task 16: V1 Cleanup And Docs
 
-Status: todo
+Status: done
 Depends on: 10-cli-file-commands.md, 12-nbd-server.md, 13-ask-bridge.md, 14-diagnostics-and-status.md, 15-benchmarks.md
 Spec refs: DESIGN-NEW.MD section "9. CLI", "Distribution" (from DESIGN-OLD §Distribution, preserved)
 
