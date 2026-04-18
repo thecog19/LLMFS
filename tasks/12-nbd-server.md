@@ -60,7 +60,10 @@ Deviations from spec (intentional):
 - Free-device discovery scans `/sys/block/nbdN/pid` (0..15). That file
   exists when an nbd-client has bound the device; absent or empty → free.
 - mount/unmount communicate via a sidecar state file in
-  `/tmp/llmdb-mounts/<flattened-mount-path>.state` (plain key=value).
+  `$XDG_RUNTIME_DIR/llmdb-mounts/<hex-encoded-mount-path>.state`
+  when `XDG_RUNTIME_DIR` is available, otherwise
+  `/tmp/llmdb-mounts-<uid>/<hex-encoded-mount-path>.state`
+  (plain key=value).
   Contains the running mount PID, the chosen `/dev/nbdN`, the socket
   path, and the mount point. `unmount` scans/reads it to find the
   right nbd device; the in-process Ctrl-C handler runs the same

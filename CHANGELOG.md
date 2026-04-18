@@ -24,6 +24,8 @@ First tagged release. V1 scope per `DESIGN-NEW.MD §2`.
 - `mount` / `unmount`: full NBD + `nbd-client` + optional
   `mkfs.ext4` + kernel mount, with `Ctrl-C` shutdown and a
   sidecar state file for cross-shell unmount.
+- `LLMDB_ROOT_HELPER`: route the root-only `mount` / `unmount`
+  sub-steps through `scripts/llmdb-e2e-root.sh`.
 - `serve`: just the NBD server, for manual driving.
 - `ask`: spawns `llama-server` against the GGUF, runs a tool
   REPL with `list_files` / `read_file` / `file_info`.
@@ -50,9 +52,11 @@ First tagged release. V1 scope per `DESIGN-NEW.MD §2`.
   for sensitivity-aware allocation.
 
 ### Tests
-- 131 tests across GGUF, packers, redirection, shadow-copy
+- Coverage across GGUF, packers, redirection, shadow-copy
   crash points, file table, file ops, CLI smoke, NBD protocol,
-  NBD socket roundtrip, diagnostics, and `ask` tool dispatch.
+  NBD socket roundtrip, diagnostics, `ask` tool dispatch, docs
+  parity, root-helper coverage, real-GGUF CLI E2E, and gated
+  kernel-backed mount E2E.
 - Clippy clean with `-D warnings`; `cargo fmt` clean.
 
 ### Deferred to post-V1

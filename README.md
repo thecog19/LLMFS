@@ -50,7 +50,7 @@ Works on any GGUF. No NBD, no root, no inference runtime needed.
 ./target/release/llmdb ls model.gguf -l
 
 # Retrieve it.
-./target/release/llmdb get model.gguf notes.txt ./notes.out
+./target/release/llmdb get model.gguf notes.txt --output ./notes.out
 
 # Full integrity scan (walks every data block's CRC).
 ./target/release/llmdb verify model.gguf
@@ -69,6 +69,12 @@ runs the full stack: NBD server → `nbd-client` → optional
 `mkfs.ext4` → `mount`, then blocks until `Ctrl-C` or until
 `llmdb unmount` is invoked from another shell.
 
+If you want to drive the root-only steps through the repo helper
+instead of granting broader sudo, set `LLMDB_ROOT_HELPER` to
+[`scripts/llmdb-e2e-root.sh`](scripts/llmdb-e2e-root.sh). The CLI
+will route `nbd-client`, `mkfs.ext4`, `mount`, and `umount`
+through that helper.
+
 ```sh
 sudo modprobe nbd nbds_max=16
 sudo ./target/release/llmdb mount model.gguf /mnt/llmdb --format --yes
@@ -79,6 +85,15 @@ ls /mnt/llmdb
 
 # Clean shutdown:
 sudo ./target/release/llmdb unmount /mnt/llmdb
+```
+
+With the helper script installed in `sudoers`, the same flow can run
+without `sudo` on the `llmdb` command itself:
+
+```sh
+export LLMDB_ROOT_HELPER="$PWD/scripts/llmdb-e2e-root.sh"
+./target/release/llmdb mount model.gguf /mnt/llmdb --format --yes
+./target/release/llmdb unmount /mnt/llmdb
 ```
 
 The device is persistent — the ext4 superblock and all file data
@@ -128,7 +143,7 @@ LLMDB_NBD_TRACE=1 ./target/release/llmdb mount ... # per-request NBD log
 cargo test --offline
 ```
 
-131 tests cover the GGUF parser, every quant packer, the
+The test suite covers the GGUF parser, every quant packer, the
 redirection table, shadow-copy crash points, the file table,
 the NBD wire protocol, the NBD socket roundtrip, and the
 `ask` tool dispatcher.
