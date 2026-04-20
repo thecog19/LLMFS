@@ -22,9 +22,6 @@ fn crate_exports_bootstrap_contracts() {
     let file_table = llmdb::fs::file_table::FileTableBootstrap::default();
     assert_eq!(file_table.entries_per_block, 16);
 
-    let nbd = llmdb::nbd::protocol::NbdProtocolBootstrap::default();
-    assert_eq!(nbd.block_size, llmdb::BLOCK_SIZE);
-
     let ask = llmdb::ask::bridge::AskBridgeBootstrap::default();
     assert_eq!(ask.tool_count, 3);
 

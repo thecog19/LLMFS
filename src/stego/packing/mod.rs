@@ -55,7 +55,7 @@ pub trait QuantPacker: Sync {
 
 /// Generic "update only the quant blocks that back this payload range" writer.
 /// Avoids the whole-tensor decode-modify-encode cycle that `write_stego_bytes`
-/// used to perform — for a 4 KB NBD write that used to replay every quant
+/// used to perform — for a 4 KB block write that used to replay every quant
 /// block in a 1–2 MB tensor, this only touches the handful of blocks that
 /// actually overlap the range. See `src/stego/packing/q8_0.rs` for a caller.
 pub fn blockwise_write_range<const P: usize>(

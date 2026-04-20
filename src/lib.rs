@@ -3,7 +3,6 @@ pub mod diagnostics;
 pub mod fs;
 pub mod fuse;
 pub mod gguf;
-pub mod nbd;
 pub mod stego;
 
 pub const APP_NAME: &str = "llmdb";

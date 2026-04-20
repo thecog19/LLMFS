@@ -200,9 +200,9 @@ impl StegoDevice {
         self.ensure_data_block(block_index)?;
 
         // Unmapped logicals present as zeros — they have no live data
-        // (never written, or freed). NBD/ext4 and the file layer both
-        // rely on this; the underlying physical doesn't exist as far as
-        // this logical is concerned.
+        // (never written, or freed). The file layer relies on this; the
+        // underlying physical doesn't exist as far as this logical is
+        // concerned.
         let Some(physical) = self.redirection.logical_to_physical(block_index) else {
             self.log_verbose(format!("read unmapped logical={} → zeros", block_index));
             return Ok(vec![0_u8; crate::BLOCK_SIZE]);
@@ -400,8 +400,8 @@ impl StegoDevice {
     }
 
     /// True iff `logical` currently maps to a physical (i.e. has live data).
-    /// Used by the NBD server to log per-write "first write vs. overwrite"
-    /// information for diagnosis.
+    /// Used by the `dump-block` diagnostic to distinguish first-write from
+    /// overwrite when tracing a block's history.
     pub fn is_logical_written(&self, logical: u32) -> bool {
         self.redirection.is_mapped(logical)
     }

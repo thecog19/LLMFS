@@ -1,7 +1,8 @@
 //! Block-level write throughput. Overwrites random pre-allocated
-//! logicals to exercise the shadow-copy path (which is what an NBD
-//! client actually hits; a fresh allocate-first-write is strictly
-//! cheaper than an overwrite, so we bench the hotter case).
+//! logicals to exercise the shadow-copy path (which is what any
+//! client that rewrites existing blocks hits; a fresh allocate-
+//! first-write is strictly cheaper than an overwrite, so we bench
+//! the hotter case).
 
 mod common;
 

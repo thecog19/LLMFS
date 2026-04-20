@@ -215,11 +215,11 @@ fn overwrites_consume_zero_net_blocks_under_split_namespace() {
 
 #[test]
 fn write_to_logical_used_as_shadow_target_does_not_corrupt_original() {
-    // Regression for the NBD-mount integrity mismatch: after we shadow-copy
-    // logical L to physical Q, a subsequent direct-addressed write to
-    // logical Q (which an NBD client may issue with no awareness of our
-    // shadow bookkeeping) must take the shadow-copy path and leave L's
-    // bytes at physical Q intact.
+    // Regression for a direct-addressed-write integrity mismatch: after
+    // we shadow-copy logical L to physical Q, a subsequent direct-
+    // addressed write to logical Q (which any block-device client may
+    // issue with no awareness of our shadow bookkeeping) must take the
+    // shadow-copy path and leave L's bytes at physical Q intact.
     let fixture = make_fixture("shadow_target_collision.gguf");
 
     let mut device =

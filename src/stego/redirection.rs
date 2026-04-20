@@ -77,7 +77,7 @@ impl RedirectionTableBlock {
 /// physical." Logical and physical address spaces are intentionally
 /// separate: a redirection-table index is *only* a logical key, never an
 /// implicit physical address. The free list and any direct-addressing
-/// client (NBD) operate on physicals; the redirection layer is the
+/// client operates on physicals; the redirection layer is the
 /// translation in between.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RedirectionTable {
