@@ -47,25 +47,28 @@ before any user data is stored. For Q8_0 / K-quant cover files V1 is a
 dual-use on int-quantized covers is explicitly V2's job (sensitivity-
 aware allocation), not a V1 tuning fix.
 
-### V2 — Optimal Embedding + Compression
+### V2 — Sensitivity-Ordered Embedding
 
-- Progressive background calibration (AWQ fast, Hessian full)
-- Sensitivity-ordered allocation
-- Content-aware matching with bucket index
-- Error compensation via GPTQ column update
-- Scatter map with bootstrap region
-- BPE tokenizer transparent compression
-- Cross-model comparison reporting (`report --compare`)
-- Recalibration support
+- Implicit metadata addressing (magnitude-ranked; no fixed bootstrap pointer, no sidecar)
+- Reed-Solomon / LDPC redundancy over metadata for drift tolerance
+- Progressive calibration (AWQ fast path on init; Hessian refinement on demand)
+- Per-weight sensitivity-ordered placement (replaces V1's 4-tier planner)
+- Bit-level content-aware matching (skip writes where target already matches payload)
+- GPTQ-style error compensation (spreads residual delta across eligible row/column weights)
+- `zstd` / BPE payload compression (shrinks the damage surface proportionally)
+- Damage-accumulation remap (shadow-and-restore during init; lossless remap deferred)
+- Cross-model comparison reporting (already prototyped via the perplexity sweep in `benches/perplexity-results/`)
 
-### V3 — GPU Acceleration
+### V3 — GPU Acceleration + Lossless Remap
 
-- Scatter map in unused KV cache slots
-- GPU gather/scatter for block I/O on weight tensors in VRAM
-- VRAM dirty block cache with lazy flush to GGUF
+- GPU-accelerated forward pass (supplants V2's CPU calibration path; unlocks large models)
+- Fisher-information calibration (tractable on GPU hardware)
+- Scatter map in VRAM / unused KV-cache slots (moves V2's sensitivity index off-disk)
+- VRAM-resident dirty block cache with lazy flush to GGUF
+- VRAM shadow store → **lossless remap** (the V2-deferred decision)
 - Tiered degradation (GPU hot → CPU warm → disk cold)
 
-This document specifies V1. V2 and V3 are listed for context; they will be specced separately.
+V2 details: §15. V3 details: §16. This document specifies V1 (§3-14); the V2 and V3 sections specify how those later versions modify or extend V1's data structures and algorithms.
 
 ## 3. GGUF Parser
 
@@ -1137,3 +1140,390 @@ If the GGUF file is modified externally (fine-tuning, re-quantization, merging),
   If V2's allocation changes re-introduce whole-tensor scans, this
   becomes the top profile target; fix is per-quant-block batching
   as originally noted.
+
+## 15. V2 Architecture — Sensitivity-Ordered Embedding
+
+### 15.1 Motivation
+
+V1 is architecturally uniform: the planner picks tensors by role
+(FFN before attention) and treats every weight within a chosen
+tensor as equally eligible for bit theft. Empirical measurement on
+`wikitext-2` (`benches/perplexity-results/`) confirmed what DESIGN
+§2 anticipated:
+
+- **F16 / F32 covers:** perplexity flat across 0→95% utilization
+  for both SmolLM2-135M and Qwen2.5-0.5B. Mantissa-only theft
+  preserves sign and exponent; the model survives full saturation.
+- **Q8_0 covers:** catastrophic collapse on `llmdb init` alone.
+  SmolLM2-135M: pristine 18.12 → post-init 34M (~1.9M× degradation).
+  Qwen2.5-0.5B: pristine 13.50 → post-init 5.6M. The 4-bit theft
+  from each int8 weight randomizes magnitudes; architecture-
+  independent.
+
+V2's goal is to preserve F16's flat curve while lifting the Q8_0
+curve from "dead model" to "within a few PPL of pristine." The
+mechanism is a per-weight eligibility decision driven by
+calibration rather than a tensor-level tiering rule.
+
+### 15.2 Layer 0 — Implicit metadata addressing
+
+V1 places metadata at stego-block 0, which lands at the start of
+whichever tensor the 4-tier sort picks first. V2 replaces this with
+a rule that computes metadata location from static weight
+properties, with no pointer, no sidecar, and no calibration
+dependency:
+
+> Rank every eligible stealable-bit position by the absolute
+> magnitude of its containing weight, ascending. Metadata occupies
+> the N lowest-magnitude positions, where N is the metadata
+> footprint in bits.
+
+**Properties:**
+- **Deterministic** — same cover file → same location, always.
+- **Calibration-free** — no forward pass needed; open-time cost is
+  O(n_weights · log N) partial sort.
+- **Findable on reopen** — recompute the rule, recover the location.
+- **Safer than random placement** — near-zero-magnitude weights
+  have provably bounded contribution to any forward activation.
+  Pure magnitude is a weaker salience estimator than AWQ/Hessian
+  (no activation awareness), but metadata is small (<1% of capacity)
+  so the marginal gain from calibrated metadata placement is dwarfed
+  by the cost of the chicken-and-egg resolution it would create.
+
+**Determinism guardrail:** magnitude comparisons must use fixed-
+point or integer arithmetic — floating-point reductions aren't
+bit-exact across CPU architectures, and a cross-machine disagreement
+on the sort would move metadata off-location.
+
+### 15.3 Layer 1 — Self-describing metadata
+
+The V1 superblock / integrity / redirection / file-table layout
+remains intact in structure. V2 extends the metadata region to
+also carry:
+
+- **Sensitivity table** — one salience score per eligible weight
+  (quantized to 8 bits; exact resolution TBD). Produced by Layer 2
+  calibration. Stored in metadata because reopen needs it and
+  re-running calibration on every open is expensive.
+- **Placement index** — compact representation of the sensitivity-
+  ordered ranking of positions. Derivable from the sensitivity
+  table but stored explicitly so reopen skips the sort.
+- **Calibration version marker** — "AWQ v1", "Hessian v1", etc.
+  Enables progressive refinement without breaking readability.
+
+**Reed-Solomon redundancy.** Metadata is framed as `(k, n)` Reed-
+Solomon blocks (nominal parameters `k=20, n=28`; tunable per
+device). Any `k` of `n` positions decode; up to `n-k` positions
+can be corrupted (fine-tuning drift, numerical instability) before
+metadata is unrecoverable. Cost: 40% expansion on metadata region
+size. Acceptable given that metadata is a small fraction of stego
+capacity.
+
+### 15.4 Layer 2 — Progressive calibration
+
+**Stage A — AWQ (fast).** Single forward pass with a baked-in
+calibration corpus (first ~512 tokens of `wiki.test.raw`, stored in
+the `llmdb` binary). Produces per-channel salience score
+`s_c = mean_batch(|x_c|) · |w_c|`. Implementation is one forward
+pass that sums absolute activations per channel; much cheaper than
+full inference. Runs during `llmdb init`. Expected cost: seconds
+on SmolLM-scale, tens of seconds on Qwen, minutes on 3B models.
+
+**Stage B — Hessian (full).** Accumulate the second-moment
+statistic `H = X^T X` across a larger calibration corpus (e.g.,
+1024-8192 tokens). Per-column diagonal `diag(H)` gives refined
+per-weight salience. Invoked explicitly via `llmdb calibrate
+--full <model>` or triggered when the user wants best-possible
+placement. Expected cost: minutes to tens of minutes on CPU for
+models up to 3B.
+
+**Stage C — Fisher information.** Deferred to V3. Requires second-
+order gradient statistics over a data distribution; tractable only
+with GPU backends.
+
+**Calibration infrastructure — the implementation tent pole.** V2
+needs transformer forward-pass math in Rust. Three paths:
+
+1. **Patched llama.cpp** — add an activation-dumping hook to the
+   existing C++ library, pipe stats back to Rust. Fastest to
+   implement, ugliest to maintain; requires fork/patch management.
+2. **Third-party Rust inference crate** (candle-core, burn) — adds
+   ~100K LOC of dependency weight; partial GGUF coverage; would
+   likely require upstream contributions to handle all quant types.
+3. **Hand-rolled minimal forward pass in Rust** — ~1000-2000 LOC
+   covering just the operations needed for activation statistics
+   (matmul + the activation functions used by transformers).
+   Self-contained; no external deps; no full inference fidelity
+   required since we only need first-moment or second-moment
+   statistics.
+
+Option 3 is preferred. Decision deferred pending a PoC. This choice
+dominates V2's implementation timeline — everything else in V2 is
+weeks of engineering; calibration is the one multi-week commitment.
+
+### 15.5 Layer 3 — Sensitivity-ordered data placement
+
+Given a sensitivity table, the placement rule is:
+
+> Sort eligible weight positions by salience ascending. Flag the
+> top-`S` percent as ineligible (policy parameter; default 1%).
+> Logical block L maps to positions `[L·K, (L+1)·K)` in the
+> remaining sorted list, where K is bits per block.
+
+This replaces V1's `src/stego/planner.rs` 4-tier ordering. The
+allocator consults the placement index in metadata; blocks are
+addressed by their rank in the sorted list, not by tensor-role.
+
+**Protected region (`top-S%`) policy.** The `S%` most-salient
+weights are untouchable. This is what rescues Q8_0: the salient
+weights whose low-4-bit randomization would destroy the model are
+simply excluded from eligibility. Expected behavior under `S=1%`:
+Q8_0 post-init PPL should drop from the V1 ~34M regime into the
+low 10s, comparable to pristine. Validate with the perplexity
+sweep harness.
+
+Trade-off: every percent of protected region reduces stego
+capacity by that percent. A 1% protection on SmolLM2-135M means
+~500 KB less stego capacity; negligible against the dual-use win.
+
+### 15.6 Layer 4 — Content-aware matching
+
+When a payload bit `b` is targeted at position `p`:
+
+- **Simple path:** read position's current bit. If equal to `b`,
+  no mantissa change occurs; the write is a no-op against the
+  cover's existing value. Implemented inside each packer.
+- **Advanced path (optional):** maintain a *pool* of candidate
+  positions for each logical bit. During placement, tiebreak
+  between same-salience candidates by preferring positions whose
+  current bit already equals the payload. Requires the on-disk
+  format to record *which* pool member held each bit.
+
+The simple path is cheap — a few lines per packer — and captures
+roughly half the damage reduction because random-payload vs
+random-target has 50% expected per-bit match rate. The advanced
+path stacks on top.
+
+### 15.7 Layer 5 — Error compensation (GPTQ-style)
+
+After perturbing weight `W[i,j]` by `δW`, the forward operation
+`y[i] = Σ_k W[i,k]·x[k]` acquires delta `δy[i] = δW · x[j]`. GPTQ
+compensates by distributing counter-adjustments across the other
+weights in row `i` such that `Σ Δ[i,k]·x[k] ≈ -δy[i]`, computed
+via the Cholesky factorization of the Hessian `H` already
+accumulated during Stage B.
+
+Compensating updates:
+
+- Touch **only eligible weights** in the same row/column (avoid
+  writing to the protected set).
+- Are small individually (delta is distributed); stay within FP
+  precision bounds so they don't introduce their own artifacts.
+- Accumulate — block N's compensation depends on writes 0..N-1.
+
+GPTQ compensation is most valuable for int-quantized covers where
+per-weight perturbation is large. For F16 it's optional — the
+uncompensated perturbation is already below measurement threshold.
+
+### 15.8 Layer 6 — Compression
+
+- **Binary files:** `zstd` at default level. ~2-3× reduction on
+  typical payloads; mature Rust crate (`zstd`).
+- **Text files:** optional BPE tokenization using the cover's own
+  tokenizer before compression. Same tokenizer, same vocabulary,
+  typically 3-5× reduction on natural text.
+
+Compression composes multiplicatively with the upstream layers:
+fewer bits to store → fewer positions to touch → less work for
+matching, compensation, and placement.
+
+### 15.9 Layer 7 — Atomic remap
+
+**Triggers:**
+- Calibration upgrade (Stage A → Stage B)
+- User-requested recalibration (`llmdb calibrate`)
+- Detected cover drift (future: fine-tune event detector)
+
+**Mechanism (damage-accumulation version, shipping with V2):**
+
+1. Compute new placement from updated sensitivity table.
+2. Read all live data from old positions.
+3. Write live data to new positions.
+4. Write zeros (or pristine-best-guess values) at old positions
+   that are no longer referenced.
+5. Commit via the superblock's `generation` + `shadow_block`
+   intent mechanism already built in V1.
+
+**Damage accumulation.** Step 4 cannot perfectly restore the
+original weight bits because V2 doesn't maintain a shadow of
+pristine values. Each remap leaves perturbed bits at positions
+that were damaged once but are no longer used. Magnitude is
+bounded: on each remap the "newly-damaged" set is
+`new_positions \ old_positions`, typically small because
+sensitivity ranking is stable across calibration stages. Over
+many remaps the accumulated damage is capped by how different
+successive rankings can be.
+
+**Lossless remap (restore pristine at abandoned positions) is
+deferred** pending a design decision on where to host the shadow
+store. See §16.4 for the V3 resolution.
+
+### 15.10 Per-quant-type adaptations
+
+Every packer in `src/stego/packing/` gains per-weight eligibility
+plumbing: accept an eligibility bitmap alongside the payload;
+skipped weights stay pristine. This is mechanical but touches all
+seven packers.
+
+- **F16 / F32:** eligibility gate is an optimization only —
+  non-damaging writes are fine. Useful for layer-5 compensation
+  (restrict compensation writes to eligible weights).
+- **Q8_0:** the dual-use-critical case. Per-weight eligibility is
+  load-bearing.
+- **K-quants (Q3_K..Q6_K):** per-block scale and super-scale
+  complicate the picture — the block scale itself may be one of
+  the highest-salience values in the block. Eligibility needs to
+  distinguish "this weight's mantissa bits" from "this block's
+  shared scale"; the scale should effectively always be protected.
+
+### 15.11 Migration from V1
+
+- **Format bump.** V2's metadata layout is not V1-compatible
+  (addressing, sensitivity table, RS framing). Superblock carries
+  a `version` byte; V2 uses `version = 2`.
+- **No auto-upgrade.** A V1 device cannot be opened as V2 without
+  `llmdb recalibrate --rebuild`, which re-inits the cover and
+  re-imports files.
+- **V2-shipping CLI:** `llmdb calibrate <model> [--full]`,
+  `llmdb recalibrate <model>`, `llmdb status` extended with a
+  "calibration: AWQ v1 / Hessian v1 / ..." line.
+
+### 15.12 Out of scope for V2
+
+- Lossless remap — V3 (§16.4).
+- Fisher calibration — V3.
+- Training-time integration ("co-train cover to absorb payload")
+  — future research.
+- Null-space perturbation (store data in directions the forward
+  pass doesn't activate) — research.
+- Content-addressable cover (payload stored as offsets into
+  existing weight bit-patterns) — research.
+
+## 16. V3 Architecture — GPU Acceleration + Lossless Remap
+
+### 16.1 Scope
+
+V3 layers on top of V2 without changing its data model. The stego
+device, placement rules, and on-disk format are V2's. V3 adds:
+
+- GPU-accelerated forward pass (replaces V2's CPU calibration).
+- Fisher-information calibration (tractable only on GPU).
+- In-VRAM scatter map / sensitivity index.
+- VRAM dirty-block cache with lazy flush.
+- VRAM shadow store that makes lossless remap tractable.
+- Tiered hot/warm/cold storage hierarchy.
+
+### 16.2 GPU forward pass
+
+V2 defines WHAT calibration computes (per-channel AWQ salience,
+per-column Hessian). V2's implementation choice (option 3:
+hand-rolled Rust forward pass) is CPU-bound by design. V3 binds
+the same logical calibration to a GPU backend — reuse `ggml-cuda`
+or equivalent; the intermediate statistics are the same, the
+execution is 10-100× faster.
+
+Consequence: calibration cost for 3B+ models drops from "minutes
+on CPU" to "seconds on GPU." `llmdb calibrate --full` becomes
+usable as a routine operation rather than a once-a-week chore.
+
+### 16.3 Scatter map in VRAM
+
+V2 keeps the placement index on disk, read into RAM on open. V3
+moves this into VRAM, exploiting the typically-underutilized
+KV-cache slots allocated at model load. Stego block I/O becomes a
+GPU kernel: a single gather/scatter operation dispatches thousands
+of stego-bit reads or writes in parallel. Expected 100× throughput
+improvement on block-intensive operations (ext4-style metadata
+bursts; large-file mount reads).
+
+### 16.4 VRAM shadow store → lossless remap
+
+The V2-deferred decision resolves naturally at V3. VRAM is dense
+and cheap to address; hosting a ~50 MB-to-~1 GB shadow of pristine
+weight bits for the stego-eligible region is a small fraction of
+VRAM on any GPU that can host the model at all.
+
+**Mechanism:**
+
+- At GPU model load, the pristine cover bits of stego-eligible
+  weights are copied into a VRAM shadow buffer. (This requires
+  either: (a) a pristine reference of the cover file that V3 can
+  read — e.g., `models/pristine/` — or (b) the shadow is
+  reconstructed from the live cover at load time before any
+  additional writes, which is fine if the load is the FIRST V3
+  open of a V2-format device).
+- Live stego writes update the cover file (mmap) but do not touch
+  the VRAM shadow.
+- On remap: data is read from old positions, written to new
+  positions. Then for each old position no longer referenced,
+  the VRAM shadow's original bit is written back — a true restore.
+- The shadow is rebuilt from the cover + stored delta on every GPU
+  load; it's not persisted to disk.
+
+**Design dependency:** requires either a pristine cover reference
+(dual-cover deployment pattern) or accepting that the first V3
+load captures the current cover as "pristine," which is only
+lossless-remap-correct if no earlier stego damage is present.
+Operationally cleaner: document that V3 deployments SHOULD keep a
+pristine cover reference alongside the stego cover, same way
+`models/pristine/` already does for benchmarking.
+
+### 16.5 VRAM dirty-block cache
+
+Writes land in a VRAM-resident cache, flushed to the GGUF cover on
+quantized schedules (threshold blocks / explicit fsync / unmount).
+Reduces mantissa re-encoding overhead — the hot write path (ext4
+journal, log-heavy workloads) amortizes encode cost across many
+writes instead of paying per-write.
+
+Matches standard block-cache semantics: dirty bits tracked,
+eviction on cache pressure, write-back on flush.
+
+### 16.6 Tiered degradation
+
+- **GPU hot:** active working set — current read/write blocks +
+  shadow + scatter index. VRAM-resident.
+- **CPU warm:** larger working set — recently-touched blocks,
+  mapped from the GGUF via mmap. Evicted to cold when not accessed.
+- **Disk cold:** the GGUF cover file itself; accessed via mmap
+  when VRAM and CPU caches miss.
+
+Policy: LRU-ish, with a preference for keeping metadata regions
+VRAM-resident since they're consulted on every I/O.
+
+### 16.7 Fisher calibration
+
+Fisher information requires second-order gradient statistics over
+a data distribution — requires autodiff-capable forward passes.
+Infeasible as a routine CPU operation; tractable as a GPU
+operation via standard ML stacks. V3's `llmdb calibrate --fisher`
+runs it; results replace the Hessian table in metadata and
+trigger a remap.
+
+### 16.8 Rolled forward from V2
+
+Three V2 deferrals close at V3:
+
+1. **Lossless remap** — VRAM shadow makes it cheap (§16.4).
+2. **Fisher calibration** — GPU makes it tractable (§16.7).
+3. **Large-model calibration** — V2's CPU path becomes impractical
+   past ~3B params; V3's GPU path extends the supported range.
+
+### 16.9 Out of scope for V3
+
+- Training-time integration (model learns to absorb its payload).
+- Federated / multi-host deployments.
+- Content-addressable cover (payload encoded as offsets into
+  existing bit-patterns in the cover).
+- Novel radical directions: null-space perturbation, co-trained
+  covers, implicit-entropy storage. Tracked as research agenda.
