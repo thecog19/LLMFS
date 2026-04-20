@@ -1,0 +1,8 @@
+model,level_requested_pct,utilization_actual_pct,used_blocks,total_blocks,ppl,ppl_stderr,chunks,ctx
+smollm2-135m-f16.gguf,pristine,0.00,0,0,18.8019,0.49479,50,512
+smollm2-135m-f16.gguf,0,0.22,28,12960,18.8140,0.49529,50,512
+smollm2-135m-f16.gguf,10,9.98,1294,12960,18.8093,0.49384,50,512
+smollm2-135m-f16.gguf,25,25.00,3240,12960,18.8349,0.49463,50,512
+smollm2-135m-f16.gguf,50,50.02,6483,12960,18.8224,0.49431,50,512
+smollm2-135m-f16.gguf,75,75.05,9726,12960,18.8237,0.49439,50,512
+smollm2-135m-f16.gguf,95,95.06,12320,12960,18.8176,0.49571,50,512
