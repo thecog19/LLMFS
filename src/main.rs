@@ -378,21 +378,27 @@ fn cmd_mount(
         mount_point.display()
     );
 
-    // Block on Ctrl-C. When the user runs `llmdb unmount` in another
-    // shell the mount is torn down by fusermount3; our `session` holds
-    // a file descriptor into /dev/fuse, and `fuser` will notice the
-    // kernel-side unmount and let the session thread finish. We poll
-    // the shutdown flag either way.
+    // Exit on either Ctrl-C here or an external unmount (fusermount3 -u
+    // from `llmdb unmount` in another shell). An external unmount ends
+    // the kernel-side FUSE session; fuser notices and the session's
+    // background thread finishes. Poll both signals.
     let shutdown = Arc::new(AtomicBool::new(false));
     let sc = Arc::clone(&shutdown);
     ctrlc::set_handler(move || sc.store(true, Ordering::SeqCst))
         .map_err(|e| CliError::internal(format!("ctrlc install failed: {e}")))?;
-    while !shutdown.load(Ordering::SeqCst) {
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            println!("unmounting {} …", mount_point.display());
+            drop(session); // triggers fusermount3 -u
+            break;
+        }
+        if session.guard.is_finished() {
+            println!("mount released externally");
+            drop(session);
+            break;
+        }
         thread::sleep(Duration::from_millis(200));
     }
-
-    println!("unmounting {} …", mount_point.display());
-    drop(session); // BackgroundSession unmount on drop
     println!("done");
     Ok(())
 }
