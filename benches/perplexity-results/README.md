@@ -11,11 +11,16 @@ so re-runs reproduce exactly).
 
 ```
 cargo build --release
-bash scripts/perplexity-sweep.sh <path/to/model.gguf> \
+bash scripts/perplexity-sweep.sh models/pristine/<name>.gguf \
     --levels 0,10,25,50,75,95 \
     --chunks 50 --ctx 512 \
     --out-csv benches/perplexity-results/<name>.csv
 ```
+
+Always point at `models/pristine/` — those GGUFs are `chmod 0444`
+and match `MANIFEST.sha256`, so the sweep starts from a known-good
+baseline. The sweep copies each file with `--no-preserve=mode` to a
+scratch working dir before touching it; the source stays untouched.
 
 Requires `llama-perplexity` from llama.cpp. The script looks at
 `$LLMDB_LLAMA_PERPLEXITY`, then the common build paths under

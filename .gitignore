@@ -1,3 +1,4 @@
 /target
-/models/
-
+/models/*
+!/models/pristine/
+/models/pristine/*.gguf

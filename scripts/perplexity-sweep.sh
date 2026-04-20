@@ -174,7 +174,10 @@ for LEVEL in "${LEVEL_ARRAY[@]}"; do
     echo "=== level ${LEVEL}% ===" >&2
 
     WORK_MODEL="$WORK/model-${LEVEL}.gguf"
-    cp "$MODEL_ABS" "$WORK_MODEL"
+    # --no-preserve=mode so a 0444 source (models/pristine/*) doesn't
+    # propagate its read-only bit onto the mutable working copy.
+    cp --no-preserve=mode,ownership "$MODEL_ABS" "$WORK_MODEL"
+    chmod u+w "$WORK_MODEL"
 
     CAPACITY=$(init_and_report_capacity "$WORK_MODEL")
     [ -n "$CAPACITY" ] || { echo "failed to parse capacity from init output" >&2; exit 2; }
