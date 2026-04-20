@@ -459,10 +459,31 @@ fn validate_filename(name: &str) -> Result<(), FsError> {
             reason: "filename contains null byte",
         });
     }
-    if name.contains('/') {
+    // Slashes are allowed so the FUSE layer can synthesize virtual
+    // directories via prefix matching, but the name must be a canonical
+    // relative path: no leading/trailing slash, no "//" runs, no "." or
+    // ".." components. Storage is still flat — §6 unchanged.
+    if name.starts_with('/') {
         return Err(FsError::InvalidFilename {
-            reason: "filename contains '/' (directories not supported in V1)",
+            reason: "filename starts with '/'",
         });
+    }
+    if name.ends_with('/') {
+        return Err(FsError::InvalidFilename {
+            reason: "filename ends with '/'",
+        });
+    }
+    for component in name.split('/') {
+        if component.is_empty() {
+            return Err(FsError::InvalidFilename {
+                reason: "filename contains an empty path component ('//' run)",
+            });
+        }
+        if component == "." || component == ".." {
+            return Err(FsError::InvalidFilename {
+                reason: "filename contains '.' or '..' component",
+            });
+        }
     }
     Ok(())
 }

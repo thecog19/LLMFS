@@ -278,11 +278,43 @@ fn invalid_filenames_are_rejected() {
         Err(FsError::InvalidFilename { .. })
     ));
 
-    let with_slash = device.store_bytes(&data, "a/b.txt", 0o644);
-    assert!(matches!(with_slash, Err(FsError::InvalidFilename { .. })));
-
     let with_null = device.store_bytes(&data, "a\0b.txt", 0o644);
     assert!(matches!(with_null, Err(FsError::InvalidFilename { .. })));
+
+    // Path-shaped names that are malformed as paths must still be rejected.
+    for bad in ["/leading", "trailing/", "foo//bar", "./rel.txt", "a/../b"] {
+        let result = device.store_bytes(&data, bad, 0o644);
+        assert!(
+            matches!(result, Err(FsError::InvalidFilename { .. })),
+            "expected InvalidFilename for {bad:?}, got {result:?}"
+        );
+    }
+}
+
+#[test]
+fn path_like_filenames_are_accepted_and_roundtrip() {
+    // / is allowed so the FUSE layer can synthesize virtual directories;
+    // storage is still flat but the stored name carries the full path.
+    let (_fixture, mut device) = open_device("file_ops_pathname.gguf", 14);
+
+    let payload_a = patterned_bytes(64, 0x11);
+    let payload_b = patterned_bytes(64, 0x22);
+    device
+        .store_bytes(&payload_a, "docs/notes.txt", 0o644)
+        .expect("store a/b");
+    device
+        .store_bytes(&payload_b, "docs/2025/plan.md", 0o644)
+        .expect("store a/b/c");
+
+    let listed = device.list_files().expect("list");
+    let names: Vec<_> = listed.iter().map(|e| e.filename.clone()).collect();
+    assert!(names.contains(&"docs/notes.txt".to_string()));
+    assert!(names.contains(&"docs/2025/plan.md".to_string()));
+
+    let got_a = device.read_file_bytes("docs/notes.txt").expect("read a");
+    let got_b = device.read_file_bytes("docs/2025/plan.md").expect("read b");
+    assert_eq!(got_a, payload_a);
+    assert_eq!(got_b, payload_b);
 }
 
 #[test]
