@@ -724,64 +724,60 @@ impl StegoDevice {
 }
 ```
 
-## 7. NBD Server
+## 7. FUSE Filesystem
 
-The Network Block Device protocol allows exposing the stego device as a Linux block device. The kernel sends read/write requests; we respond with stego block operations.
+The mount path is a FUSE driver (`fuser` crate) that exposes the file
+table as a real filesystem. No root required (unprivileged mount via
+`fusermount3`), no kernel modules, no block-device round-trip. Virtual
+directories are synthesized from `/`-separated filenames at the FUSE
+layer; on-disk storage stays flat per §6.
 
-### Protocol
+Earlier drafts of this document specified an NBD-backed ext4 mount.
+That path was deleted: it required root plus the nbd kernel module,
+produced an ext4 image independent of the file table (so CLI and mount
+saw incompatible data), and its test coverage was gated behind root
+helpers that ran in practice ~never. FUSE is a smaller surface with
+better coverage and a single source of truth.
 
-NBD uses a simple request/response protocol over a Unix socket or TCP:
+### Operations
 
-```
-Client → Server:  NBD_REQUEST { magic, type, handle, offset, length }
-Server → Client:  NBD_REPLY { magic, error, handle, data (for reads) }
-```
+| FUSE op | Action |
+|---|---|
+| `lookup`, `getattr` | Resolve a path to a live file or a virtual directory (any entry whose name starts with `<path>/`). |
+| `readdir` | Prefix-match live entries at the current directory; dedup nested components into virtual-directory entries. |
+| `open`, `read` | Load full file contents via `read_file_bytes` (or the dirty write buffer), slice to `(offset, size)`. |
+| `write` | Stage into a per-inode buffer; no on-disk mutation until `release` / `flush` / `fsync`. |
+| `create` | Allocate an inode, seed an empty dirty buffer; `release` commits via `store_bytes`. |
+| `release` / `flush` / `fsync` | Commit: `delete_file` (if exists) then `store_bytes`. |
+| `unlink` | Tombstone via `delete_file`. |
+| `mkdir` | Record the path in an in-memory `explicit_dirs` set. Nothing persisted — empty dirs vanish on unmount unless a file is stored under them. |
+| `rmdir` | ENOTEMPTY if any live entry has the directory's prefix; else drop from `explicit_dirs`. |
+| `rename` | For files: read + store-under-new + delete-old. For directories: walk matching entries, rename each. |
+| `setattr` | `mode` change → re-store with new mode. Truncate → resize the write buffer. atime ignored. |
+| `statfs` | Device block count / free count; block size 4096; namelen 95. |
 
-Request types we must handle:
-- `NBD_CMD_READ`: Read `length` bytes at `offset`. Map to stego block reads.
-- `NBD_CMD_WRITE`: Write `length` bytes at `offset`. Map to stego block writes.
-- `NBD_CMD_FLUSH`: Call `StegoDevice::flush()`.
-- `NBD_CMD_DISC`: Disconnect. Flush and clean up.
+### Concurrency
 
-### Implementation
+Dispatch is single-threaded. `StegoDevice` methods take `&mut self`;
+enabling fuser's threaded dispatch would require a global lock that
+serializes everything anyway. Documented at the top of
+`src/fuse/fs.rs`.
 
-```rust
-struct NbdServer {
-    device: StegoDevice,
-    socket_path: PathBuf,
-}
+### Filename limits
 
-impl NbdServer {
-    fn new(device: StegoDevice) -> Self;
+The file-table entry's filename field is 96 bytes (95 usable + null
+terminator, per §6). FUSE full paths share that limit, not just the
+basename. Returns `ENAMETOOLONG` if exceeded. A FUSE client doing
+`create /mnt/x/a/very/deep/path/…` hits this at ~3–4 directory
+levels of reasonable-length names; growing the filename field is a
+V2-or-later format change.
 
-    /// Start the NBD server and connect it to /dev/nbdN.
-    /// This forks a background process or spawns a thread.
-    fn start(&mut self) -> Result<PathBuf>; // returns /dev/nbdN path
+### Lifetime
 
-    /// Handle one request from the kernel.
-    fn handle_request(&mut self, req: NbdRequest) -> NbdReply;
-
-    /// Disconnect and clean up.
-    fn stop(&mut self) -> Result<()>;
-}
-```
-
-The `llmdb mount` command:
-1. Opens the GGUF file as a StegoDevice.
-2. Starts the NBD server.
-3. Runs `nbd-client` to attach `/dev/nbdN`.
-4. If the device is unformatted (no ext4 signature), prompts to format.
-5. Mounts `/dev/nbdN` at the specified mount point.
-6. Waits for unmount signal (SIGINT or `llmdb unmount`).
-7. Unmounts, disconnects NBD, flushes stego device.
-
-### Alignment
-
-NBD requests can be for arbitrary byte ranges, not aligned to our 4096-byte block size. The handler must:
-- For reads: read the enclosing block(s), return the requested sub-range.
-- For writes: read-modify-write for partial block writes. Read the enclosing block, splice in the new data, write back the full block.
-
-ext4 with 4096-byte block size will naturally issue 4096-aligned requests in most cases, but we must handle the general case.
+`llmdb mount` blocks until `Ctrl-C` or until `llmdb unmount` runs
+`fusermount3 -u` from another shell. Put it in the background with
+`&` / `nohup` / `disown` for cross-shell lifetime; the mount dies
+with the process that owns it.
 
 ## 8. `ask` Command
 
@@ -1122,6 +1118,6 @@ If the GGUF file is modified externally (fine-tuning, re-quantization, merging),
 
 - Determine SmolLM3-3B's exact tensor names (need to inspect an actual GGUF file) for the eligibility classifier.
 - Determine whether `llama-server` from llama.cpp supports SmolLM3's tool-calling chat template correctly, or whether we need to handle the chat template ourselves.
-- NBD requires root or `CAP_SYS_ADMIN` for `nbd-client`. Determine whether FUSE (via `fuser` crate) is a better option for unprivileged use. V1 can support both: NBD for full ext4 support, FUSE as a fallback.
+- ~~NBD vs FUSE decision.~~ **Resolved.** Mount path is FUSE-only; NBD was deleted. See §7.
 - Determine the actual hidden dimension and layer count of SmolLM3-3B by inspecting the GGUF metadata, to validate capacity estimates.
 - Profile the address translation hot path. If per-byte translation is too slow, batch translations per quant block (translate once per 32-weight block rather than per weight).
