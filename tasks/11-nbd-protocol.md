@@ -1,8 +1,12 @@
 # Task 11: NBD Protocol
 
-Status: done
+Status: superseded — NBD shipped in v1.0.0 then was deleted post-v1
+in favor of FUSE (commits cd52c86 + 5c275ef). See DESIGN-NEW §7 for
+the current mount architecture. This file is kept as a historical
+record; nothing in the current tree implements or depends on it.
+
 Depends on: 07-stego-device-block-io.md
-Spec refs: DESIGN-NEW.MD section "7. NBD Server" (Protocol)
+Spec refs: DESIGN-NEW.MD section "7. NBD Server" (Protocol) — historical
 
 Objective:
 Implement the NBD wire protocol types so the server in Task 12 can parse kernel

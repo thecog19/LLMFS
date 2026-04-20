@@ -30,8 +30,8 @@ task file here is new.
 | 08 | `08-shadow-copy-and-recovery.md` | §13 | Reworks atomic-write path; drops pending-metadata recovery |
 | 09 | `09-file-table-and-file-ops.md` | §6 | Net-new `src/fs/` |
 | 10 | `10-cli-file-commands.md` | §9 | Rewires `src/main.rs` for store/get/ls/rm/verify/dump/wipe |
-| 11 | `11-nbd-protocol.md` | §7 | Net-new `src/nbd/protocol.rs` |
-| 12 | `12-nbd-server.md` | §7 | Net-new `src/nbd/server.rs`, wires `mount`/`unmount` |
+| 11 | `11-nbd-protocol.md` | §7 | Net-new `src/nbd/protocol.rs` — **superseded post-v1; see DESIGN-NEW §7 (FUSE)** |
+| 12 | `12-nbd-server.md` | §7 | Net-new `src/nbd/server.rs`, wires `mount`/`unmount` — **superseded post-v1; see DESIGN-NEW §7 (FUSE)** |
 | 13 | `13-ask-bridge.md` | §8 | Net-new `src/ask/`, spawns `llama-server` |
 | 14 | `14-diagnostics-and-status.md` | §9 | Real `src/diagnostics.rs`, wires `status` output |
 | 15 | `15-benchmarks.md` | §11 | Net-new `benches/` |

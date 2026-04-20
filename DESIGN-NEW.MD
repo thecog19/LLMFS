@@ -1116,8 +1116,24 @@ If the GGUF file is modified externally (fine-tuning, re-quantization, merging),
 
 ## 14. Open Items
 
-- Determine SmolLM3-3B's exact tensor names (need to inspect an actual GGUF file) for the eligibility classifier.
-- Determine whether `llama-server` from llama.cpp supports SmolLM3's tool-calling chat template correctly, or whether we need to handle the chat template ourselves.
-- ~~NBD vs FUSE decision.~~ **Resolved.** Mount path is FUSE-only; NBD was deleted. See §7.
-- Determine the actual hidden dimension and layer count of SmolLM3-3B by inspecting the GGUF metadata, to validate capacity estimates.
-- Profile the address translation hot path. If per-byte translation is too slow, batch translations per quant block (translate once per 32-weight block rather than per weight).
+- SmolLM3-3B specifically (tensor names, hidden dim, layer count) is
+  unverified. Development and benchmarking to date use SmolLM2-135M;
+  the code is model-agnostic at the parser level, but the §1 target
+  has not been exercised end-to-end. Downloading the 3B variants and
+  re-running the perplexity sweep is the next step if
+  SmolLM3-specific behavior becomes load-bearing.
+- ~~`llama-server` tool-calling chat template for SmolLM3.~~
+  Exercised end-to-end for SmolLM2 via `tests/ask_e2e.rs`
+  (`LLMDB_E2E_ASK=1`). SmolLM3 itself remains untested pending the
+  tensor-name work above.
+- ~~NBD vs FUSE decision.~~ **Resolved.** Mount path is FUSE-only;
+  NBD was deleted. See §7.
+- ~~Address translation hot-path profile.~~ Measured: `map_logical_byte`
+  at ~66 ns/byte (~15 M bytes/s) on this workstation via
+  `cargo bench --bench address_translation`. Per-byte cost is real
+  but not the current bottleneck — the range-update packer path
+  (commit 2f51e2d) batches writes so the per-byte translation sits
+  inside a loop that's already dominated by mantissa encode work.
+  If V2's allocation changes re-introduce whole-tensor scans, this
+  becomes the top profile target; fix is per-quant-block batching
+  as originally noted.

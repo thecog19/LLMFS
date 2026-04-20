@@ -1,8 +1,12 @@
 # Task 12: NBD Server And Mount
 
-Status: done
+Status: superseded — NBD shipped in v1.0.0 then was deleted post-v1
+in favor of FUSE (commits cd52c86 + 5c275ef). See DESIGN-NEW §7 for
+the current mount architecture. This file is kept as a historical
+record; nothing in the current tree implements or depends on it.
+
 Depends on: 11-nbd-protocol.md, 10-cli-file-commands.md
-Spec refs: DESIGN-NEW.MD section "7. NBD Server" (Implementation, Alignment, `llmdb mount`)
+Spec refs: DESIGN-NEW.MD section "7. NBD Server" (Implementation, Alignment, `llmdb mount`) — historical
 
 Objective:
 Serve the stego device as an NBD export on a Unix socket, attach it to
