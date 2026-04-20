@@ -17,7 +17,8 @@ cargo build --release --offline
 The binary lands at `target/release/llmdb`. No external runtime
 dependencies except:
 
-- `nbd-client` + the `nbd` kernel module (for `mount` / `unmount`)
+- `fusermount3` (or `fusermount`) on `PATH` + `/dev/fuse` accessible,
+  for `mount` / `unmount`. On Debian/Ubuntu/WSL2: `apt install fuse3`.
 - `llama-server` on `PATH` (for `ask`)
 
 ## Cover-file viability
@@ -36,7 +37,7 @@ allocation). See `DESIGN-NEW.MD §2`.
 
 ## Quickstart: file storage CLI
 
-Works on any GGUF. No NBD, no root, no inference runtime needed.
+Works on any GGUF. No mount, no root, no inference runtime needed.
 
 ```sh
 # Prepare a GGUF as a stego device. Zeroes the stealable bits and
@@ -62,43 +63,32 @@ Works on any GGUF. No NBD, no root, no inference runtime needed.
 ./target/release/llmdb rm model.gguf notes.txt
 ```
 
-## Mount as ext4
+## Mount as a FUSE filesystem
 
-Requires root and the `nbd` kernel module. The `mount` command
-runs the full stack: NBD server → `nbd-client` → optional
-`mkfs.ext4` → `mount`, then blocks until `Ctrl-C` or until
-`llmdb unmount` is invoked from another shell.
-
-If you want to drive the root-only steps through the repo helper
-instead of granting broader sudo, set `LLMDB_ROOT_HELPER` to
-[`scripts/llmdb-e2e-root.sh`](scripts/llmdb-e2e-root.sh). The CLI
-will route `nbd-client`, `mkfs.ext4`, `mount`, and `umount`
-through that helper.
+Unprivileged mount via `fusermount3`. The `mount` command blocks
+until `Ctrl-C` or until `llmdb unmount` is run in another shell;
+drop it into the background with `&` / `nohup` / `disown` if you
+need cross-shell lifetime.
 
 ```sh
-sudo modprobe nbd nbds_max=16
-sudo ./target/release/llmdb mount model.gguf /mnt/llmdb --format --yes
+./target/release/llmdb mount model.gguf /mnt/llmdb
 
-# In another shell — read/write files through ext4:
-sudo cp somefile /mnt/llmdb/
-ls /mnt/llmdb
+# In another shell:
+echo "hello" > /mnt/llmdb/greet.txt
+mkdir -p /mnt/llmdb/docs
+cp notes.md /mnt/llmdb/docs/
+ls /mnt/llmdb/docs
 
 # Clean shutdown:
-sudo ./target/release/llmdb unmount /mnt/llmdb
-```
-
-With the helper script installed in `sudoers`, the same flow can run
-without `sudo` on the `llmdb` command itself:
-
-```sh
-export LLMDB_ROOT_HELPER="$PWD/scripts/llmdb-e2e-root.sh"
-./target/release/llmdb mount model.gguf /mnt/llmdb --format --yes
 ./target/release/llmdb unmount /mnt/llmdb
 ```
 
-The device is persistent — the ext4 superblock and all file data
-are hidden inside the GGUF's stego space. Remount the same GGUF
-later and your files are still there.
+Storage is flat under the hood — virtual directories come from
+`/`-separated filenames and persist as long as there are files
+under them. Empty directories live only in the mount session
+(touch a `.keep` file to make one persistent). Files stored via
+the CLI (`llmdb store ... --name docs/notes.md`) show up in the
+mount and vice versa.
 
 ## Ask the model about its own files
 
@@ -116,25 +106,12 @@ where the model sees the stego filesystem as its own context.
 Only meaningful on an F16 / F32 cover file where the model still
 inferences after `init`.
 
-## Manual NBD flow
-
-For debugging or if you prefer to drive `nbd-client` / `mkfs`
-yourself:
-
-```sh
-./target/release/llmdb serve model.gguf      # binds Unix socket
-# — in another shell —
-sudo nbd-client -unix /tmp/llmdb.sock /dev/nbd0
-sudo mkfs.ext4 -F /dev/nbd0
-sudo mount /dev/nbd0 /mnt/llmdb
-```
-
 ## Diagnostics
 
 ```sh
 ./target/release/llmdb dump-block model.gguf 4    # hex of one block
 ./target/release/llmdb verify model.gguf          # CRC scan
-LLMDB_NBD_TRACE=1 ./target/release/llmdb mount ... # per-request NBD log
+./target/release/llmdb status model.gguf          # generation, tiers, utilization
 ```
 
 ## Running the test suite
@@ -144,6 +121,7 @@ cargo test --offline
 ```
 
 The test suite covers the GGUF parser, every quant packer, the
-redirection table, shadow-copy crash points, the file table,
-the NBD wire protocol, the NBD socket roundtrip, and the
-`ask` tool dispatcher.
+redirection table, shadow-copy crash points, the file table
+(including chain extension), the FUSE driver via real kernel
+mounts (skipped gracefully if `/dev/fuse` or `fusermount` is
+missing), and the `ask` tool dispatcher.

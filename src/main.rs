@@ -1,7 +1,6 @@
 use std::error::Error;
 use std::fmt;
 use std::io::{self, Write};
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::sync::Arc;
@@ -15,7 +14,6 @@ use llmdb::ask::AskError;
 use llmdb::ask::bridge::{AskSession, HttpChatClient};
 use llmdb::ask::server::LlamaServer;
 use llmdb::fs::file_ops::FsError;
-use llmdb::nbd::server::{NbdError, NbdServer, default_socket_path};
 use llmdb::stego::device::{DeviceError, DeviceOptions, StegoDevice};
 use llmdb::stego::integrity::decode_quant_profile;
 use llmdb::stego::planner::AllocationMode;
@@ -75,42 +73,26 @@ enum Command {
     Verify {
         model: PathBuf,
     },
-    /// Mount the stego device as an ext4 filesystem. Runs the full NBD
-    /// stack: serve → nbd-client → (optional mkfs) → mount. Blocks until
-    /// Ctrl-C or until `llmdb unmount` is run in another shell. Requires
-    /// root (invoke via `sudo`).
+    /// Mount the stego device as a FUSE filesystem. Blocks until Ctrl-C
+    /// or until `llmdb unmount <mount_point>` is run in another shell.
+    /// Unprivileged — no root or kernel helpers required, just
+    /// `fusermount3` (or `fusermount`) on PATH.
+    ///
+    /// Put the command in the background with `&` / `nohup` / `disown`
+    /// if you want cross-shell lifetime; the mount dies with the process
+    /// that owns it.
     Mount {
         model: PathBuf,
         mount_point: PathBuf,
-        /// Run `mkfs.ext4` on the device before mounting. DESTRUCTIVE —
-        /// any existing filesystem on the stego device is wiped.
+        /// Allow users other than the mounter to access the mount.
+        /// Requires `user_allow_other` in /etc/fuse.conf.
         #[arg(long, action = ArgAction::SetTrue)]
-        format: bool,
-        /// Skip the mkfs confirmation prompt.
-        #[arg(long, action = ArgAction::SetTrue)]
-        yes: bool,
-        /// Override auto-selected `/dev/nbdN`.
-        #[arg(long)]
-        nbd: Option<PathBuf>,
-        /// Override the default socket path.
-        #[arg(long)]
-        socket: Option<PathBuf>,
+        allow_other: bool,
     },
-    /// Unmount the ext4 filesystem and tear down the NBD stack. Paired
-    /// with `mount`. Requires root.
+    /// Unmount a FUSE-mounted stego device. Shells out to
+    /// `fusermount3 -u` (falling back to `fusermount -u`).
     Unmount {
         mount_point: PathBuf,
-    },
-    /// Bind the NBD server on a Unix socket and wait for a client to
-    /// connect. Companion command for the manual mount flow —
-    /// `nbd-client -unix <socket> /dev/nbdN` connects, then the user
-    /// runs `mkfs.ext4` and `mount` in another shell. Exits when the
-    /// NBD client disconnects.
-    Serve {
-        model: PathBuf,
-        /// Override the default socket path (`/tmp/llmdb-<pid>.sock`).
-        #[arg(long)]
-        socket: Option<PathBuf>,
     },
     /// Diagnostic: hexdump a physical block as the stego layer decodes it.
     /// Useful for chasing free-list / redirection corruption.
@@ -181,25 +163,12 @@ fn dispatch(cmd: Command, mode: AllocationMode, options: DeviceOptions) -> Resul
         } => cmd_rm(&model, &stego_name, yes, mode, options),
         Command::Verify { model } => cmd_verify(&model, mode, options),
         Command::Wipe { model, yes } => cmd_wipe(&model, yes, mode, options),
-        Command::Serve { model, socket } => cmd_serve(&model, socket, mode, options),
         Command::DumpBlock { model, block } => cmd_dump_block(&model, block, mode, options),
         Command::Mount {
             model,
             mount_point,
-            format,
-            yes,
-            nbd,
-            socket,
-        } => cmd_mount(
-            &model,
-            &mount_point,
-            format,
-            yes,
-            nbd,
-            socket,
-            mode,
-            options,
-        ),
+            allow_other,
+        } => cmd_mount(&model, &mount_point, allow_other, mode, options),
         Command::Unmount { mount_point } => cmd_unmount(&mount_point),
         Command::Ask { model } => cmd_ask(&model, mode, options),
         Command::Dump { model } => cmd_dump(&model, mode, options),
@@ -380,510 +349,85 @@ fn cmd_verify(
     }
 }
 
-fn cmd_serve(
-    model: &Path,
-    socket: Option<PathBuf>,
-    alloc_mode: AllocationMode,
-    options: DeviceOptions,
-) -> Result<(), CliError> {
-    let device = StegoDevice::open_with_options(model, alloc_mode, options).map_err(open_err)?;
-    let server = NbdServer::new(device);
-    let export = server.export_bytes();
-    let data_blocks = export / llmdb::BLOCK_SIZE as u64;
-    let pid = std::process::id();
-    let socket_path = socket.unwrap_or_else(|| default_socket_path(pid));
-
-    println!(
-        "llmdb serve: export {} bytes ({} data blocks)",
-        export, data_blocks
-    );
-    println!("socket: {}", socket_path.display());
-    println!();
-    println!("In another shell (root required):");
-    println!(
-        "  sudo modprobe nbd && sudo nbd-client -unix {} /dev/nbd0",
-        socket_path.display()
-    );
-    println!("  sudo mkfs.ext4 /dev/nbd0          # first mount only");
-    println!("  sudo mount /dev/nbd0 /mnt/llmdb");
-    println!();
-    println!("To stop: sudo umount /mnt/llmdb && sudo nbd-client -d /dev/nbd0");
-    println!("waiting for nbd client to connect...");
-
-    server.serve_on_unix_socket(&socket_path).map_err(nbd_err)?;
-    println!("nbd client disconnected; server exiting");
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
 fn cmd_mount(
     model: &Path,
     mount_point: &Path,
-    format: bool,
-    yes: bool,
-    nbd_override: Option<PathBuf>,
-    socket_override: Option<PathBuf>,
+    allow_other: bool,
     alloc_mode: AllocationMode,
     options: DeviceOptions,
 ) -> Result<(), CliError> {
-    let nbd_dev = match nbd_override {
-        Some(p) => p,
-        None => find_free_nbd_device()?,
-    };
-    eprintln!("using {}", nbd_dev.display());
+    use llmdb::fuse::{LlmdbFs, MountConfig, spawn_background};
 
-    if format && !yes {
-        let prompt = format!(
-            "`mkfs.ext4 {}` will wipe any existing filesystem on the stego \
-             device. Proceed?",
-            nbd_dev.display()
-        );
-        if !confirm(&prompt)? {
-            return Err(CliError::user("aborted"));
-        }
-    }
-
-    let device = StegoDevice::open_with_options(model, alloc_mode, options).map_err(open_err)?;
-    let server = Arc::new(NbdServer::new(device));
-    let export = server.export_bytes();
-    let sock_path = socket_override.unwrap_or_else(|| default_socket_path(std::process::id()));
-
-    // Spawn server thread before invoking nbd-client.
-    let server_thread = {
-        let server = Arc::clone(&server);
-        let sock = sock_path.clone();
-        thread::spawn(move || server.serve_on_unix_socket(&sock))
-    };
-
-    // Wait briefly for the socket file to appear.
-    for _ in 0..40 {
-        if sock_path.exists() {
-            break;
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-    if !sock_path.exists() {
-        return Err(CliError::internal(format!(
-            "nbd socket {} never appeared",
-            sock_path.display()
-        )));
-    }
-
-    println!(
-        "llmdb mount: export {} bytes on {}",
-        export,
-        nbd_dev.display()
-    );
-
-    // 1. nbd-client -unix <sock> /dev/nbdN
-    run_cmd(&[
-        "nbd-client",
-        "-unix",
-        sock_path.to_str().unwrap(),
-        nbd_dev.to_str().unwrap(),
-    ])?;
-
-    // 2. optional mkfs.ext4
-    if format && let Err(e) = run_cmd(&["mkfs.ext4", "-F", nbd_dev.to_str().unwrap()]) {
-        run_cmd(&["nbd-client", "-d", nbd_dev.to_str().unwrap()]).ok();
-        return Err(e);
-    }
-
-    // 3. mkdir -p mount_point
-    if let Err(e) = std::fs::create_dir_all(mount_point) {
-        run_cmd(&["nbd-client", "-d", nbd_dev.to_str().unwrap()]).ok();
-        return Err(CliError::internal(format!(
+    std::fs::create_dir_all(mount_point).map_err(|e| {
+        CliError::internal(format!(
             "could not create mount point {}: {e}",
             mount_point.display()
-        )));
-    }
+        ))
+    })?;
 
-    // 4. mount /dev/nbdN mount_point
-    if let Err(e) = run_cmd(&[
-        "mount",
-        nbd_dev.to_str().unwrap(),
-        mount_point.to_str().unwrap(),
-    ]) {
-        run_cmd(&["nbd-client", "-d", nbd_dev.to_str().unwrap()]).ok();
-        return Err(e);
-    }
+    let device = StegoDevice::open_with_options(model, alloc_mode, options).map_err(open_err)?;
+    let fs = LlmdbFs::new(device);
+    let config = MountConfig { allow_other };
 
-    // 5. Write the sidecar state file so `llmdb unmount` can find us.
-    let sidecar = MountState {
-        mount_point: mount_point.to_path_buf(),
-        nbd_device: nbd_dev.clone(),
-        socket_path: sock_path.clone(),
-        mount_pid: std::process::id(),
-    };
-    if let Err(e) = sidecar.write() {
-        eprintln!(
-            "warning: could not write mount sidecar ({e}); \
-             `llmdb unmount` may not find this session — use Ctrl-C to stop"
-        );
-    }
+    let session = spawn_background(fs, mount_point, &config)
+        .map_err(|e| CliError::internal(format!("fuse mount failed: {e}")))?;
 
     println!("mounted at {}", mount_point.display());
     println!(
-        "stop with:  sudo llmdb unmount {}   (or Ctrl-C here)",
+        "stop with: llmdb unmount {}   (or Ctrl-C here)",
         mount_point.display()
     );
 
-    // 6. Install Ctrl-C handler + wait.
+    // Block on Ctrl-C. When the user runs `llmdb unmount` in another
+    // shell the mount is torn down by fusermount3; our `session` holds
+    // a file descriptor into /dev/fuse, and `fuser` will notice the
+    // kernel-side unmount and let the session thread finish. We poll
+    // the shutdown flag either way.
     let shutdown = Arc::new(AtomicBool::new(false));
-    let shutdown_cc = Arc::clone(&shutdown);
-    ctrlc::set_handler(move || shutdown_cc.store(true, Ordering::SeqCst))
-        .map_err(|e| CliError::internal(format!("ctrlc handler install failed: {e}")))?;
-
-    let mut disconnected_elsewhere = false;
+    let sc = Arc::clone(&shutdown);
+    ctrlc::set_handler(move || sc.store(true, Ordering::SeqCst))
+        .map_err(|e| CliError::internal(format!("ctrlc install failed: {e}")))?;
     while !shutdown.load(Ordering::SeqCst) {
-        if server_thread.is_finished() {
-            // Client disconnected (e.g. via `llmdb unmount` running
-            // `nbd-client -d`). Flow into the cleanup path below.
-            disconnected_elsewhere = true;
-            break;
-        }
         thread::sleep(Duration::from_millis(200));
     }
 
     println!("unmounting {} …", mount_point.display());
-    if !disconnected_elsewhere {
-        teardown_mount(mount_point, &nbd_dev)?;
-    }
-    join_server_thread(server_thread)?;
-    MountState::remove_for(mount_point).map_err(|e| {
-        CliError::internal(format!(
-            "could not remove mount sidecar for {}: {e}",
-            mount_point.display()
-        ))
-    })?;
+    drop(session); // BackgroundSession unmount on drop
     println!("done");
     Ok(())
 }
 
 fn cmd_unmount(mount_point: &Path) -> Result<(), CliError> {
-    let sidecar_dir = default_sidecar_dir()?;
-    cmd_unmount_with_sidecar_dir(&sidecar_dir, mount_point)
-}
-
-fn cmd_unmount_with_sidecar_dir(sidecar_dir: &Path, mount_point: &Path) -> Result<(), CliError> {
-    let canonical = mount_point
-        .canonicalize()
-        .unwrap_or_else(|_| mount_point.to_path_buf());
-    let state = MountState::find_for_in(sidecar_dir, &canonical)
-        .or_else(|| MountState::find_for_in(sidecar_dir, mount_point))
-        .ok_or_else(|| {
-            CliError::user(format!(
-                "no active llmdb mount found for {}",
-                mount_point.display()
-            ))
-        })?;
-
-    println!(
-        "unmounting {} (nbd: {}, mount_pid: {}) …",
-        state.mount_point.display(),
-        state.nbd_device.display(),
-        state.mount_pid
-    );
-    teardown_mount(&state.mount_point, &state.nbd_device)?;
-    // The mount command's server thread should now finish as nbd-client
-    // disconnects; the mount process cleans its own sidecar on exit.
-    // Give it a moment, then force-remove the sidecar if it lingers.
-    thread::sleep(Duration::from_millis(500));
-    state.remove_file_in(sidecar_dir).map_err(|e| {
-        CliError::internal(format!(
-            "could not remove mount sidecar for {}: {e}",
-            state.mount_point.display()
-        ))
-    })?;
-    println!("done — the `llmdb mount` shell should now return");
-    Ok(())
-}
-
-fn find_free_nbd_device() -> Result<PathBuf, CliError> {
-    for i in 0..16 {
-        let dev = PathBuf::from(format!("/dev/nbd{i}"));
-        if !dev.exists() {
-            continue;
-        }
-        let pid_file = PathBuf::from(format!("/sys/block/nbd{i}/pid"));
-        if !pid_file.exists() {
-            return Ok(dev);
-        }
-        // pid file exists → device is in use by an nbd-client. Check anyway
-        // in case the client died without cleanup (empty pid file).
-        match std::fs::read_to_string(&pid_file) {
-            Ok(s) if s.trim().is_empty() => return Ok(dev),
-            _ => continue,
+    // Try fusermount3 first (Linux 5.x+); fall back to fusermount (older
+    // systems / containers that ship only the v2 binary).
+    for prog in ["fusermount3", "fusermount"] {
+        let out = ProcessCommand::new(prog)
+            .arg("-u")
+            .arg(mount_point)
+            .output();
+        match out {
+            Ok(o) if o.status.success() => {
+                println!("unmounted {}", mount_point.display());
+                return Ok(());
+            }
+            Ok(o) => {
+                return Err(CliError::user(format!(
+                    "{prog} -u {} failed: {}",
+                    mount_point.display(),
+                    String::from_utf8_lossy(&o.stderr).trim()
+                )));
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                continue;
+            }
+            Err(e) => {
+                return Err(CliError::internal(format!("spawning {prog}: {e}")));
+            }
         }
     }
     Err(CliError::user(
-        "no free /dev/nbdN device found; run `sudo modprobe nbd` if the \
-         module isn't loaded"
-            .to_owned(),
+        "neither fusermount3 nor fusermount is on PATH — install fuse3 or fuse".to_owned(),
     ))
-}
-
-fn run_cmd(argv: &[&str]) -> Result<(), CliError> {
-    let resolved = resolve_command(argv)?;
-    let mut cmd = ProcessCommand::new(&resolved[0]);
-    cmd.args(&resolved[1..]);
-    let status = cmd
-        .status()
-        .map_err(|e| CliError::internal(format!("spawn {}: {e}", resolved[0])))?;
-    if !status.success() {
-        return Err(CliError::user(format!(
-            "{} exited with status {:?}",
-            resolved[0],
-            status.code()
-        )));
-    }
-    Ok(())
-}
-
-fn resolve_command(argv: &[&str]) -> Result<Vec<String>, CliError> {
-    if let Some(helper) = root_helper_path()?
-        && let Some(mapped) = map_root_helper_command(&helper, argv)
-    {
-        return Ok(mapped);
-    }
-    Ok(argv.iter().map(|arg| (*arg).to_owned()).collect())
-}
-
-fn root_helper_path() -> Result<Option<PathBuf>, CliError> {
-    let Some(raw) = std::env::var_os("LLMDB_ROOT_HELPER") else {
-        return Ok(None);
-    };
-    let path = PathBuf::from(raw);
-    let canonical = path.canonicalize().map_err(|e| {
-        CliError::internal(format!(
-            "could not resolve LLMDB_ROOT_HELPER {}: {e}",
-            path.display()
-        ))
-    })?;
-    Ok(Some(canonical))
-}
-
-fn map_root_helper_command(helper: &Path, argv: &[&str]) -> Option<Vec<String>> {
-    let helper = helper.display().to_string();
-    let sudo = || vec!["sudo".to_owned(), "-n".to_owned(), helper.clone()];
-    match argv {
-        ["nbd-client", "-unix", socket_path, nbd_device] => {
-            let mut args = sudo();
-            args.push("attach".to_owned());
-            args.push((*socket_path).to_owned());
-            args.push((*nbd_device).to_owned());
-            Some(args)
-        }
-        ["mkfs.ext4", "-F", nbd_device] => {
-            let mut args = sudo();
-            args.push("format".to_owned());
-            args.push((*nbd_device).to_owned());
-            Some(args)
-        }
-        ["mount", nbd_device, mount_point] => {
-            let mut args = sudo();
-            args.push("mountfs".to_owned());
-            args.push((*nbd_device).to_owned());
-            args.push((*mount_point).to_owned());
-            Some(args)
-        }
-        ["umount", mount_point] => {
-            let mut args = sudo();
-            args.push("unmountfs".to_owned());
-            args.push((*mount_point).to_owned());
-            Some(args)
-        }
-        ["nbd-client", "-d", nbd_device] => {
-            let mut args = sudo();
-            args.push("detach".to_owned());
-            args.push((*nbd_device).to_owned());
-            Some(args)
-        }
-        _ => None,
-    }
-}
-
-fn teardown_mount(mount_point: &Path, nbd_device: &Path) -> Result<(), CliError> {
-    let mut errors = Vec::new();
-    if let Err(e) = run_cmd(&["umount", mount_point.to_str().unwrap()]) {
-        errors.push(format!("umount {}: {e}", mount_point.display()));
-    }
-    if let Err(e) = run_cmd(&["nbd-client", "-d", nbd_device.to_str().unwrap()]) {
-        errors.push(format!("nbd-client -d {}: {e}", nbd_device.display()));
-    }
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(CliError::user(errors.join("; ")))
-    }
-}
-
-fn join_server_thread(
-    server_thread: thread::JoinHandle<Result<(), NbdError>>,
-) -> Result<(), CliError> {
-    match server_thread.join() {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(e)) => Err(nbd_err(e)),
-        Err(_) => Err(CliError::internal("nbd server thread panicked".to_owned())),
-    }
-}
-
-// -- Mount sidecar state (for `unmount` to find a running mount) --
-
-#[derive(Debug)]
-struct MountState {
-    mount_point: PathBuf,
-    nbd_device: PathBuf,
-    socket_path: PathBuf,
-    mount_pid: u32,
-}
-
-impl MountState {
-    fn path_for_in(sidecar_dir: &Path, mount_point: &Path) -> PathBuf {
-        let encoded = encode_mount_point(mount_point);
-        sidecar_dir.join(format!("{encoded}.state"))
-    }
-
-    fn write(&self) -> io::Result<()> {
-        let sidecar_dir = default_sidecar_dir().map_err(io::Error::other)?;
-        self.write_in(&sidecar_dir)
-    }
-
-    fn write_in(&self, sidecar_dir: &Path) -> io::Result<()> {
-        std::fs::create_dir_all(sidecar_dir)?;
-        let body = format!(
-            "mount_point={}\nnbd_device={}\nsocket_path={}\nmount_pid={}\n",
-            self.mount_point.display(),
-            self.nbd_device.display(),
-            self.socket_path.display(),
-            self.mount_pid
-        );
-        std::fs::write(Self::path_for_in(sidecar_dir, &self.mount_point), body)
-    }
-
-    fn find_for_in(sidecar_dir: &Path, mount_point: &Path) -> Option<Self> {
-        let path = Self::path_for_in(sidecar_dir, mount_point);
-        if !path.exists() {
-            return Self::scan_for_in(sidecar_dir, mount_point);
-        }
-        std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|body| Self::parse(&body))
-            .or_else(|| Self::scan_for_in(sidecar_dir, mount_point))
-    }
-
-    fn scan_for_in(sidecar_dir: &Path, mount_point: &Path) -> Option<Self> {
-        let mut entries: Vec<_> = std::fs::read_dir(sidecar_dir).ok()?.flatten().collect();
-        entries.sort_by_key(|entry| entry.file_name());
-        for e in entries {
-            let Ok(body) = std::fs::read_to_string(e.path()) else {
-                continue;
-            };
-            let Some(state) = Self::parse(&body) else {
-                continue;
-            };
-            if state.mount_point == mount_point {
-                return Some(state);
-            }
-        }
-        None
-    }
-
-    fn parse(body: &str) -> Option<Self> {
-        let mut mp = None;
-        let mut nd = None;
-        let mut sp = None;
-        let mut pid = None;
-        for line in body.lines() {
-            let (k, v) = line.split_once('=')?;
-            match k {
-                "mount_point" => mp = Some(PathBuf::from(v)),
-                "nbd_device" => nd = Some(PathBuf::from(v)),
-                "socket_path" => sp = Some(PathBuf::from(v)),
-                "mount_pid" => pid = v.parse().ok(),
-                _ => {}
-            }
-        }
-        Some(Self {
-            mount_point: mp?,
-            nbd_device: nd?,
-            socket_path: sp?,
-            mount_pid: pid?,
-        })
-    }
-
-    fn remove_for(mount_point: &Path) -> io::Result<()> {
-        let sidecar_dir = default_sidecar_dir().map_err(io::Error::other)?;
-        Self::remove_for_in(&sidecar_dir, mount_point)
-    }
-
-    fn remove_for_in(sidecar_dir: &Path, mount_point: &Path) -> io::Result<()> {
-        let path = Self::path_for_in(sidecar_dir, mount_point);
-        if path.exists() {
-            std::fs::remove_file(path)
-        } else {
-            Ok(())
-        }
-    }
-
-    fn remove_file_in(&self, sidecar_dir: &Path) -> io::Result<()> {
-        let path = Self::path_for_in(sidecar_dir, &self.mount_point);
-        if path.exists() {
-            std::fs::remove_file(path)
-        } else {
-            Ok(())
-        }
-    }
-}
-
-fn encode_mount_point(mount_point: &Path) -> String {
-    let mut encoded = String::with_capacity(mount_point.as_os_str().as_bytes().len() * 2);
-    for byte in mount_point.as_os_str().as_bytes() {
-        encoded.push_str(&format!("{byte:02x}"));
-    }
-    encoded
-}
-
-fn default_sidecar_dir() -> Result<PathBuf, CliError> {
-    if let Some(dir) = std::env::var_os("LLMDB_SIDECAR_DIR") {
-        return Ok(PathBuf::from(dir));
-    }
-    let uid = current_uid()?;
-    Ok(compute_sidecar_dir(
-        std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from),
-        uid,
-    ))
-}
-
-fn compute_sidecar_dir(runtime_dir: Option<PathBuf>, uid: u32) -> PathBuf {
-    match runtime_dir {
-        Some(dir) => dir.join("llmdb-mounts"),
-        None => PathBuf::from(format!("/tmp/llmdb-mounts-{uid}")),
-    }
-}
-
-fn current_uid() -> Result<u32, CliError> {
-    if let Ok(uid) = std::env::var("UID")
-        && let Ok(parsed) = uid.parse::<u32>()
-    {
-        return Ok(parsed);
-    }
-
-    let output = ProcessCommand::new("id")
-        .arg("-u")
-        .output()
-        .map_err(|e| CliError::internal(format!("spawn id -u: {e}")))?;
-    if !output.status.success() {
-        return Err(CliError::internal(format!(
-            "id -u exited with status {:?}",
-            output.status.code()
-        )));
-    }
-    let uid = String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse::<u32>()
-        .map_err(|e| CliError::internal(format!("parse id -u output: {e}")))?;
-    Ok(uid)
 }
 
 fn cmd_ask(
@@ -1084,16 +628,6 @@ fn open_err(e: DeviceError) -> CliError {
     }
 }
 
-fn nbd_err(e: NbdError) -> CliError {
-    match e {
-        NbdError::OutOfRange { .. } => CliError::user(e.to_string()),
-        NbdError::Io(inner) => CliError::internal(inner.to_string()),
-        NbdError::Device(inner) => dev_err(inner),
-        NbdError::Protocol(inner) => CliError::internal(inner.to_string()),
-        NbdError::LockPoisoned => CliError::internal("nbd device lock poisoned".to_owned()),
-    }
-}
-
 // ─── CliError ─────────────────────────────────────────────────────────────
 
 #[derive(Debug)]
@@ -1126,144 +660,3 @@ impl fmt::Display for CliError {
 }
 
 impl Error for CliError {}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs;
-
-    fn sample_state(base: &Path, mount_point: &Path) -> MountState {
-        MountState {
-            mount_point: mount_point.to_path_buf(),
-            nbd_device: PathBuf::from("/dev/nbd999"),
-            socket_path: base.join("llmdb.sock"),
-            mount_pid: 4242,
-        }
-    }
-
-    #[test]
-    fn sidecar_paths_do_not_alias_distinct_mount_points() {
-        let sidecar_dir = tempfile::tempdir().expect("tempdir");
-        let lhs = MountState::path_for_in(sidecar_dir.path(), Path::new("/tmp/foo-bar"));
-        let rhs = MountState::path_for_in(sidecar_dir.path(), Path::new("/tmp/foo/bar"));
-        assert_ne!(
-            lhs, rhs,
-            "distinct mount points must not share a state file"
-        );
-    }
-
-    #[test]
-    fn scan_for_skips_malformed_sidecars() {
-        let sidecar_dir = tempfile::tempdir().expect("tempdir");
-        fs::write(
-            sidecar_dir.path().join("000-bad.state"),
-            "not-a-state-file\n",
-        )
-        .expect("write bad");
-
-        let mount_point = PathBuf::from("/tmp/llmdb-scan-target");
-        let expected = sample_state(sidecar_dir.path(), &mount_point);
-        expected.write_in(sidecar_dir.path()).expect("write good");
-
-        let found = MountState::scan_for_in(sidecar_dir.path(), &mount_point)
-            .expect("scan should find the valid sidecar");
-        assert_eq!(found.mount_point, expected.mount_point);
-        assert_eq!(found.nbd_device, expected.nbd_device);
-        assert_eq!(found.socket_path, expected.socket_path);
-        assert_eq!(found.mount_pid, expected.mount_pid);
-    }
-
-    #[test]
-    fn unmount_reports_teardown_failures_and_preserves_sidecar() {
-        let base = tempfile::tempdir().expect("tempdir");
-        let sidecar_dir = base.path().join("sidecars");
-        let mount_point = base.path().join("mount-point");
-        fs::create_dir_all(&mount_point).expect("create mount point");
-
-        let state = sample_state(base.path(), &mount_point);
-        state.write_in(&sidecar_dir).expect("write sidecar");
-
-        let err = cmd_unmount_with_sidecar_dir(&sidecar_dir, &mount_point)
-            .expect_err("teardown failures must surface as an error");
-        let message = err.to_string();
-        assert!(
-            message.contains("umount") || message.contains("nbd-client"),
-            "unexpected unmount error: {message}"
-        );
-        assert!(
-            MountState::find_for_in(&sidecar_dir, &mount_point).is_some(),
-            "failed unmount must leave the sidecar in place for a retry"
-        );
-    }
-
-    #[test]
-    fn root_helper_maps_attach_command() {
-        let helper = Path::new("/tmp/llmdb-e2e-root.sh");
-        let mapped = map_root_helper_command(
-            helper,
-            &["nbd-client", "-unix", "/tmp/test.sock", "/dev/nbd3"],
-        )
-        .expect("attach should map");
-        assert_eq!(
-            mapped,
-            vec![
-                "sudo",
-                "-n",
-                "/tmp/llmdb-e2e-root.sh",
-                "attach",
-                "/tmp/test.sock",
-                "/dev/nbd3",
-            ]
-        );
-    }
-
-    #[test]
-    fn root_helper_maps_mount_and_detach_commands() {
-        let helper = Path::new("/tmp/llmdb-e2e-root.sh");
-        let mount_cmd = map_root_helper_command(helper, &["mount", "/dev/nbd2", "/mnt/llmdb"])
-            .expect("mount should map");
-        assert_eq!(
-            mount_cmd,
-            vec![
-                "sudo",
-                "-n",
-                "/tmp/llmdb-e2e-root.sh",
-                "mountfs",
-                "/dev/nbd2",
-                "/mnt/llmdb",
-            ]
-        );
-
-        let detach_cmd = map_root_helper_command(helper, &["nbd-client", "-d", "/dev/nbd2"])
-            .expect("detach should map");
-        assert_eq!(
-            detach_cmd,
-            vec![
-                "sudo",
-                "-n",
-                "/tmp/llmdb-e2e-root.sh",
-                "detach",
-                "/dev/nbd2",
-            ]
-        );
-    }
-
-    #[test]
-    fn root_helper_does_not_map_unrelated_commands() {
-        let helper = Path::new("/tmp/llmdb-e2e-root.sh");
-        assert!(map_root_helper_command(helper, &["echo", "hello"]).is_none());
-        assert!(map_root_helper_command(helper, &["nbd-client", "--version"]).is_none());
-    }
-
-    #[test]
-    fn sidecar_dir_uses_runtime_dir_when_available() {
-        let path = compute_sidecar_dir(Some(PathBuf::from("/run/user/1000")), 1000);
-        assert_eq!(path, PathBuf::from("/run/user/1000/llmdb-mounts"));
-    }
-
-    #[test]
-    fn sidecar_dir_falls_back_to_uid_scoped_tmp_dir() {
-        let path = compute_sidecar_dir(None, 1000);
-        assert_eq!(path, PathBuf::from("/tmp/llmdb-mounts-1000"));
-    }
-}
