@@ -286,6 +286,172 @@ fn invalid_filenames_are_rejected() {
 }
 
 #[test]
+fn store_more_than_15_files_extends_chain_and_roundtrips() {
+    // 15 slots per file-table block (slot 15 is reserved for the chain
+    // pointer). Storing the 16th file must allocate a new chain block,
+    // which comes from the data region via `alloc_metadata_physical`.
+    // Needs enough data-region blocks to host 20 one-block files AND one
+    // chain block: 20 + 1 + metadata = ~25. Fixture: 32 tensors → 32 blocks
+    // → 28 data blocks available.
+    let (_fixture, mut device) = open_device("file_ops_chain.gguf", 32);
+
+    for i in 0..20 {
+        let name = format!("file_{i:02}.txt");
+        let payload = patterned_bytes(16, i as u8);
+        device.store_bytes(&payload, &name, 0o644).expect("store");
+    }
+
+    let listed = device.list_files().expect("list");
+    assert_eq!(listed.len(), 20);
+
+    // Roundtrip every file to confirm the chain walk covers both blocks.
+    for i in 0..20 {
+        let name = format!("file_{i:02}.txt");
+        let got = device.read_file_bytes(&name).expect("read");
+        let expected = patterned_bytes(16, i as u8);
+        assert_eq!(got, expected, "file {name} mismatch");
+    }
+}
+
+#[test]
+fn chain_survives_close_and_reopen() {
+    let fixture = write_custom_gguf_fixture(
+        SyntheticGgufVersion::V3,
+        "chain_reopen.gguf",
+        &make_q8_tensors(32),
+    );
+
+    {
+        let mut device = StegoDevice::initialize_with_options(
+            &fixture.path,
+            AllocationMode::Standard,
+            DeviceOptions { verbose: false },
+        )
+        .expect("init");
+        for i in 0..18 {
+            let name = format!("persist_{i:02}.bin");
+            device
+                .store_bytes(&patterned_bytes(16, i as u8 + 0x80), &name, 0o644)
+                .expect("store");
+        }
+        device.close().expect("close");
+    }
+
+    let device = StegoDevice::open_with_options(
+        &fixture.path,
+        AllocationMode::Standard,
+        DeviceOptions { verbose: false },
+    )
+    .expect("reopen");
+
+    let listed = device.list_files().expect("list after reopen");
+    assert_eq!(
+        listed.len(),
+        18,
+        "chain walk must pick up all entries across extended blocks"
+    );
+    for i in 0..18 {
+        let name = format!("persist_{i:02}.bin");
+        let got = device.read_file_bytes(&name).expect("read after reopen");
+        assert_eq!(got, patterned_bytes(16, i as u8 + 0x80));
+    }
+}
+
+#[test]
+fn unclean_shutdown_preserves_chain_blocks_from_orphan_scan() {
+    // Without the recover() fix, the orphan scan would treat chain blocks
+    // (which live in the data region, not in redirection) as unreferenced
+    // and reclaim them on every dirty reopen. Verify by forcing a dirty
+    // shutdown after chain extension.
+    let fixture = write_custom_gguf_fixture(
+        SyntheticGgufVersion::V3,
+        "chain_recovery.gguf",
+        &make_q8_tensors(32),
+    );
+
+    let file_count = 18;
+    {
+        let mut device = StegoDevice::initialize_with_options(
+            &fixture.path,
+            AllocationMode::Standard,
+            DeviceOptions { verbose: false },
+        )
+        .expect("init");
+        for i in 0..file_count {
+            let name = format!("crash_{i:02}.bin");
+            device
+                .store_bytes(&patterned_bytes(16, i as u8), &name, 0o644)
+                .expect("store");
+        }
+        // Simulate a crash: don't call close, skip Drop by forgetting.
+        std::mem::forget(device);
+    }
+
+    let device = StegoDevice::open_with_options(
+        &fixture.path,
+        AllocationMode::Standard,
+        DeviceOptions { verbose: false },
+    )
+    .expect("reopen after dirty shutdown");
+
+    let listed = device.list_files().expect("list after recovery");
+    assert_eq!(
+        listed.len(),
+        file_count,
+        "recovery must keep chain blocks out of the orphan set"
+    );
+    for i in 0..file_count {
+        let name = format!("crash_{i:02}.bin");
+        let got = device
+            .read_file_bytes(&name)
+            .unwrap_or_else(|e| panic!("read {name} after recovery: {e}"));
+        assert_eq!(got, patterned_bytes(16, i as u8));
+    }
+}
+
+#[test]
+fn recovery_preserves_live_entry_overflow_blocks() {
+    // The pre-chaining recover() didn't mark overflow blocks as in-use
+    // either (a latent bug spec §13 listed). Verify they survive a dirty
+    // reopen now.
+    let fixture = write_custom_gguf_fixture(
+        SyntheticGgufVersion::V3,
+        "overflow_recovery.gguf",
+        &make_q8_tensors(48),
+    );
+
+    // Store a file that needs an overflow block (30 blocks of data > 28
+    // inline capacity → 1 overflow block).
+    let data_len = 30 * 4096 - 1;
+    let payload = patterned_bytes(data_len, 0x33);
+    {
+        let mut device = StegoDevice::initialize_with_options(
+            &fixture.path,
+            AllocationMode::Standard,
+            DeviceOptions { verbose: false },
+        )
+        .expect("init");
+        let entry = device
+            .store_bytes(&payload, "needs_overflow.bin", 0o644)
+            .expect("store");
+        assert_ne!(entry.overflow_block, llmdb::stego::integrity::NO_BLOCK);
+        std::mem::forget(device);
+    }
+
+    let device = StegoDevice::open_with_options(
+        &fixture.path,
+        AllocationMode::Standard,
+        DeviceOptions { verbose: false },
+    )
+    .expect("reopen after dirty shutdown");
+
+    let got = device
+        .read_file_bytes("needs_overflow.bin")
+        .expect("read after recovery — overflow block must survive orphan scan");
+    assert_eq!(got, payload);
+}
+
+#[test]
 fn large_file_uses_overflow_block_and_roundtrips() {
     // Need > 28 data blocks to exercise overflow. 40 tensors → 40 raw blocks,
     // of which 4 are metadata → 36 data blocks. A file of 30 × 4096 = ~123 KB

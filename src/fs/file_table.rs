@@ -24,6 +24,13 @@ pub const ENTRY_BYTES: usize = 256;
 /// Number of entries in one file-table block (4096 / 256).
 pub const ENTRIES_PER_BLOCK: usize = 16;
 
+/// Slot 15 of every file-table block is reserved for a chain-next pointer
+/// (`FileEntryType::Chain`). That leaves 15 slots per block for actual file
+/// entries. Legacy blocks where slot 15 is `Free` read as "no next block"
+/// and are only rewritten when the chain needs to be extended.
+pub const CHAIN_SLOT: usize = 15;
+pub const ENTRIES_PER_BLOCK_USABLE: usize = 15;
+
 /// Maximum inline block indices carried in a file-table entry. Files larger
 /// than `MAX_INLINE_BLOCKS * BLOCK_SIZE` chain extra indices through overflow
 /// blocks.
@@ -57,6 +64,9 @@ pub enum FileEntryType {
     Regular = 1,
     Directory = 2,
     Symlink = 3,
+    /// Slot-15 marker carrying a chain-next pointer to the next file-table
+    /// block. Never appears in a file-facing slot.
+    Chain = 4,
 }
 
 impl FileEntryType {
@@ -66,6 +76,7 @@ impl FileEntryType {
             1 => Ok(Self::Regular),
             2 => Ok(Self::Directory),
             3 => Ok(Self::Symlink),
+            4 => Ok(Self::Chain),
             other => Err(FileTableError::InvalidEntryType(other)),
         }
     }
@@ -111,8 +122,32 @@ impl FileEntry {
         }
     }
 
+    /// Construct a Chain slot-15 marker carrying `next` as the next
+    /// file-table block (or `NO_BLOCK` to terminate the chain).
+    pub fn chain(next: u32) -> Self {
+        Self {
+            entry_type: FileEntryType::Chain,
+            flags: 0,
+            mode: 0,
+            uid: 0,
+            gid: 0,
+            size_bytes: 0,
+            created: 0,
+            modified: 0,
+            crc32: 0,
+            block_count: 0,
+            overflow_block: 0,
+            filename: String::new(),
+            inline_blocks: vec![next],
+        }
+    }
+
     pub fn is_free(&self) -> bool {
         matches!(self.entry_type, FileEntryType::Free)
+    }
+
+    pub fn is_chain(&self) -> bool {
+        matches!(self.entry_type, FileEntryType::Chain)
     }
 
     pub fn is_deleted(&self) -> bool {
@@ -120,14 +155,34 @@ impl FileEntry {
     }
 
     /// An entry is "live" iff it is a non-free, non-tombstoned regular file
-    /// (or directory/symlink, once V1 adds those).
+    /// (or directory/symlink, once V1 adds those). Chain markers are not
+    /// live and do not surface in file listings.
     pub fn is_live(&self) -> bool {
-        !self.is_free() && !self.is_deleted()
+        !self.is_free() && !self.is_chain() && !self.is_deleted()
+    }
+
+    /// If this slot carries a chain-next pointer, return it unless it's
+    /// `NO_BLOCK` (end-of-chain sentinel).
+    pub fn chain_next(&self) -> Option<u32> {
+        if !self.is_chain() {
+            return None;
+        }
+        let next = self.inline_blocks.first().copied().unwrap_or(NO_BLOCK);
+        if next == NO_BLOCK { None } else { Some(next) }
     }
 
     pub fn encode(&self) -> Result<[u8; ENTRY_BYTES], FileTableError> {
         let mut bytes = [0_u8; ENTRY_BYTES];
         if self.is_free() {
+            return Ok(bytes);
+        }
+        if self.is_chain() {
+            // Chain entries skip normal validation and carry only the
+            // next-block pointer in the first 4 bytes of the inline-map
+            // region. All other fields are zero on disk.
+            bytes[OFFSET_ENTRY_TYPE] = FileEntryType::Chain.as_u8();
+            let next = self.inline_blocks.first().copied().unwrap_or(NO_BLOCK);
+            bytes[OFFSET_INLINE_MAP..OFFSET_INLINE_MAP + 4].copy_from_slice(&next.to_le_bytes());
             return Ok(bytes);
         }
         self.validate()?;
@@ -168,6 +223,14 @@ impl FileEntry {
         let entry_type = FileEntryType::from_u8(bytes[OFFSET_ENTRY_TYPE])?;
         if matches!(entry_type, FileEntryType::Free) {
             return Ok(Self::free());
+        }
+        if matches!(entry_type, FileEntryType::Chain) {
+            let next = u32::from_le_bytes(
+                bytes[OFFSET_INLINE_MAP..OFFSET_INLINE_MAP + 4]
+                    .try_into()
+                    .unwrap(),
+            );
+            return Ok(Self::chain(next));
         }
 
         let flags = bytes[OFFSET_FLAGS];
@@ -277,6 +340,21 @@ impl FileTableBlock {
     pub fn empty() -> Self {
         Self {
             entries: (0..ENTRIES_PER_BLOCK).map(|_| FileEntry::free()).collect(),
+        }
+    }
+
+    /// Follows slot 15's chain pointer. Legacy blocks (slot 15 = Free) read
+    /// as end-of-chain; a Chain slot returns the next block unless the
+    /// stored pointer is `NO_BLOCK`.
+    pub fn next_block(&self) -> Option<u32> {
+        self.entries.get(CHAIN_SLOT).and_then(FileEntry::chain_next)
+    }
+
+    /// Overwrites slot 15 with a Chain entry carrying `next`. Pass
+    /// `NO_BLOCK` to mark the block as the chain tail.
+    pub fn set_next_block(&mut self, next: u32) {
+        if let Some(slot) = self.entries.get_mut(CHAIN_SLOT) {
+            *slot = FileEntry::chain(next);
         }
     }
 
@@ -414,4 +492,6 @@ pub enum FileTableError {
     EntryCountMismatch { actual: usize, expected: usize },
     #[error("overflow block entry count {count} exceeds max {max}")]
     TooManyOverflowEntries { count: usize, max: usize },
+    #[error("file-table chain exceeds {0} blocks (cycle or corruption)")]
+    ChainCycle(usize),
 }

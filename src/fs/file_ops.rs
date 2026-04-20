@@ -5,7 +5,7 @@ use crc32fast::Hasher;
 use thiserror::Error;
 
 use crate::fs::file_table::{
-    ENTRIES_PER_BLOCK, FLAG_DELETED, FileEntry, FileEntryType, FileTableBlock, FileTableError,
+    CHAIN_SLOT, FLAG_DELETED, FileEntry, FileEntryType, FileTableBlock, FileTableError,
     MAX_FILENAME_BYTES, MAX_INLINE_BLOCKS, OVERFLOW_ENTRIES_PER_BLOCK, OverflowBlock,
 };
 use crate::stego::device::{DeviceError, StegoDevice};
@@ -86,9 +86,18 @@ impl StegoDevice {
             });
         }
 
-        let slot = self.find_free_slot()?.ok_or(FsError::TableFull {
-            capacity: self.file_table_capacity(),
-        })?;
+        let slot = match self.find_free_slot()? {
+            Some(s) => s,
+            None => {
+                // Every chain block is packed. Allocate a fresh tail and
+                // place the new entry in its first slot.
+                let new_block = self.extend_file_table()?;
+                EntryLocation {
+                    block_index: new_block,
+                    slot: 0,
+                }
+            }
+        };
 
         let data_blocks = self.alloc_blocks(block_count)?;
         let overflow_blocks = match self.alloc_blocks(overflow_count) {
@@ -190,10 +199,7 @@ impl StegoDevice {
 
     pub fn list_files(&self) -> Result<Vec<FileEntry>, FsError> {
         let mut out = Vec::new();
-        let length = self.file_table_length_blocks();
-        let start = self.file_table_start_block();
-        for offset in 0..length {
-            let block = self.read_file_table_block(start + offset)?;
+        for (_, block) in self.collect_file_table_chain()? {
             for entry in block.entries {
                 if entry.is_live() {
                     out.push(entry);
@@ -295,12 +301,11 @@ impl StegoDevice {
         &self,
         name: &str,
     ) -> Result<Option<(EntryLocation, FileEntry)>, FsError> {
-        let length = self.file_table_length_blocks();
-        let start = self.file_table_start_block();
-        for offset in 0..length {
-            let block_index = start + offset;
-            let block = self.read_file_table_block(block_index)?;
+        for (block_index, block) in self.collect_file_table_chain()? {
             for (slot, entry) in block.entries.into_iter().enumerate() {
+                if slot == CHAIN_SLOT {
+                    continue;
+                }
                 if !entry.is_free() && entry.filename == name {
                     return Ok(Some((EntryLocation { block_index, slot }, entry)));
                 }
@@ -320,13 +325,13 @@ impl StegoDevice {
         // A slot is reusable if it's never been used (Free) or if it holds
         // only a tombstone (deleted). Without the tombstone branch we'd
         // leak a file-table slot per delete, which fills the table up in
-        // workloads that churn names (ext4 journal, CI logs, etc.).
-        let length = self.file_table_length_blocks();
-        let start = self.file_table_start_block();
-        for offset in 0..length {
-            let block_index = start + offset;
-            let block = self.read_file_table_block(block_index)?;
+        // workloads that churn names (ext4 journal, CI logs, etc.). Slot
+        // 15 is always skipped — it's the chain-next pointer.
+        for (block_index, block) in self.collect_file_table_chain()? {
             for (slot, entry) in block.entries.iter().enumerate() {
+                if slot == CHAIN_SLOT {
+                    continue;
+                }
                 if entry.is_free() || entry.is_deleted() {
                     return Ok(Some(EntryLocation { block_index, slot }));
                 }
@@ -353,12 +358,88 @@ impl StegoDevice {
         self.superblock().fields.file_table_start
     }
 
-    fn file_table_length_blocks(&self) -> u32 {
-        self.superblock().fields.file_table_length
+    /// Walks the file-table chain starting at `file_table_start`, following
+    /// slot-15 next-block pointers. Returns `(block_index, decoded_block)`
+    /// for every block in order. Bounded by `total_blocks` as a cycle guard.
+    pub(crate) fn collect_file_table_chain(&self) -> Result<Vec<(u32, FileTableBlock)>, FsError> {
+        let mut chain = Vec::new();
+        let max = self.total_blocks() as usize;
+        let mut cursor = Some(self.file_table_start_block());
+        while let Some(block_index) = cursor {
+            if chain.len() >= max {
+                return Err(FsError::Table(FileTableError::ChainCycle(chain.len())));
+            }
+            let block = self.read_file_table_block(block_index)?;
+            cursor = block.next_block();
+            chain.push((block_index, block));
+        }
+        Ok(chain)
     }
 
-    fn file_table_capacity(&self) -> usize {
-        (self.file_table_length_blocks() as usize) * ENTRIES_PER_BLOCK
+    /// Returns the physical indices of file-table chain blocks that sit in
+    /// the data region (i.e. all chain blocks except the root, which lives
+    /// in the metadata region). Used by recovery to keep chain blocks out
+    /// of the orphan set.
+    pub(crate) fn file_table_data_region_blocks(&self) -> Result<Vec<u32>, FsError> {
+        let data_start = self.data_region_start();
+        Ok(self
+            .collect_file_table_chain()?
+            .into_iter()
+            .map(|(idx, _)| idx)
+            .filter(|idx| *idx >= data_start)
+            .collect())
+    }
+
+    /// Returns the physical indices of overflow blocks referenced by live
+    /// file entries. Used by recovery so the orphan scan doesn't reclaim
+    /// them.
+    pub(crate) fn live_overflow_blocks(&self) -> Result<Vec<u32>, FsError> {
+        let mut out = Vec::new();
+        let data_start = self.data_region_start();
+        let total = self.total_blocks();
+        for (_, block) in self.collect_file_table_chain()? {
+            for entry in block.entries.iter() {
+                if !entry.is_live() {
+                    continue;
+                }
+                let mut cursor = entry.overflow_block;
+                let mut seen = 0_u32;
+                while cursor != crate::stego::integrity::NO_BLOCK {
+                    if cursor < data_start || cursor >= total || seen >= total {
+                        break;
+                    }
+                    out.push(cursor);
+                    seen += 1;
+                    let bytes = self.read_physical_block_raw(cursor)?;
+                    cursor = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Allocate a fresh file-table block, link it onto the tail, and return
+    /// its physical index. Called by `find_free_slot` when every existing
+    /// chain block is full.
+    pub(crate) fn extend_file_table(&mut self) -> Result<u32, FsError> {
+        let chain = self.collect_file_table_chain()?;
+        let (tail_index, mut tail_block) = chain
+            .into_iter()
+            .last()
+            .expect("chain always contains the root block");
+
+        let new_phys = self.alloc_metadata_physical()?;
+        let mut new_block = FileTableBlock::empty();
+        new_block.set_next_block(crate::stego::integrity::NO_BLOCK);
+        let new_bytes = new_block.encode()?;
+        self.write_physical_block_raw(new_phys, &new_bytes)?;
+
+        tail_block.set_next_block(new_phys);
+        let tail_bytes = tail_block.encode()?;
+        self.write_physical_block_raw(tail_index, &tail_bytes)?;
+        self.flush()?;
+
+        Ok(new_phys)
     }
 }
 

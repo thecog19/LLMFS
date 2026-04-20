@@ -1,7 +1,7 @@
 use llmdb::fs::file_table::{
-    ENTRIES_PER_BLOCK, ENTRY_BYTES, FLAG_DELETED, FileEntry, FileEntryType, FileTableBlock,
-    FileTableError, MAX_FILENAME_BYTES, MAX_INLINE_BLOCKS, OVERFLOW_ENTRIES_PER_BLOCK,
-    OverflowBlock,
+    CHAIN_SLOT, ENTRIES_PER_BLOCK, ENTRY_BYTES, FLAG_DELETED, FileEntry, FileEntryType,
+    FileTableBlock, FileTableError, MAX_FILENAME_BYTES, MAX_INLINE_BLOCKS,
+    OVERFLOW_ENTRIES_PER_BLOCK, OverflowBlock,
 };
 use llmdb::stego::integrity::NO_BLOCK;
 
@@ -279,4 +279,69 @@ fn overflow_block_rejects_too_many_entries() {
         result,
         Err(FileTableError::TooManyOverflowEntries { .. })
     ));
+}
+
+#[test]
+fn chain_entry_roundtrips_next_pointer() {
+    let entry = FileEntry::chain(0x0DEF_ACED);
+    assert!(entry.is_chain());
+    assert!(!entry.is_live());
+    assert!(!entry.is_free());
+    assert_eq!(entry.chain_next(), Some(0x0DEF_ACED));
+
+    let bytes = entry.encode().expect("encode chain");
+    // Type byte at 0x00 = 4 (Chain); next at 0x90..0x94.
+    assert_eq!(bytes[0x00], FileEntryType::Chain.as_u8());
+    assert_eq!(
+        u32::from_le_bytes(bytes[0x90..0x94].try_into().unwrap()),
+        0x0DEF_ACED
+    );
+    // Non-pointer, non-type bytes are zero.
+    for (i, b) in bytes.iter().enumerate() {
+        let is_type = i == 0;
+        let is_pointer = (0x90..0x94).contains(&i);
+        if is_type || is_pointer {
+            continue;
+        }
+        assert_eq!(*b, 0, "chain entry byte {i:#x} must be zero, got {b:#x}");
+    }
+
+    let decoded = FileEntry::decode(&bytes).expect("decode chain");
+    assert_eq!(decoded, entry);
+}
+
+#[test]
+fn chain_entry_with_no_block_reads_as_end_of_chain() {
+    let entry = FileEntry::chain(NO_BLOCK);
+    assert!(entry.is_chain());
+    assert_eq!(
+        entry.chain_next(),
+        None,
+        "NO_BLOCK sentinel means end-of-chain, not a literal block 0xFFFF_FFFF"
+    );
+}
+
+#[test]
+fn file_table_block_next_block_follows_slot_15() {
+    let mut block = FileTableBlock::empty();
+    assert_eq!(block.next_block(), None, "empty block: chain ends here");
+
+    block.set_next_block(42);
+    assert_eq!(block.next_block(), Some(42));
+    assert!(block.entries[CHAIN_SLOT].is_chain());
+
+    // Setting NO_BLOCK means "chain tail"; next_block returns None but the
+    // slot is still Chain (not Free), so find_free_slot will skip it.
+    block.set_next_block(NO_BLOCK);
+    assert_eq!(block.next_block(), None);
+    assert!(block.entries[CHAIN_SLOT].is_chain());
+}
+
+#[test]
+fn legacy_block_with_free_slot_15_reads_as_end_of_chain() {
+    // A pre-chaining fixture: every slot is Free. next_block must report
+    // "end of chain" without error, even though slot 15 isn't Chain yet.
+    let block = FileTableBlock::empty();
+    assert!(block.entries[CHAIN_SLOT].is_free());
+    assert_eq!(block.next_block(), None);
 }

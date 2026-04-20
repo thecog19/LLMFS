@@ -897,6 +897,25 @@ impl StegoDevice {
             })
     }
 
+    /// Allocate a physical block to be used as raw metadata storage (e.g.
+    /// a file-table chain block). Bypasses the redirection table — the
+    /// returned physical is addressed directly via `read_physical_block_raw`
+    /// / `write_physical_block_raw`, and is not tied to any logical. Caller
+    /// is responsible for writing the metadata payload and ensuring the
+    /// block is persisted before any external visibility.
+    pub(crate) fn alloc_metadata_physical(&mut self) -> Result<u32, DeviceError> {
+        self.pop_free_block().ok_or(DeviceError::OutOfSpace)
+    }
+
+    /// Return a metadata physical to the free list. Mirror of
+    /// `alloc_metadata_physical`; never used in V1 but kept so future
+    /// shrink paths (e.g. compacting the file-table chain) don't have to
+    /// leak out the raw `push_free_block` primitive.
+    #[allow(dead_code)]
+    pub(crate) fn free_metadata_physical(&mut self, physical: u32) -> Result<(), DeviceError> {
+        self.push_free_block(physical)
+    }
+
     /// Pop the head of the free list. The free list stores PHYSICAL block
     /// indices — reads/writes go directly to physical stego space, bypassing
     /// the redirection table.
@@ -988,6 +1007,19 @@ impl StegoDevice {
             if let Some(physical) = self.redirection.logical_to_physical(logical) {
                 in_use.insert(physical);
             }
+        }
+
+        // File-table chain blocks and live-entry overflow blocks are
+        // referenced through metadata, not the redirection table. Miss
+        // them and orphan scan reclaims them as "unreferenced data blocks"
+        // on every reopen. Best-effort: if the walk fails (corrupt chain)
+        // we fall back to the redirection-only set and accept the risk of
+        // over-reclamation rather than refusing to recover.
+        if let Ok(blocks) = self.file_table_data_region_blocks() {
+            in_use.extend(blocks);
+        }
+        if let Ok(blocks) = self.live_overflow_blocks() {
+            in_use.extend(blocks);
         }
 
         // Physicals currently on the free list.
