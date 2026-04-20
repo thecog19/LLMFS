@@ -135,6 +135,20 @@ impl StegoDevice {
         Ok(())
     }
 
+    /// Read the on-disk superblock without running recovery or toggling the
+    /// dirty flag. Used by diagnostics and by tests that want to observe the
+    /// generation counter / shadow intent fields before recovery clears them.
+    pub fn peek_superblock_on_disk(
+        path: impl AsRef<Path>,
+        mode: AllocationMode,
+    ) -> Result<Superblock, DeviceError> {
+        let device = Self::open_internal(path, mode, DeviceOptions::default())?;
+        let sb = device.load_superblock()?;
+        // Skip Drop's dirty-clear side effect: the device was never marked dirty.
+        std::mem::forget(device);
+        Ok(sb)
+    }
+
     pub fn superblock(&self) -> &Superblock {
         &self.superblock
     }
@@ -267,10 +281,18 @@ impl StegoDevice {
 
         let shadow = self.pop_free_block().ok_or(DeviceError::OutOfSpace)?;
 
-        // Phase 1: shadow data written + free-list pop durable. CRC for
-        // `block_index` NOT updated — the integrity table still reflects the
-        // old data at `old_physical`. If we crash here, orphan-scan reclaims
-        // the shadow and the old block remains authoritative.
+        // Record the in-flight shadow intent in-memory so the phase-1
+        // persist carries it to disk. Recovery consults this to
+        // discriminate "crash before flip" from "crash after flip" by
+        // intent (DESIGN-NEW §13), rather than relying on reachability
+        // alone.
+        self.superblock.fields.shadow_block = shadow;
+        self.superblock.fields.shadow_target = block_index;
+
+        // Phase 1: shadow data written + free-list pop + intent durable. CRC
+        // for `block_index` NOT updated — the integrity table still reflects
+        // the old data at `old_physical`. If we crash here, recovery sees
+        // intent=(S, L) and redirection[L] != S → frees S, keeps old.
         self.write_physical_block_raw(shadow, data)?;
         // persist_superblock calls flush internally; no second msync needed.
         self.persist_superblock()?;
@@ -286,7 +308,12 @@ impl StegoDevice {
         // Phase 2: flip redirection + update CRC atomically. The flush
         // barrier here is the *required* ordering guarantee — readers
         // must not see the new redirection mapping until the shadow
-        // bytes and CRC it points at are durable.
+        // bytes and CRC it points at are durable. Integrity is indexed by
+        // logical (see `update_block_crc_for_data`), so §13's literal
+        // sequence where integrity lands before redirection would create
+        // a window in which reads pass redirection[L]=O but fail
+        // integrity[L]=CRC(new). Collapsing both under one flush closes
+        // that window.
         self.redirection.set_mapping(block_index, shadow);
         self.update_block_crc(block_index, data)?;
         self.persist_redirection_block_for(block_index)?;
@@ -300,12 +327,19 @@ impl StegoDevice {
             return Ok(());
         }
 
-        // Phase 3: reclaim the old physical. No flush here — if we crash
-        // before the next flush, recovery's orphan scan picks up
-        // old_physical as "in data region, unreferenced, not on free list"
-        // and reclaims it. The next persist_superblock call (either from
-        // another write or from close) batches the durability.
+        // Phase 3: reclaim the old physical + clear intent. No superblock
+        // persist here — a crash before the next persist lands in one of
+        // two states:
+        //   - On-disk intent still set + redirection[L]=S (flushed in phase 2)
+        //     → recovery concludes the write committed, frees O (via orphan
+        //     scan or by virtue of its absence from the free list), clears
+        //     intent. Correct.
+        //   - On-disk intent already cleared (because some other persist
+        //     happened between phase 3 and the crash) + redirection[L]=S
+        //     → recovery sees clean state, orphan scan reclaims O. Correct.
         self.push_free_block(old_physical)?;
+        self.superblock.fields.shadow_block = NO_BLOCK;
+        self.superblock.fields.shadow_target = NO_BLOCK;
 
         Ok(())
     }
@@ -483,6 +517,9 @@ impl StegoDevice {
                 file_table_length: 0,
                 flags: 0,
                 quant_profile: 0,
+                generation: 0,
+                shadow_block: NO_BLOCK,
+                shadow_target: NO_BLOCK,
             }),
             redirection: RedirectionTable::empty(total_blocks),
             reserved_logicals: HashSet::new(),
@@ -525,6 +562,13 @@ impl StegoDevice {
                 0x00
             },
             quant_profile: encode_quant_profile(&quant_types),
+            // Format() is the first persist of the freshly-initialized
+            // superblock. persist_superblock will bump this to 1 before
+            // writing. shadow_{block,target} remain NO_BLOCK — no write
+            // is in flight on a fresh device.
+            generation: 0,
+            shadow_block: NO_BLOCK,
+            shadow_target: NO_BLOCK,
         });
 
         self.redirection = RedirectionTable::empty(total_blocks);
@@ -603,8 +647,16 @@ impl StegoDevice {
     }
 
     fn persist_superblock(&mut self) -> Result<(), DeviceError> {
+        // Every on-disk commit is a new generation. This is the one place
+        // the counter bumps, so every persisted superblock is strictly
+        // ordered with respect to prior persists — V2 metadata ordering
+        // and the `ask` cache-invalidation signal both rely on this.
+        self.superblock.fields.generation = self.superblock.fields.generation.saturating_add(1);
         let bytes = self.superblock.encode();
-        self.log_verbose("persisting superblock");
+        self.log_verbose(format!(
+            "persisting superblock (gen={})",
+            self.superblock.fields.generation
+        ));
         self.write_physical_block_raw(SUPERBLOCK_BLOCK, &bytes)?;
         self.flush()?;
         Ok(())
@@ -901,6 +953,32 @@ impl StegoDevice {
         let data_start = self.data_region_start();
         let total = self.total_blocks();
 
+        // Intent-based discrimination (DESIGN-NEW §13). The write path sets
+        // shadow_block/shadow_target in phase 1 and clears them at the end
+        // of phase 3. If they're non-NO_BLOCK on reopen, a write was in
+        // flight. Consulting the intent tells us, by design, which side of
+        // the redirection flip the crash landed on:
+        //   redirection[target] == shadow → phase 2 committed; old is orphaned
+        //   redirection[target] != shadow → phase 2 didn't land; shadow is orphaned
+        // Either way, the concrete block to reclaim is still found by the
+        // orphan scan below — intent is the diagnostic signal, not an
+        // independent reclamation path. V2/V3 will layer intent-driven
+        // actions on top of this hook.
+        let shadow_block = self.superblock.fields.shadow_block;
+        let shadow_target = self.superblock.fields.shadow_target;
+        if shadow_block != NO_BLOCK {
+            let mapped = self.redirection.logical_to_physical(shadow_target);
+            let phase = if mapped == Some(shadow_block) {
+                "committed (redirection flipped before crash)"
+            } else {
+                "aborted (redirection unchanged before crash)"
+            };
+            self.log_verbose(format!(
+                "recovery: intent=(shadow={}, target={}); redirection[target]={:?}; {}",
+                shadow_block, shadow_target, mapped, phase
+            ));
+        }
+
         // In-use physicals = those that some logical's redirection points to.
         // With the split namespace, "logical L is alive" and "physical X is
         // in use" are independent — we only care about physicals here for
@@ -945,9 +1023,14 @@ impl StegoDevice {
             for orphan in orphans {
                 self.push_free_block(orphan)?;
             }
-            self.persist_superblock()?;
-            self.flush()?;
         }
+
+        // Clear the intent fields — whatever was in flight is resolved.
+        // Clearing is unconditional so a stale intent from a prior session
+        // that somehow survived (e.g., orphan scan already handled it)
+        // doesn't linger on disk.
+        self.superblock.fields.shadow_block = NO_BLOCK;
+        self.superblock.fields.shadow_target = NO_BLOCK;
 
         self.superblock.set_dirty(false);
         self.persist_superblock()?;

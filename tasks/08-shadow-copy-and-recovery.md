@@ -43,13 +43,20 @@ Acceptance criteria:
 Deviations from spec (intentional):
 
 - The write sequence uses 2 flushes, not 3 as in §13. Phase 1 flushes the
-  shadow data + free-list pop; phase 2 atomically flushes redirection flip
-  AND integrity CRC update; phase 3 flushes the old-physical free-list push.
-  Collapsing CRC and redirection into one flush avoids a window in the spec's
-  sequence where the integrity table describes the shadow block but the
-  redirection still points at the old — any read of the logical in that
-  window would report a CRC mismatch against its own (old) data. The phase-2
-  mmap writes land together, so a crash mid-phase-2 leaves neither durable.
+  shadow data + free-list pop + shadow intent (superblock); phase 2
+  atomically flushes redirection flip AND integrity CRC update; phase 3
+  pushes the old physical to the free list and clears the intent in memory,
+  relying on the next superblock persist to make the clear durable. Why
+  collapse phase 2: integrity is indexed by *logical* block, not physical
+  (see `update_block_crc_for_data` in `src/stego/device.rs`). §13's literal
+  sequence — integrity update then redirection flip in separate flushes —
+  opens a window where `integrity[L] = CRC(new)` while `redirection[L] = O`,
+  so a reader follows redirection to the old physical and fails the
+  logical's CRC check against its own (old) data. The phase-2 mmap writes
+  land under one flush, closing the window. V3's dirty-cache model dissolves
+  the constraint (all writes live inside an atomic cache transaction);
+  collapsing phase 2 is a V1-specific adaptation that can be un-collapsed
+  once V3 lands.
 
 - `write_block` is direct for the first write after `alloc_block` (the block
   has no live data to preserve) and shadow-copy for overwrites. This matches
@@ -64,9 +71,10 @@ Deviations from spec (intentional):
   slot is held as "wasted" (not on free list, not a referenced data location)
   until `free_block(L)` reclaims both the slot and the shadow physical.
 
-- The superblock still lacks the `generation`, `shadow_block`, and
-  `shadow_target` fields that §5/§13 specify. Recovery falls back to orphan
-  scan + dirty-flag detection, which is functionally sufficient for V1 but
-  cannot distinguish "crash before redirection flip" from "crash after flip"
-  by intent — only by reachability. Adding the fields is tracked as a
-  Task 05 amendment, not in Task 08's scope.
+- Recovery uses orphan scan as its reclamation engine, with the superblock
+  intent fields (`shadow_block`, `shadow_target`) as the diagnostic signal
+  rather than a separate reclamation path. §13 says "determine the old
+  block by scanning" — the intent lets recovery *name* which side of the
+  flip the crash landed on (aborted vs. committed), but the concrete block
+  to reclaim is still found by scanning. This matches §13's spec; it is
+  not a deviation.

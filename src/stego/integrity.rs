@@ -9,8 +9,8 @@ pub const SUPERBLOCK_VERSION: u8 = 1;
 pub const NO_BLOCK: u32 = u32::MAX;
 pub const ENTRIES_PER_INTEGRITY_BLOCK: usize = 1020;
 
-const SUPERBLOCK_CRC_RANGE_END: usize = 0x28;
-const SUPERBLOCK_CRC_OFFSET: usize = 0x28;
+const SUPERBLOCK_CRC_RANGE_END: usize = 0x38;
+const SUPERBLOCK_CRC_OFFSET: usize = 0x38;
 const FLAG_LOBOTOMY: u8 = 0x01;
 const FLAG_DIRTY: u8 = 0x02;
 
@@ -30,21 +30,24 @@ impl Default for IntegrityBootstrap {
 /// Superblock layout per DESIGN-NEW §5.
 ///
 /// ```text
-/// 0x00  5   magic "LLMDB"
-/// 0x05  1   version (1)
-/// 0x06  2   block size (4096)
-/// 0x08  4   total blocks
-/// 0x0C  4   free list head
-/// 0x10  4   integrity chain head
-/// 0x14  4   redirection table start
-/// 0x18  4   redirection table length
-/// 0x1C  4   file table start
-/// 0x20  4   file table length
-/// 0x24  1   flags (bit 0 lobotomy, bit 1 dirty)
-/// 0x25  1   quant profile
-/// 0x26  2   reserved
-/// 0x28  4   CRC32 of bytes 0x00–0x27
-/// 0x2C  4052 reserved / padding
+/// 0x00  5     magic "LLMDB"
+/// 0x05  1     version (1)
+/// 0x06  2     block size (4096)
+/// 0x08  4     total blocks
+/// 0x0C  4     free list head
+/// 0x10  4     integrity chain head
+/// 0x14  4     redirection table start
+/// 0x18  4     redirection table length
+/// 0x1C  4     file table start
+/// 0x20  4     file table length
+/// 0x24  1     flags (bit 0 lobotomy, bit 1 dirty)
+/// 0x25  1     quant profile
+/// 0x26  2     reserved
+/// 0x28  8     generation counter (monotonic, bumped on every superblock persist)
+/// 0x30  4     shadow_block (NO_BLOCK = no write in flight)
+/// 0x34  4     shadow_target (logical block being replaced; NO_BLOCK if shadow_block is NO_BLOCK)
+/// 0x38  4     CRC32 of bytes 0x00..0x38
+/// 0x3C  4036  reserved / padding
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SuperblockFields {
@@ -57,6 +60,9 @@ pub struct SuperblockFields {
     pub file_table_length: u32,
     pub flags: u8,
     pub quant_profile: u8,
+    pub generation: u64,
+    pub shadow_block: u32,
+    pub shadow_target: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,6 +105,10 @@ impl Superblock {
         bytes[0x20..0x24].copy_from_slice(&self.fields.file_table_length.to_le_bytes());
         bytes[0x24] = self.fields.flags;
         bytes[0x25] = self.fields.quant_profile;
+        // 0x26..0x28 reserved (zeroed above)
+        bytes[0x28..0x30].copy_from_slice(&self.fields.generation.to_le_bytes());
+        bytes[0x30..0x34].copy_from_slice(&self.fields.shadow_block.to_le_bytes());
+        bytes[0x34..0x38].copy_from_slice(&self.fields.shadow_target.to_le_bytes());
 
         let crc = superblock_crc32(&bytes);
         bytes[SUPERBLOCK_CRC_OFFSET..SUPERBLOCK_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
@@ -154,6 +164,9 @@ impl Superblock {
                 file_table_length: u32::from_le_bytes(bytes[0x20..0x24].try_into().unwrap()),
                 flags: bytes[0x24],
                 quant_profile: bytes[0x25],
+                generation: u64::from_le_bytes(bytes[0x28..0x30].try_into().unwrap()),
+                shadow_block: u32::from_le_bytes(bytes[0x30..0x34].try_into().unwrap()),
+                shadow_target: u32::from_le_bytes(bytes[0x34..0x38].try_into().unwrap()),
             },
         })
     }

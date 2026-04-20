@@ -42,6 +42,10 @@ pub struct DeviceStatus {
     pub quant_profile: Vec<GgufQuantType>,
     pub lobotomy: bool,
     pub dirty_on_open: bool,
+    /// Monotonic counter bumped on every superblock persist. Exposed so
+    /// external tools (notably the `ask` cache) can detect modifications
+    /// to the device between sessions without diffing the whole state.
+    pub generation: u64,
     pub estimated_perplexity_impact: PerplexityImpact,
 }
 
@@ -141,6 +145,7 @@ pub fn gather(device: &StegoDevice) -> Result<DeviceStatus, FsError> {
         quant_profile: decode_quant_profile(sb.fields.quant_profile),
         lobotomy: sb.is_lobotomy(),
         dirty_on_open: device.was_dirty_on_open(),
+        generation: sb.fields.generation,
         estimated_perplexity_impact,
     })
 }
@@ -195,6 +200,7 @@ pub fn format_human(status: &DeviceStatus) -> String {
             "no"
         }
     );
+    let _ = writeln!(out, "generation:  {}", status.generation);
     out.push('\n');
     let _ = writeln!(out, "per-tier breakdown:");
     for (tier, usage) in &status.tier_utilization {

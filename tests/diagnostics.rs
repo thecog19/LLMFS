@@ -106,6 +106,22 @@ fn per_tier_breakdown_includes_tier1_for_ffn_fixture() {
 }
 
 #[test]
+fn generation_counter_advances_across_writes() {
+    let (_fx, mut device) = open_device("diag_generation.gguf", 12);
+    let baseline = gather(&device).expect("gather baseline").generation;
+
+    device
+        .store_bytes(b"hello", "greetings.txt", 0o644)
+        .expect("store");
+
+    let after = gather(&device).expect("gather after").generation;
+    assert!(
+        after > baseline,
+        "generation must advance after a store (baseline={baseline}, after={after})"
+    );
+}
+
+#[test]
 fn format_human_output_names_every_field() {
     let (_fx, mut device) = open_device("diag_format.gguf", 12);
     device
@@ -124,6 +140,7 @@ fn format_human_output_names_every_field() {
         "quant:",
         "lobotomy:",
         "dirty:",
+        "generation:",
         "per-tier breakdown:",
         "est. perplexity impact:",
     ] {
