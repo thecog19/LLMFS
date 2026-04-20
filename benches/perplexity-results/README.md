@@ -57,8 +57,16 @@ result is not SmolLM-specific.
 collapse on `llmdb init` alone. Pristine 18.12 → post-init (0% user
 data) 34,167,762. That's ~1.9 million× degradation before any stego
 payload lands — every subsequent row in the 10–95% range sits
-between 30M and 73M. The 4-bit theft from each int8 weight
-randomizes magnitudes; the model stops being a model.
+between 30M and 73M.
+
+**Q8_0, Qwen2.5-0.5B** (`qwen2.5-0.5b-instruct-q8_0.csv`): same
+pattern, different magnitude. Pristine 13.50 → post-init 5,628,989
+(~417K× degradation), 10–95% range 2.6M–4.3M. The collapse
+generalizes across architectures and scales; the larger model
+collapses less catastrophically in absolute PPL terms but is still
+degenerate by every operational definition. The 4-bit theft from
+each int8 weight randomizes magnitudes; the model stops being a
+model regardless of parameter count.
 
 All results match the empirical findings already captured in
 `DESIGN-NEW.MD §2` and `project_v1_stego_destroys_inference`. These
