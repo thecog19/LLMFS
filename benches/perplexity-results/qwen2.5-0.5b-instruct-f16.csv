@@ -1,0 +1,8 @@
+model,level_requested_pct,utilization_actual_pct,used_blocks,total_blocks,ppl,ppl_stderr,chunks,ctx
+qwen2.5-0.5b-instruct-f16.gguf,pristine,0.00,0,0,14.0075,0.35207,50,512
+qwen2.5-0.5b-instruct-f16.gguf,0,0.20,88,43686,14.0240,0.35276,50,512
+qwen2.5-0.5b-instruct-f16.gguf,10,10.14,4430,43686,14.0194,0.35087,50,512
+qwen2.5-0.5b-instruct-f16.gguf,25,25.15,10989,43686,14.0160,0.35096,50,512
+qwen2.5-0.5b-instruct-f16.gguf,50,50.18,21922,43686,14.0371,0.35208,50,512
+qwen2.5-0.5b-instruct-f16.gguf,75,75.20,32854,43686,14.0631,0.35285,50,512
+qwen2.5-0.5b-instruct-f16.gguf,95,95.23,41600,43686,14.0270,0.35201,50,512

@@ -42,19 +42,25 @@ model,level_requested_pct,utilization_actual_pct,used_blocks,total_blocks,ppl,pp
 
 ## Current headline findings
 
-**F16** (`smollm2-135m-f16.csv`): perplexity flat across the full
-sweep. Pristine 18.80 → 95%-full 18.82, every step inside ±0.49
-stderr. Writing 50 MB into the low 12 mantissa bits of an F16 cover
-is invisible to wikitext-2 perplexity.
+**F16, SmolLM2-135M** (`smollm2-135m-f16.csv`): perplexity flat
+across the full sweep. Pristine 18.80 → 95%-full 18.82, every step
+inside ±0.49 stderr. Writing 50 MB into the low 12 mantissa bits of
+an F16 cover is invisible to wikitext-2 perplexity.
 
-**Q8_0** (`smollm2-135m-q8_0.csv`): catastrophic collapse on `llmdb
-init` alone. Pristine 18.12 → post-init (0% user data) 34,167,762.
-That's ~1.9 million× degradation before any stego payload lands —
-every subsequent row in the 10–95% range sits between 30M and 73M.
-The 4-bit theft from each int8 weight randomizes magnitudes; the
-model stops being a model.
+**F16, Qwen2.5-0.5B** (`qwen2.5-0.5b-instruct-f16.csv`): same story,
+different scale. Pristine 14.01 → 95%-full 14.03, every step inside
+±0.35 stderr. A 4× larger model carries 175 MB of stego payload (vs
+SmolLM2-135M's 50 MB) with no measurable perplexity impact. The F16
+result is not SmolLM-specific.
 
-Both results match the empirical findings already captured in
+**Q8_0, SmolLM2-135M** (`smollm2-135m-q8_0.csv`): catastrophic
+collapse on `llmdb init` alone. Pristine 18.12 → post-init (0% user
+data) 34,167,762. That's ~1.9 million× degradation before any stego
+payload lands — every subsequent row in the 10–95% range sits
+between 30M and 73M. The 4-bit theft from each int8 weight
+randomizes magnitudes; the model stops being a model.
+
+All results match the empirical findings already captured in
 `DESIGN-NEW.MD §2` and `project_v1_stego_destroys_inference`. These
 CSVs are the first quantitative evidence, reproducible per-commit.
 

@@ -17,6 +17,7 @@ copies the source before touching it.
 |------|--------|
 | `smollm2-135m-f16.gguf` | [bartowski/SmolLM2-135M-Instruct-GGUF](https://huggingface.co/bartowski/SmolLM2-135M-Instruct-GGUF) — F16 variant |
 | `smollm2-135m-q8_0.gguf` | [bartowski/SmolLM2-135M-Instruct-GGUF](https://huggingface.co/bartowski/SmolLM2-135M-Instruct-GGUF) — Q8_0 variant |
+| `qwen2.5-0.5b-instruct-f16.gguf` | [bartowski/Qwen2.5-0.5B-Instruct-GGUF](https://huggingface.co/bartowski/Qwen2.5-0.5B-Instruct-GGUF) — F16 variant |
 
 The GGUFs themselves are gitignored (they're >100 MB). Only this
 README and `MANIFEST.sha256` live in the repo. Redownload with:
@@ -26,6 +27,8 @@ curl -sL -o models/pristine/smollm2-135m-f16.gguf \
     "https://huggingface.co/bartowski/SmolLM2-135M-Instruct-GGUF/resolve/main/SmolLM2-135M-Instruct-F16.gguf"
 curl -sL -o models/pristine/smollm2-135m-q8_0.gguf \
     "https://huggingface.co/bartowski/SmolLM2-135M-Instruct-GGUF/resolve/main/SmolLM2-135M-Instruct-Q8_0.gguf"
+curl -sL -o models/pristine/qwen2.5-0.5b-instruct-f16.gguf \
+    "https://huggingface.co/bartowski/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/Qwen2.5-0.5B-Instruct-f16.gguf"
 chmod 0444 models/pristine/*.gguf
 ```
 
