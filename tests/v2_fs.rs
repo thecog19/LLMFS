@@ -24,7 +24,11 @@
 use llmdb::gguf::quant::GgufQuantType;
 use llmdb::stego::planner::TensorTier;
 use llmdb::stego::tensor_map::{TensorMap, TensorSlot};
+use llmdb::v2::anchor;
+use llmdb::v2::chunk::{read_chunk, write_chunk};
 use llmdb::v2::fs::{Filesystem, FsError};
+use llmdb::v2::inode::{INODE_BYTES, Inode};
+use llmdb::v2::super_root::{SUPER_ROOT_BYTES, SuperRoot};
 
 fn f32_to_f16_bits(value: f32) -> u16 {
     let bits = value.to_bits();
@@ -181,6 +185,58 @@ fn mount_fails_on_cover_with_no_anchor() {
     match Filesystem::mount_with_chunk_size(cover, map, 64) {
         Err(FsError::Anchor(_)) => {}
         other => panic!("expected Anchor error on unintialised cover, got {other:?}"),
+    }
+}
+
+#[test]
+fn init_rejects_zero_chunk_size() {
+    let (cover, map) = make_cover(20_000);
+    match Filesystem::init_with_chunk_size(cover, map, 0) {
+        Err(FsError::InvalidChunkSize { chunk_size: 0 }) => {}
+        other => panic!("expected InvalidChunkSize(0), got {other:?}"),
+    }
+}
+
+#[test]
+fn mount_rejects_zero_chunk_size() {
+    let (cover, map) = make_cover(20_000);
+    let fs = Filesystem::init_with_chunk_size(cover, map.clone(), 64).expect("init");
+    let cover_after = fs.unmount();
+
+    match Filesystem::mount_with_chunk_size(cover_after, map, 0) {
+        Err(FsError::InvalidChunkSize { chunk_size: 0 }) => {}
+        other => panic!("expected InvalidChunkSize(0), got {other:?}"),
+    }
+}
+
+#[test]
+fn mount_fails_cleanly_on_inode_pointer_with_invalid_slot() {
+    let (cover, map) = make_cover(20_000);
+    let mut fs = Filesystem::init_with_chunk_size(cover, map.clone(), 64).expect("init");
+    fs.write(b"hello").expect("write");
+    let mut cover_after = fs.unmount();
+
+    let anchor_outcome = anchor::read_anchor(&cover_after, &map).expect("read anchor");
+    let super_root_ptr = anchor_outcome.active.super_root;
+
+    let mut super_root_bytes = [0u8; SUPER_ROOT_BYTES];
+    read_chunk(&cover_after, &map, super_root_ptr, 0, &mut super_root_bytes)
+        .expect("read super-root");
+    let super_root = SuperRoot::decode(&super_root_bytes).expect("decode super-root");
+
+    let root_inode_ptr = super_root.root_dir_inode;
+    let mut inode_bytes = [0u8; INODE_BYTES];
+    read_chunk(&cover_after, &map, root_inode_ptr, 0, &mut inode_bytes).expect("read inode");
+    let mut inode = Inode::decode(&inode_bytes).expect("decode inode");
+    inode.direct[0].slot = u16::MAX;
+    write_chunk(&mut cover_after, &map, root_inode_ptr, 0, &inode.encode()).expect("write inode");
+
+    match Filesystem::mount_with_chunk_size(cover_after, map, 64) {
+        Err(FsError::PointerSlotOutOfRange {
+            slot: u16::MAX,
+            slot_count: 1,
+        }) => {}
+        other => panic!("expected PointerSlotOutOfRange, got {other:?}"),
     }
 }
 

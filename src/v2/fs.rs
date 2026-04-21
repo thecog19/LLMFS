@@ -97,6 +97,9 @@ pub enum FsError {
     #[error("out of space: could not allocate {requested_bits} bits")]
     OutOfSpace { requested_bits: u32 },
 
+    #[error("invalid data chunk size {chunk_size}; must be greater than zero")]
+    InvalidChunkSize { chunk_size: u32 },
+
     #[error(
         "file of {bytes} bytes needs more than {max_chunks} direct chunks at chunk size {chunk_size}; indirect pointers land in a later step"
     )]
@@ -108,6 +111,20 @@ pub enum FsError {
 
     #[error("super-root generation {super_root} disagrees with anchor generation {anchor}")]
     GenerationMismatch { anchor: u64, super_root: u64 },
+
+    #[error("pointer references slot {slot} but map has only {slot_count} slots")]
+    PointerSlotOutOfRange { slot: u16, slot_count: usize },
+
+    #[error("pointer targets slot {slot}, which has no stealable bits")]
+    PointerTargetsNonStealableSlot { slot: u16 },
+
+    #[error("pointer range [{start_weight}, {end_weight}) lies outside slot {slot} with {weight_count} weights")]
+    PointerOutOfBounds {
+        slot: u16,
+        start_weight: u32,
+        end_weight: u64,
+        weight_count: u64,
+    },
 }
 
 impl Filesystem {
@@ -125,6 +142,7 @@ impl Filesystem {
         map: TensorMap,
         data_chunk_size_bytes: u32,
     ) -> Result<Self, FsError> {
+        validate_chunk_size(data_chunk_size_bytes)?;
         let ceiling = CeilingSummary::build(&cover, &map);
         let mut allocator = Allocator::new_for_map(&map, ceiling)?;
 
@@ -174,6 +192,7 @@ impl Filesystem {
         map: TensorMap,
         data_chunk_size_bytes: u32,
     ) -> Result<Self, FsError> {
+        validate_chunk_size(data_chunk_size_bytes)?;
         // Compute the anchor placement once. The cover's ceiling
         // magnitudes are the same whether we're inside read_anchor or
         // new_for_map, so this single scan covers both.
@@ -427,6 +446,15 @@ fn unique_weights(placement: &MetadataPlacement) -> Vec<(u16, u32)> {
     out
 }
 
+fn validate_chunk_size(data_chunk_size_bytes: u32) -> Result<(), FsError> {
+    if data_chunk_size_bytes == 0 {
+        return Err(FsError::InvalidChunkSize {
+            chunk_size: data_chunk_size_bytes,
+        });
+    }
+    Ok(())
+}
+
 /// Reserve every weight covered by `ptr` in the allocator.
 fn reserve_pointer(
     allocator: &mut Allocator,
@@ -436,9 +464,27 @@ fn reserve_pointer(
     if ptr.is_null() {
         return Ok(());
     }
-    let slot = &map.slots[ptr.slot as usize];
+    let slot = map
+        .slots
+        .get(ptr.slot as usize)
+        .ok_or(FsError::PointerSlotOutOfRange {
+            slot: ptr.slot,
+            slot_count: map.slots.len(),
+        })?;
     let bpw = slot.stealable_bits_per_weight as u32;
+    if bpw == 0 {
+        return Err(FsError::PointerTargetsNonStealableSlot { slot: ptr.slot });
+    }
     let weights = ptr.length_in_bits.div_ceil(bpw);
+    let end_weight = u64::from(ptr.start_weight) + u64::from(weights);
+    if end_weight > slot.weight_count {
+        return Err(FsError::PointerOutOfBounds {
+            slot: ptr.slot,
+            start_weight: ptr.start_weight,
+            end_weight,
+            weight_count: slot.weight_count,
+        });
+    }
     let iter = (0..weights).map(|i| (ptr.slot, ptr.start_weight + i));
     allocator.reserve_weights(iter)?;
     Ok(())
