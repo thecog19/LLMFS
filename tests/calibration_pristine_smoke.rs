@@ -65,9 +65,10 @@ fn ranks_pristine_smollm2_f16_lowest_thousand() {
     let largest_in_top_n = last;
     println!("lowest 1000 |w|: smallest={smallest:.6}, 1000th={largest_in_top_n:.6}",);
 
-    // For a trained F16 model on wikitext-scale tasks, we expect lots of
-    // near-zero weights — the smallest of the bottom 1000 should be
-    // genuinely tiny (pretty much zero-ish) and the 1000th still small.
+    // For a trained F16 model on wikitext-scale tasks, we expect lots
+    // of near-zero weights — the smallest of the bottom 1000 should
+    // be genuinely tiny (pretty much zero-ish) and the 1000th still
+    // small.
     assert!(
         smallest < 1e-3,
         "expected near-zero smallest weight, got {smallest}"
@@ -75,5 +76,32 @@ fn ranks_pristine_smollm2_f16_lowest_thousand() {
     assert!(
         largest_in_top_n < 1.0,
         "expected the bottom 1000 to all be < 1.0, got {largest_in_top_n}"
+    );
+
+    // Sanity check that we're actually reading real tensor data, not
+    // garbage zeros from a wrong-offset read. A previous bug had the
+    // magnitude estimator using TensorSlot::data_offset as if it were
+    // absolute (it's relative); the result was that all 1000 returned
+    // weights had magnitude 0.0 because the reader was hitting
+    // zero-padded GGUF metadata bytes. Strict asymmetric distribution
+    // (some zeros, many tiny-but-nonzero) is the real signal.
+    let nonzero_count = ranked
+        .iter()
+        .map(|r| {
+            let slot = &map.slots[r.slot_index as usize];
+            read_weight_abs(&mmap[..], slot, r.weight_index)
+        })
+        .filter(|m| *m > 0.0)
+        .count();
+    assert!(
+        nonzero_count > 0,
+        "all 1000 lowest-magnitude weights are exactly 0.0 — \
+         suspect a wrong-offset bug in the reader (real trained \
+         models have a mix of exact-zero and near-zero weights)"
+    );
+    assert!(
+        largest_in_top_n > 0.0,
+        "1000th smallest weight is exactly 0.0 — \
+         suspect a wrong-offset bug, see the comment above"
     );
 }
