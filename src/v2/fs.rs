@@ -456,10 +456,10 @@ impl Filesystem {
             return Err(FsError::PathCannotBeRoot);
         }
         let (parent_dir, leaf_name) = self.read_parent_directory(&components)?;
-        if let Some(existing) = parent_dir.find(leaf_name) {
-            if existing.kind == EntryKind::Directory {
-                return Err(FsError::IsADirectory(leaf_name.to_owned()));
-            }
+        if let Some(existing) = parent_dir.find(leaf_name)
+            && existing.kind == EntryKind::Directory
+        {
+            return Err(FsError::IsADirectory(leaf_name.to_owned()));
         }
 
         // Path errors must not perturb allocator state or cover bytes,
