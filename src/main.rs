@@ -111,6 +111,27 @@ enum Command {
         #[arg(long, action = ArgAction::SetTrue)]
         yes: bool,
     },
+
+    /// V2: initialise a fresh inode + CoW filesystem on the cover
+    /// (per DESIGN-NEW §15). Writes the anchor, an empty root
+    /// directory, and an empty dirty bitmap, then writes the cover
+    /// bytes back. Global `--lobotomy` is ignored — V2 placement is
+    /// driven by ceiling magnitude over every eligible weight.
+    V2Init {
+        model: PathBuf,
+    },
+
+    /// V2: mount a V2-initialised cover as a FUSE filesystem. Loads
+    /// the cover into memory, serves kernel ops through
+    /// `v2::Filesystem`, and writes the cover back on unmount.
+    V2Mount {
+        model: PathBuf,
+        mount_point: PathBuf,
+        /// Allow users other than the mounter to access the mount.
+        /// Requires `user_allow_other` in /etc/fuse.conf.
+        #[arg(long, action = ArgAction::SetTrue)]
+        allow_other: bool,
+    },
 }
 
 fn main() {
@@ -172,6 +193,12 @@ fn dispatch(cmd: Command, mode: AllocationMode, options: DeviceOptions) -> Resul
         Command::Unmount { mount_point } => cmd_unmount(&mount_point),
         Command::Ask { model } => cmd_ask(&model, mode, options),
         Command::Dump { model } => cmd_dump(&model, mode, options),
+        Command::V2Init { model } => cmd_v2_init(&model),
+        Command::V2Mount {
+            model,
+            mount_point,
+            allow_other,
+        } => cmd_v2_mount(&model, &mount_point, allow_other),
     }
 }
 
@@ -578,6 +605,127 @@ fn cmd_wipe(
     device.wipe().map_err(dev_err)?;
     println!("wiped {} (device re-initialized, 0 files)", model.display());
     device.close().map_err(dev_err)?;
+    Ok(())
+}
+
+// ─── V2 (DESIGN-NEW §15) ──────────────────────────────────────────────────
+
+fn cmd_v2_init(model: &Path) -> Result<(), CliError> {
+    use llmdb::gguf::parser::parse_path as parse_gguf;
+    use llmdb::stego::planner::build_allocation_plan;
+    use llmdb::stego::tensor_map::TensorMap;
+    use llmdb::v2::fs::Filesystem as V2Filesystem;
+
+    let parsed = parse_gguf(model)
+        .map_err(|e| CliError::user(format!("parse {}: {e}", model.display())))?;
+    let plan = build_allocation_plan(&parsed.tensors, AllocationMode::Standard);
+    let map =
+        TensorMap::from_allocation_plan_with_base(&plan, parsed.tensor_data_offset as u64);
+
+    let cover = std::fs::read(model).map_err(|e| {
+        CliError::internal(format!("reading {}: {e}", model.display()))
+    })?;
+
+    let total_slots = map.slots.len();
+    let total_weights: u64 = map.slots.iter().map(|s| s.weight_count).sum();
+    let cover_len = cover.len();
+
+    let fs = V2Filesystem::init(cover, map)
+        .map_err(|e| CliError::user(format!("V2 init failed: {e}")))?;
+    let generation = fs.generation();
+    let cover_after = fs.unmount();
+
+    std::fs::write(model, &cover_after).map_err(|e| {
+        CliError::internal(format!("writing {}: {e}", model.display()))
+    })?;
+
+    println!("initialized (V2) {}", model.display());
+    println!("  cover size:       {cover_len} bytes");
+    println!("  eligible slots:   {total_slots}");
+    println!("  eligible weights: {total_weights}");
+    println!("  generation:       {generation}");
+    Ok(())
+}
+
+fn cmd_v2_mount(
+    model: &Path,
+    mount_point: &Path,
+    allow_other: bool,
+) -> Result<(), CliError> {
+    use llmdb::gguf::parser::parse_path as parse_gguf;
+    use llmdb::stego::planner::build_allocation_plan;
+    use llmdb::stego::tensor_map::TensorMap;
+    use llmdb::v2::fs::Filesystem as V2Filesystem;
+    use llmdb::v2::fuse::{LlmdbV2Fs, MountConfig, spawn_background};
+
+    std::fs::create_dir_all(mount_point).map_err(|e| {
+        CliError::internal(format!(
+            "could not create mount point {}: {e}",
+            mount_point.display()
+        ))
+    })?;
+
+    let parsed = parse_gguf(model)
+        .map_err(|e| CliError::user(format!("parse {}: {e}", model.display())))?;
+    let plan = build_allocation_plan(&parsed.tensors, AllocationMode::Standard);
+    let map =
+        TensorMap::from_allocation_plan_with_base(&plan, parsed.tensor_data_offset as u64);
+    let cover = std::fs::read(model).map_err(|e| {
+        CliError::internal(format!("reading {}: {e}", model.display()))
+    })?;
+
+    let fs = V2Filesystem::mount(cover, map).map_err(|e| {
+        CliError::user(format!("V2 mount (no anchor? run `llmdb v2-init` first): {e}"))
+    })?;
+    let driver = LlmdbV2Fs::new(fs);
+    let shared = driver.share();
+    let config = MountConfig { allow_other };
+
+    let session = spawn_background(driver, mount_point, &config)
+        .map_err(|e| CliError::internal(format!("fuse mount failed: {e}")))?;
+
+    println!("mounted V2 filesystem at {}", mount_point.display());
+    println!(
+        "stop with: llmdb unmount {}   (or Ctrl-C here)",
+        mount_point.display()
+    );
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let sc = Arc::clone(&shutdown);
+    ctrlc::set_handler(move || sc.store(true, Ordering::SeqCst))
+        .map_err(|e| CliError::internal(format!("ctrlc install failed: {e}")))?;
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            println!("unmounting {} …", mount_point.display());
+            drop(session);
+            break;
+        }
+        if session.guard.is_finished() {
+            println!("mount released externally");
+            drop(session);
+            break;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+
+    // Recover the filesystem, pull the cover bytes out, write them
+    // back to the GGUF. `Arc::try_unwrap` should succeed because the
+    // BackgroundSession's Arc was dropped with the driver above.
+    let mutex = std::sync::Arc::try_unwrap(shared).map_err(|_| {
+        CliError::internal(
+            "could not recover V2 filesystem after unmount — a background handle is still alive"
+                .to_owned(),
+        )
+    })?;
+    let fs = mutex.into_inner().map_err(|_| {
+        CliError::internal("V2 filesystem mutex poisoned (a FUSE op panicked)".to_owned())
+    })?;
+    let cover_after = fs.unmount();
+    std::fs::write(model, &cover_after).map_err(|e| {
+        CliError::internal(format!("writing {}: {e}", model.display()))
+    })?;
+    println!("wrote {} bytes back to {}", cover_after.len(), model.display());
+    println!("done");
     Ok(())
 }
 

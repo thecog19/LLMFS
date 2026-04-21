@@ -39,6 +39,7 @@
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use fuser::{
@@ -49,6 +50,12 @@ use fuser::{
 
 use crate::v2::directory::EntryKind;
 use crate::v2::fs::{Filesystem, FsError};
+
+/// Shared handle to the underlying [`Filesystem`]. Exposed so the
+/// CLI can [`share`](LlmdbV2Fs::share) a handle before consuming the
+/// driver in `spawn_background`, and recover the filesystem + cover
+/// bytes once the mount releases.
+pub type SharedFilesystem = Arc<Mutex<Filesystem>>;
 
 /// The kernel reserves inode 1 for the root directory.
 pub const ROOT_INO: u64 = 1;
@@ -156,7 +163,7 @@ struct WriteBuffer {
 // ==================================================================
 
 pub struct LlmdbV2Fs {
-    fs: Filesystem,
+    fs: SharedFilesystem,
     inodes: InodeMap,
     /// Per-inode pending write buffer. Offset writes stage here;
     /// `release` / `flush` / `fsync` commits via
@@ -168,8 +175,19 @@ pub struct LlmdbV2Fs {
 }
 
 impl LlmdbV2Fs {
-    /// Wrap a mounted V2 filesystem for FUSE dispatch.
+    /// Wrap a V2 [`Filesystem`] for FUSE dispatch. The filesystem is
+    /// moved behind an `Arc<Mutex<_>>` so the adapter can co-exist
+    /// with an out-of-band CLI handle — see [`Self::share`].
     pub fn new(fs: Filesystem) -> Self {
+        Self::with_shared(Arc::new(Mutex::new(fs)))
+    }
+
+    /// Build a driver around an already-shared filesystem handle.
+    /// Use this when a caller (e.g. the CLI) needs to hold onto a
+    /// handle that survives the FUSE session — after `drop(session)`
+    /// returns, the caller's `Arc` is the last reference and can
+    /// [`Arc::try_unwrap`] the filesystem back.
+    pub fn with_shared(fs: SharedFilesystem) -> Self {
         Self {
             fs,
             inodes: InodeMap::default(),
@@ -178,10 +196,20 @@ impl LlmdbV2Fs {
         }
     }
 
-    /// Consume the driver and return the underlying filesystem. Used
-    /// by the CLI on graceful shutdown and by tests.
+    /// Clone the underlying shared filesystem handle. See
+    /// [`Self::with_shared`].
+    pub fn share(&self) -> SharedFilesystem {
+        Arc::clone(&self.fs)
+    }
+
+    /// Consume the driver and return the underlying filesystem.
+    /// Panics if another `Arc` to the shared filesystem is alive —
+    /// callers using [`Self::share`] should drop their handle (or
+    /// the [`BackgroundSession`]) first.
     pub fn into_inner(self) -> Filesystem {
-        self.fs
+        let mutex = Arc::try_unwrap(self.fs)
+            .expect("into_inner called while another Arc<Mutex<Filesystem>> is alive");
+        mutex.into_inner().expect("filesystem mutex poisoned")
     }
 
     fn path_for_child(&self, parent: u64, name: &OsStr) -> Option<String> {
@@ -191,7 +219,7 @@ impl LlmdbV2Fs {
     }
 
     fn file_attr(&self, req: &Request<'_>, ino: u64, path: &str) -> Option<FileAttr> {
-        let inode = self.fs.inode_at(path).ok()?;
+        let inode = self.fs.lock().unwrap().inode_at(path).ok()?;
         let size = self
             .buffers
             .get(&ino)
@@ -249,7 +277,7 @@ impl LlmdbV2Fs {
         if let Some(buf) = self.buffers.get(&ino) {
             return Ok(buf.contents.clone());
         }
-        self.fs.read_file(path)
+        self.fs.lock().unwrap().read_file(path)
     }
 
     fn flush_buffer(&mut self, ino: u64) -> Result<(), FsError> {
@@ -261,7 +289,7 @@ impl LlmdbV2Fs {
         }
         let path = buf.path.clone();
         let contents = buf.contents.clone();
-        self.fs.create_file(&path, &contents)?;
+        self.fs.lock().unwrap().create_file(&path, &contents)?;
         if let Some(buf) = self.buffers.get_mut(&ino) {
             buf.dirty = false;
         }
@@ -298,7 +326,7 @@ impl FuserFilesystem for LlmdbV2Fs {
             reply.error(libc::ENOENT);
             return;
         };
-        let Ok(entries) = self.fs.readdir(
+        let Ok(entries) = self.fs.lock().unwrap().readdir(
             self.inodes
                 .path_of(parent)
                 .unwrap_or("/")
@@ -344,20 +372,20 @@ impl FuserFilesystem for LlmdbV2Fs {
             reply.error(libc::ENOENT);
             return;
         };
-        if !self.fs.exists(&path) {
+        if !self.fs.lock().unwrap().exists(&path) {
             reply.error(libc::ENOENT);
             return;
         }
         // Ask V2 about the inode to discriminate file vs. directory
         // without re-scanning the parent.
-        let Ok(inode) = self.fs.inode_at(&path) else {
+        let Ok(inode) = self.fs.lock().unwrap().inode_at(&path) else {
             reply.error(libc::ENOENT);
             return;
         };
         // Directories are the ones whose serialized content
         // deserializes to a Directory. Rather than re-parse, we
         // heuristic: try readdir; if it succeeds, it's a directory.
-        if self.fs.readdir(&path).is_ok() {
+        if self.fs.lock().unwrap().readdir(&path).is_ok() {
             let attr = self.dir_attr(req, ino);
             reply.attr(&TTL, &attr);
             return;
@@ -409,7 +437,7 @@ impl FuserFilesystem for LlmdbV2Fs {
             reply.error(libc::ENOENT);
             return;
         };
-        let entries = match self.fs.readdir(&dir_path) {
+        let entries = match self.fs.lock().unwrap().readdir(&dir_path) {
             Ok(e) => e,
             Err(err) => {
                 reply.error(fs_err_to_errno(&err));
@@ -509,7 +537,7 @@ impl FuserFilesystem for LlmdbV2Fs {
 
         // Seed the buffer from on-disk contents on first write.
         if !self.buffers.contains_key(&ino) {
-            let existing = self.fs.read_file(&path).unwrap_or_default();
+            let existing = self.fs.lock().unwrap().read_file(&path).unwrap_or_default();
             self.buffers.insert(
                 ino,
                 WriteBuffer {
@@ -591,14 +619,14 @@ impl FuserFilesystem for LlmdbV2Fs {
             reply.error(libc::EINVAL);
             return;
         };
-        if self.fs.exists(&path) {
+        if self.fs.lock().unwrap().exists(&path) {
             reply.error(libc::EEXIST);
             return;
         }
         // Create an empty file on disk so lookup / getattr see it
         // immediately — otherwise a `touch foo` followed by `stat
         // foo` without a write in between would ENOENT.
-        if let Err(err) = self.fs.create_file(&path, &[]) {
+        if let Err(err) = self.fs.lock().unwrap().create_file(&path, &[]) {
             reply.error(fs_err_to_errno(&err));
             return;
         }
@@ -647,7 +675,7 @@ impl FuserFilesystem for LlmdbV2Fs {
             self.buffers.remove(&ino);
             self.inodes.forget(ino);
         }
-        match self.fs.unlink(&path) {
+        match self.fs.lock().unwrap().unlink(&path) {
             Ok(()) => reply.ok(),
             Err(err) => reply.error(fs_err_to_errno(&err)),
         }
@@ -666,7 +694,7 @@ impl FuserFilesystem for LlmdbV2Fs {
             reply.error(libc::EINVAL);
             return;
         };
-        if let Err(err) = self.fs.mkdir(&path) {
+        if let Err(err) = self.fs.lock().unwrap().mkdir(&path) {
             reply.error(fs_err_to_errno(&err));
             return;
         }
@@ -680,7 +708,7 @@ impl FuserFilesystem for LlmdbV2Fs {
             reply.error(libc::ENOENT);
             return;
         };
-        match self.fs.rmdir(&path) {
+        match self.fs.lock().unwrap().rmdir(&path) {
             Ok(()) => {
                 if let Some(ino) = self.inodes.path_to_ino.get(&path).copied() {
                     self.inodes.forget(ino);
@@ -718,7 +746,7 @@ impl FuserFilesystem for LlmdbV2Fs {
             // Both truncate and chmod stage through the write buffer.
             // Seed the buffer with disk contents if we don't have one.
             if !self.buffers.contains_key(&ino) {
-                let existing = self.fs.read_file(&path).unwrap_or_default();
+                let existing = self.fs.lock().unwrap().read_file(&path).unwrap_or_default();
                 self.buffers.insert(
                     ino,
                     WriteBuffer {
@@ -745,7 +773,7 @@ impl FuserFilesystem for LlmdbV2Fs {
 
         if let Some(attr) = self.file_attr(req, ino, &path) {
             reply.attr(&TTL, &attr);
-        } else if self.fs.readdir(&path).is_ok() {
+        } else if self.fs.lock().unwrap().readdir(&path).is_ok() {
             reply.attr(&TTL, &self.dir_attr(req, ino));
         } else {
             reply.error(libc::ENOENT);
@@ -756,7 +784,7 @@ impl FuserFilesystem for LlmdbV2Fs {
         // V2 doesn't expose a total-block count; report free space
         // in stealable-bit weights scaled to blocks so userspace
         // tooling shows something reasonable.
-        let free_weights = self.fs.allocator_free_weights();
+        let free_weights = self.fs.lock().unwrap().allocator_free_weights();
         let free_blocks = free_weights.saturating_div(BLOCK_SIZE as u64);
         reply.statfs(
             free_blocks.saturating_mul(2),
