@@ -281,11 +281,28 @@ pub fn init_anchor(
 
 /// Read the anchor and return its active slot. Errors if neither slot
 /// has a valid CRC (or if the header magic / version is wrong).
+///
+/// Recomputes the anchor placement on each call — for hot-path
+/// callers that mount or commit frequently, use
+/// [`read_anchor_with_placement`] with a cached placement (the
+/// placement is O(N) in total eligible weights).
 pub fn read_anchor(
     mmap: &[u8],
     map: &TensorMap,
 ) -> Result<AnchorReadOutcome, AnchorError> {
     let placement = find_anchor_placement(mmap, map);
+    read_anchor_with_placement(mmap, map, &placement)
+}
+
+/// As [`read_anchor`] but reuses a caller-cached placement. The
+/// `Filesystem` layer builds the placement once at init / mount and
+/// threads it through every subsequent read and commit so each
+/// operation pays O(1) rather than O(eligible_weights).
+pub fn read_anchor_with_placement(
+    mmap: &[u8],
+    map: &TensorMap,
+    placement: &MetadataPlacement,
+) -> Result<AnchorReadOutcome, AnchorError> {
     if (placement.positions.len() as u64) < ANCHOR_BITS {
         return Err(AnchorError::CoverTooSmall {
             needed: ANCHOR_BITS,
@@ -294,7 +311,7 @@ pub fn read_anchor(
     }
 
     let mut buf = [0u8; ANCHOR_BYTES];
-    read_bytes(mmap, map, &placement, 0, &mut buf)?;
+    read_bytes(mmap, map, placement, 0, &mut buf)?;
 
     let magic: [u8; 4] = buf[0..4].try_into().unwrap();
     if &magic != MAGIC {
@@ -352,7 +369,22 @@ pub fn commit_anchor(
     super_root: Pointer,
     prev_generation: u64,
 ) -> Result<u64, AnchorError> {
-    let outcome = read_anchor(mmap, map)?;
+    let placement = find_anchor_placement(mmap, map);
+    commit_anchor_with_placement(mmap, map, &placement, super_root, prev_generation)
+}
+
+/// As [`commit_anchor`] but reuses a caller-cached placement. The
+/// `Filesystem` layer caches the placement at mount; each subsequent
+/// write reuses it here to avoid the O(eligible_weights) re-scan that
+/// would otherwise dominate commit latency.
+pub fn commit_anchor_with_placement(
+    mmap: &mut [u8],
+    map: &TensorMap,
+    placement: &MetadataPlacement,
+    super_root: Pointer,
+    prev_generation: u64,
+) -> Result<u64, AnchorError> {
+    let outcome = read_anchor_with_placement(mmap, map, placement)?;
     if outcome.active.generation != prev_generation {
         return Err(AnchorError::GenerationMismatch {
             expected: prev_generation,
@@ -363,12 +395,10 @@ pub fn commit_anchor(
     let target_slot = outcome.active_slot.other();
     let new_slot = AnchorSlot::with_pointer(new_gen, super_root);
 
-    // Write the slot bytes at their offset within the anchor record.
-    let placement = find_anchor_placement(mmap, map);
     write_bytes(
         mmap,
         map,
-        &placement,
+        placement,
         target_slot.byte_offset(),
         &new_slot.encode(),
     )?;

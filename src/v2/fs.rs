@@ -54,11 +54,18 @@ const DEFAULT_CHUNK_SIZE_BYTES: u32 = 4096;
 
 /// Top-level V2 filesystem. Owns the cover bytes for the lifetime of
 /// the mount; [`Self::unmount`] returns them for persistence.
+///
+/// Caches the anchor placement so init / mount / write don't rescan
+/// every eligible weight on each operation. Without the cache, a 270
+/// MB cover pays ~30 s per write (the scan is O(eligible_weights)
+/// and dominates the commit); with the cache it's a one-shot cost at
+/// init / mount.
 #[derive(Debug)]
 pub struct Filesystem {
     cover: Vec<u8>,
     map: TensorMap,
     alloc: Allocator,
+    anchor_placement: MetadataPlacement,
     generation: u64,
     super_root: SuperRoot,
     super_root_ptr: Pointer,
@@ -118,8 +125,10 @@ impl Filesystem {
         let ceiling = CeilingSummary::build(&cover, &map);
         let mut allocator = Allocator::new_for_map(&map, ceiling)?;
 
-        let placement = anchor::find_anchor_placement(&cover, &map);
-        allocator.reserve_weights(unique_weights(&placement))?;
+        // Compute anchor placement once and keep it; every subsequent
+        // read_anchor / commit_anchor reuses this cached copy.
+        let anchor_placement = anchor::find_anchor_placement(&cover, &map);
+        allocator.reserve_weights(unique_weights(&anchor_placement))?;
 
         let root_inode = Inode::EMPTY;
         let root_inode_ptr =
@@ -139,6 +148,7 @@ impl Filesystem {
             cover,
             map,
             alloc: allocator,
+            anchor_placement,
             generation: 1,
             super_root,
             super_root_ptr,
@@ -161,13 +171,17 @@ impl Filesystem {
         map: TensorMap,
         data_chunk_size_bytes: u32,
     ) -> Result<Self, FsError> {
-        let anchor_outcome = anchor::read_anchor(&cover, &map)?;
+        // Compute the anchor placement once. The cover's ceiling
+        // magnitudes are the same whether we're inside read_anchor or
+        // new_for_map, so this single scan covers both.
+        let anchor_placement = anchor::find_anchor_placement(&cover, &map);
+        let anchor_outcome =
+            anchor::read_anchor_with_placement(&cover, &map, &anchor_placement)?;
 
         let ceiling = CeilingSummary::build(&cover, &map);
         let mut allocator = Allocator::new_for_map(&map, ceiling)?;
 
-        let placement = anchor::find_anchor_placement(&cover, &map);
-        allocator.reserve_weights(unique_weights(&placement))?;
+        allocator.reserve_weights(unique_weights(&anchor_placement))?;
 
         let super_root_ptr = anchor_outcome.active.super_root;
         let mut super_root_bytes = [0u8; SUPER_ROOT_BYTES];
@@ -199,6 +213,7 @@ impl Filesystem {
             cover,
             map,
             alloc: allocator,
+            anchor_placement,
             generation: anchor_outcome.active.generation,
             super_root,
             super_root_ptr,
@@ -271,9 +286,10 @@ impl Filesystem {
             &new_super_root.encode(),
         )?;
 
-        let committed_gen = anchor::commit_anchor(
+        let committed_gen = anchor::commit_anchor_with_placement(
             &mut self.cover,
             &self.map,
+            &self.anchor_placement,
             new_super_root_ptr,
             self.generation,
         )?;
