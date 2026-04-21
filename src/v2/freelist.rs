@@ -27,6 +27,15 @@
 //! catches NaN).
 
 use std::collections::{BTreeMap, BTreeSet};
+use thiserror::Error;
+
+use crate::v2::ceiling::CeilingSummary;
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ReserveError {
+    #[error("weight ({slot}, {weight_index}) is not in any free run")]
+    NotFree { slot: u16, weight_index: u32 },
+}
 
 /// Key type for the `by_fit` index. Packed tuple for lexicographic
 /// ordering: `(max_ceiling_bits, length_in_weights, slot,
@@ -102,6 +111,87 @@ impl FreeRunSet {
             .values()
             .map(|e| e.length_in_weights as u64)
             .sum()
+    }
+
+    /// Remove the single weight `(slot, weight_index)` from the free
+    /// set, splitting the containing run if necessary. Left and
+    /// right halves' `max_ceiling` are recomputed via `ceiling` so
+    /// the allocator's fit-ordering stays accurate after the split.
+    ///
+    /// Used at init to carve out the anchor positions so the
+    /// allocator never hands them back as data chunks.
+    ///
+    /// Returns `ReserveError::NotFree` if the weight isn't in any
+    /// free run (already allocated, or outside the slot's range).
+    pub fn reserve_weight(
+        &mut self,
+        slot: u16,
+        weight_index: u32,
+        ceiling: &CeilingSummary,
+    ) -> Result<(), ReserveError> {
+        // Containing run: rightmost entry whose key is ≤ (slot, weight_index).
+        let containing_key = self
+            .by_position
+            .range(..=(slot, weight_index))
+            .next_back()
+            .map(|(k, _)| *k);
+        let key = containing_key.ok_or(ReserveError::NotFree {
+            slot,
+            weight_index,
+        })?;
+        if key.0 != slot {
+            return Err(ReserveError::NotFree {
+                slot,
+                weight_index,
+            });
+        }
+        let entry = *self.by_position.get(&key).unwrap();
+        let run_start = key.1;
+        let run_end = run_start + entry.length_in_weights;
+        if weight_index < run_start || weight_index >= run_end {
+            return Err(ReserveError::NotFree {
+                slot,
+                weight_index,
+            });
+        }
+
+        // Remove the whole run.
+        self.remove_raw(key).expect("run was in by_position");
+
+        // Reinsert the left half, if any.
+        if weight_index > run_start {
+            let left_len = weight_index - run_start;
+            let left_max = ceiling.max_over_range(
+                slot as u32,
+                run_start as u64,
+                left_len as u64,
+            );
+            self.insert_raw(FreeRun {
+                slot,
+                start_weight: run_start,
+                length_in_weights: left_len,
+                max_ceiling: left_max,
+            });
+        }
+
+        // Reinsert the right half, if any.
+        if weight_index + 1 < run_end {
+            let right_start = weight_index + 1;
+            let right_len = run_end - right_start;
+            let right_max = ceiling.max_over_range(
+                slot as u32,
+                right_start as u64,
+                right_len as u64,
+            );
+            self.insert_raw(FreeRun {
+                slot,
+                start_weight: right_start,
+                length_in_weights: right_len,
+                max_ceiling: right_max,
+            });
+        }
+
+        Ok(())
     }
 
     /// True if any free run in `slot` overlaps the weight range

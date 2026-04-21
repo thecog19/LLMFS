@@ -249,6 +249,62 @@ fn alloc_converts_bits_to_weights_per_slot() {
 }
 
 #[test]
+fn reserve_weights_carves_anchor_positions_out_of_free_list() {
+    // 32 F16 weights. Reserve 4 scattered positions and confirm the
+    // allocator never hands those positions back.
+    let values: Vec<f32> = (0..32).map(|i| (i + 1) as f32 * 0.001).collect();
+    let cover = f16_cover(&values);
+    let slot = f16_slot(32, 0, "a");
+    let map = build_map(vec![slot]);
+    let summary = CeilingSummary::build(&cover, &map);
+    let mut alloc = Allocator::new_for_map(&map, summary).expect("allocator");
+
+    // Before reservation: 1 free run of 32 weights.
+    assert_eq!(alloc.free_run_count(), 1);
+
+    // Reserve weights 0, 5, 10, 31 (boundary cases at start + end).
+    let reserved = [(0_u16, 0_u32), (0, 5), (0, 10), (0, 31)];
+    alloc.reserve_weights(reserved).expect("reserve");
+
+    // 4 reservations in a single run → 3 internal gaps ÷ an edge at the end
+    // that collapses to nothing (weight 31 was at the run-end), so 3 runs
+    // remain: [1..5), [6..10), [11..31).
+    assert_eq!(alloc.free_run_count(), 3);
+    assert_eq!(alloc.total_free_weights(), 32 - reserved.len() as u64);
+
+    // Exhaustive: allocate everything. No allocated pointer should
+    // overlap a reserved weight.
+    let mut allocated_weights = std::collections::HashSet::new();
+    // F16 = 4 bits/weight; allocate 4 bits at a time.
+    while let Some(ptr) = alloc.alloc(&map, 4) {
+        allocated_weights.insert(ptr.start_weight);
+    }
+    for (_slot, reserved_w) in reserved {
+        assert!(
+            !allocated_weights.contains(&reserved_w),
+            "allocator handed back reserved weight {reserved_w}",
+        );
+    }
+}
+
+#[test]
+fn reserve_weights_fails_fast_if_position_already_allocated() {
+    let values: Vec<f32> = (0..4).map(|i| (i + 1) as f32 * 0.01).collect();
+    let cover = f16_cover(&values);
+    let slot = f16_slot(4, 0, "a");
+    let map = build_map(vec![slot]);
+    let summary = CeilingSummary::build(&cover, &map);
+    let mut alloc = Allocator::new_for_map(&map, summary).expect("allocator");
+
+    // Allocate the whole slot, then try to reserve a weight in it.
+    let _ = alloc.alloc(&map, 16).expect("alloc all");
+    let err = alloc
+        .reserve_weights([(0_u16, 0_u32)])
+        .expect_err("position already allocated");
+    matches!(err, AllocError::Reserve { .. });
+}
+
+#[test]
 fn free_rejects_pointer_outside_any_run() {
     // Freeing a pointer that was never allocated (or was already
     // freed) is a programmer error; the allocator refuses.

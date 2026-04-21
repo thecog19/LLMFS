@@ -17,7 +17,8 @@
 //! 6. **Three-way merge** — freeing a run with neighbours on both
 //!    sides collapses all three.
 
-use llmdb::v2::freelist::{FreeRun, FreeRunSet};
+use llmdb::v2::ceiling::CeilingSummary;
+use llmdb::v2::freelist::{FreeRun, FreeRunSet, ReserveError};
 
 fn make_run(slot: u16, start: u32, len: u32, max: f32) -> FreeRun {
     FreeRun {
@@ -157,6 +158,127 @@ fn ties_broken_by_weightref() {
     let got = fl.pop_best_fit(50).expect("pop");
     assert_eq!(got.start_weight, 0, "tie broken by lowest WeightRef");
 }
+
+// ------------------------------------------------------------------
+// reserve_weight
+// ------------------------------------------------------------------
+
+/// Build a one-slot CeilingSummary where every bucket has max=1.0,
+/// matching a cover where we don't care about the actual magnitudes
+/// for these tests — we just want reserve_weight's split logic to
+/// have *some* ceiling to query.
+fn flat_summary(bucket_counts: &[u32]) -> CeilingSummary {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"CSUM");
+    bytes.push(1);
+    bytes.extend_from_slice(&[0, 0, 0]);
+    bytes.extend_from_slice(&(bucket_counts.len() as u32).to_le_bytes());
+    for &c in bucket_counts {
+        bytes.extend_from_slice(&c.to_le_bytes());
+    }
+    for &c in bucket_counts {
+        for _ in 0..c {
+            bytes.extend_from_slice(&1.0_f32.to_le_bytes());
+        }
+    }
+    CeilingSummary::deserialize(&bytes).expect("summary")
+}
+
+#[test]
+fn reserve_weight_in_middle_splits_into_two_halves() {
+    let mut fl = FreeRunSet::new();
+    fl.insert(make_run(0, 0, 100, 0.5));
+    let summary = flat_summary(&[1]); // 1 slot, 1 bucket covering ≥ 100 weights
+
+    fl.reserve_weight(0, 42, &summary).expect("reserve");
+    assert_eq!(fl.len(), 2, "run split into left + right");
+    // Left half: [0, 42). Right half: [43, 100).
+    let left = fl.pop_best_fit(40).expect("left fits");
+    let right = fl.pop_best_fit(1).expect("right fits");
+    // Determinism: pop_best_fit picks by (max, length, slot, start).
+    // Both halves have max=1.0 (from the flat summary), so shorter
+    // wins first — length 42 vs 57 means left goes first.
+    let (l, r) = if left.length_in_weights < right.length_in_weights {
+        (left, right)
+    } else {
+        (right, left)
+    };
+    assert_eq!(l.start_weight, 0);
+    assert_eq!(l.length_in_weights, 42);
+    assert_eq!(r.start_weight, 43);
+    assert_eq!(r.length_in_weights, 57);
+}
+
+#[test]
+fn reserve_weight_at_run_start_shrinks_from_left() {
+    let mut fl = FreeRunSet::new();
+    fl.insert(make_run(0, 0, 100, 0.5));
+    let summary = flat_summary(&[1]);
+
+    fl.reserve_weight(0, 0, &summary).expect("reserve");
+    assert_eq!(fl.len(), 1);
+    let got = fl.pop_best_fit(1).unwrap();
+    assert_eq!(got.start_weight, 1);
+    assert_eq!(got.length_in_weights, 99);
+}
+
+#[test]
+fn reserve_weight_at_run_end_shrinks_from_right() {
+    let mut fl = FreeRunSet::new();
+    fl.insert(make_run(0, 0, 100, 0.5));
+    let summary = flat_summary(&[1]);
+
+    fl.reserve_weight(0, 99, &summary).expect("reserve");
+    assert_eq!(fl.len(), 1);
+    let got = fl.pop_best_fit(1).unwrap();
+    assert_eq!(got.start_weight, 0);
+    assert_eq!(got.length_in_weights, 99);
+}
+
+#[test]
+fn reserve_weight_on_single_weight_run_empties_it() {
+    let mut fl = FreeRunSet::new();
+    fl.insert(make_run(0, 10, 1, 0.5));
+    let summary = flat_summary(&[1]);
+
+    fl.reserve_weight(0, 10, &summary).expect("reserve");
+    assert!(fl.is_empty());
+}
+
+#[test]
+fn reserve_weight_not_in_any_run_errors() {
+    let mut fl = FreeRunSet::new();
+    fl.insert(make_run(0, 100, 50, 0.5));
+    let summary = flat_summary(&[1]);
+
+    // Before the run.
+    let err = fl.reserve_weight(0, 50, &summary).expect_err("not free");
+    assert_eq!(err, ReserveError::NotFree { slot: 0, weight_index: 50 });
+    // After the run.
+    let err = fl
+        .reserve_weight(0, 200, &summary)
+        .expect_err("not free");
+    assert_eq!(err, ReserveError::NotFree { slot: 0, weight_index: 200 });
+    // Wrong slot.
+    let err = fl.reserve_weight(1, 100, &summary).expect_err("not free");
+    assert_eq!(err, ReserveError::NotFree { slot: 1, weight_index: 100 });
+}
+
+#[test]
+fn reserve_many_weights_produces_many_small_runs() {
+    // Start with one big run, reserve 10 scattered positions,
+    // end up with 11 gaps (or fewer if any land at a boundary).
+    let mut fl = FreeRunSet::new();
+    fl.insert(make_run(0, 0, 1000, 0.5));
+    let summary = flat_summary(&[4]); // 4 buckets × 256 = 1024 weights covered
+
+    for w in [5_u32, 100, 200, 300, 400, 500, 600, 700, 800, 900] {
+        fl.reserve_weight(0, w, &summary).expect("reserve");
+    }
+    assert_eq!(fl.len(), 11, "10 reservations → 11 gaps in the original run");
+}
+
+// ------------------------------------------------------------------
 
 #[test]
 fn pop_leaves_oversized_run_intact() {

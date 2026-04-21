@@ -38,7 +38,7 @@ use thiserror::Error;
 use crate::stego::calibration::stealable_bits_for;
 use crate::stego::tensor_map::TensorMap;
 use crate::v2::ceiling::CeilingSummary;
-use crate::v2::freelist::{FreeRun, FreeRunSet};
+use crate::v2::freelist::{FreeRun, FreeRunSet, ReserveError};
 use crate::v2::pointer::Pointer;
 
 /// Pristine-path allocator over a cover's free-run set.
@@ -79,6 +79,12 @@ pub enum AllocError {
 
     #[error("map has {slot_count} slots, exceeding V2's current max of {max_slots}")]
     TooManySlots { slot_count: usize, max_slots: usize },
+
+    #[error("reserve failed: {source}")]
+    Reserve {
+        #[from]
+        source: ReserveError,
+    },
 }
 
 impl Allocator {
@@ -122,6 +128,30 @@ impl Allocator {
             });
         }
         Ok(Self { freelist, ceiling })
+    }
+
+    /// Remove every `(slot, weight_index)` in `weights` from the free
+    /// set, splitting containing runs as needed. Used at `llmdb init`
+    /// to carve out the anchor positions so the allocator never
+    /// returns them to data-chunk callers. Errors as soon as any
+    /// individual reservation fails (NotFree means the weight was
+    /// already outside a free run).
+    pub fn reserve_weights<I>(&mut self, weights: I) -> Result<(), AllocError>
+    where
+        I: IntoIterator<Item = (u16, u32)>,
+    {
+        for (slot, weight_index) in weights {
+            self.freelist
+                .reserve_weight(slot, weight_index, &self.ceiling)?;
+        }
+        Ok(())
+    }
+
+    /// Borrow the cover's ceiling-magnitude bucket summary — the
+    /// `Filesystem` layer needs it at mount time to rebuild its own
+    /// view.
+    pub fn ceiling(&self) -> &CeilingSummary {
+        &self.ceiling
     }
 
     /// Count of free runs, for diagnostics and tests.
