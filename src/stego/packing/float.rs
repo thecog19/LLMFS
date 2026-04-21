@@ -4,6 +4,39 @@ pub const NAME: &str = "float";
 pub const F16_BYTES_PER_VALUE: usize = 2;
 pub const F32_BYTES_PER_VALUE: usize = 4;
 
+/// Decode IEEE 754 half-precision (fp16) bits to f32. Standard layout:
+/// 1 sign bit, 5 exponent bits (bias 15), 10 mantissa bits. Subnormals
+/// are promoted; +inf / -inf and NaN preserved. Used by the K-quant
+/// decoders (`q4_k`, `q5_k`, `q6_k`) for the per-block fp16 super-scale,
+/// by Q8_0 for its per-block fp16 scale, and by the magnitude
+/// estimator for raw fp16 weights.
+pub fn f16_to_f32(bits: u16) -> f32 {
+    let sign = (bits >> 15) & 0x1;
+    let exp = (bits >> 10) & 0x1F;
+    let mantissa = bits & 0x3FF;
+    if exp == 0 {
+        if mantissa == 0 {
+            return if sign == 0 { 0.0 } else { -0.0 };
+        }
+        let sign_f = if sign == 0 { 1.0 } else { -1.0 };
+        return sign_f * (mantissa as f32) * 2.0_f32.powi(-24);
+    }
+    if exp == 31 {
+        return if mantissa == 0 {
+            if sign == 0 {
+                f32::INFINITY
+            } else {
+                f32::NEG_INFINITY
+            }
+        } else {
+            f32::NAN
+        };
+    }
+    let f32_bits =
+        ((sign as u32) << 31) | (((exp as u32) + (127 - 15)) << 23) | ((mantissa as u32) << 13);
+    f32::from_bits(f32_bits)
+}
+
 pub struct F16Packer;
 pub struct F32Packer;
 

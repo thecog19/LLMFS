@@ -12,23 +12,28 @@ use std::collections::BinaryHeap;
 
 use crate::gguf::quant::GgufQuantType;
 use crate::stego::calibration::{WeightRef, stealable_bits_for};
+use crate::stego::packing::{float, q6_k};
 use crate::stego::tensor_map::{TensorMap, TensorSlot};
 
 /// Read the absolute value of a single weight from the mmap'd cover
 /// file. Dispatches on quant type. Returns 0.0 for quant types we
 /// don't yet decode — the caller treats those as "minimal salience"
-/// (eligible first), which is conservative for Layer 0 metadata
-/// placement and explicitly documented as a TODO until K-quant
-/// decoders land.
+/// (eligible first). Each unimplemented variant is its own concrete
+/// TODO; calibration on covers using these types will silently
+/// mis-rank until they're real.
 pub fn read_weight_abs(mmap: &[u8], slot: &TensorSlot, weight_index: u64) -> f32 {
     match slot.quant_type {
         GgufQuantType::F16 => read_f16_abs(mmap, slot.data_offset, weight_index),
         GgufQuantType::F32 => read_f32_abs(mmap, slot.data_offset, weight_index),
         GgufQuantType::Q8_0 => read_q8_0_abs(mmap, slot.data_offset, weight_index),
+        GgufQuantType::Q6K => read_q6_k_abs(mmap, slot.data_offset, weight_index),
+        // TODO: real decoders for Q4_K, Q5_K, Q3_K (and the legacy
+        // Q4_0/Q4_1/Q5_0/Q5_1/Q8_1/Q2_K/Q8_K variants if a real cover
+        // ever needs them). Stubbed at 0.0 → ranked first (eligible
+        // before known-magnitude weights), which is incorrect.
         GgufQuantType::Q3K
         | GgufQuantType::Q4K
         | GgufQuantType::Q5K
-        | GgufQuantType::Q6K
         | GgufQuantType::Q2K
         | GgufQuantType::Q4_0
         | GgufQuantType::Q4_1
@@ -42,7 +47,7 @@ pub fn read_weight_abs(mmap: &[u8], slot: &TensorSlot, weight_index: u64) -> f32
 fn read_f16_abs(mmap: &[u8], data_offset: u64, weight_index: u64) -> f32 {
     let off = (data_offset + weight_index * 2) as usize;
     let bits = u16::from_le_bytes([mmap[off], mmap[off + 1]]);
-    f16_to_f32(bits).abs()
+    float::f16_to_f32(bits).abs()
 }
 
 fn read_f32_abs(mmap: &[u8], data_offset: u64, weight_index: u64) -> f32 {
@@ -60,40 +65,24 @@ fn read_q8_0_abs(mmap: &[u8], data_offset: u64, weight_index: u64) -> f32 {
     let in_block = (weight_index % BLOCK_WEIGHTS) as usize;
     let block_off = (data_offset + block_idx * BLOCK_BYTES) as usize;
     let scale_bits = u16::from_le_bytes([mmap[block_off], mmap[block_off + 1]]);
-    let scale = f16_to_f32(scale_bits);
+    let scale = float::f16_to_f32(scale_bits);
     let int8 = mmap[block_off + 2 + in_block] as i8;
     (int8 as f32 * scale).abs()
 }
 
-/// Decode IEEE 754 half-precision (fp16) bits to f32. Standard layout:
-/// 1 sign bit, 5 exponent bits (bias 15), 10 mantissa bits.
-fn f16_to_f32(bits: u16) -> f32 {
-    let sign = (bits >> 15) & 0x1;
-    let exp = (bits >> 10) & 0x1F;
-    let mantissa = bits & 0x3FF;
-    if exp == 0 {
-        if mantissa == 0 {
-            return if sign == 0 { 0.0 } else { -0.0 };
-        }
-        // Subnormal: value = (-1)^sign * 2^-14 * (mantissa / 1024)
-        let sign_f = if sign == 0 { 1.0 } else { -1.0 };
-        return sign_f * (mantissa as f32) * 2.0_f32.powi(-24);
-    }
-    if exp == 31 {
-        return if mantissa == 0 {
-            if sign == 0 {
-                f32::INFINITY
-            } else {
-                f32::NEG_INFINITY
-            }
-        } else {
-            f32::NAN
-        };
-    }
-    // Normal: re-bias exponent (15 → 127) and shift mantissa (10 → 23 bits).
-    let f32_bits =
-        ((sign as u32) << 31) | (((exp as u32) + (127 - 15)) << 23) | ((mantissa as u32) << 13);
-    f32::from_bits(f32_bits)
+fn read_q6_k_abs(mmap: &[u8], data_offset: u64, weight_index: u64) -> f32 {
+    let block_weights = q6_k::WEIGHTS_PER_BLOCK as u64;
+    let block_bytes = q6_k::BLOCK_BYTES;
+    let block_idx = weight_index / block_weights;
+    let in_block = (weight_index % block_weights) as usize;
+    let block_start = data_offset as usize + block_idx as usize * block_bytes;
+    let block = &mmap[block_start..block_start + block_bytes];
+    // The packer's value reader does its own bounds checks. If they
+    // ever fail it's a programmer error (calibration walked off-tensor),
+    // hence panic.
+    q6_k::read_weight_value(block, in_block)
+        .expect("q6_k weight read invariant violated")
+        .abs()
 }
 
 /// Return the `n` lowest-`|w|` weights across all slots in `map`,
@@ -187,6 +176,8 @@ impl PartialOrd for F32Ord {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::stego::packing::float::f16_to_f32;
 
     #[test]
     fn f16_to_f32_decodes_canonical_values() {

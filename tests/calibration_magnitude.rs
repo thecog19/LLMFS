@@ -210,6 +210,53 @@ fn lowest_for_bits_zero_request_returns_empty() {
 }
 
 #[test]
+fn ranks_q6_k_block_via_dispatch() {
+    // Synthesize a Q6_K block where weight 0 has |value| 16.0 and
+    // weight 96 has |value| 32.0. ranking the two should place weight 0
+    // first.
+    use llmdb::stego::packing::q6_k;
+    let mut block = vec![0_u8; q6_k::BLOCK_BYTES];
+    // d = 1.0 (0x3C00)
+    block[208] = 0x00;
+    block[209] = 0x3C;
+    // scales: all 1
+    for i in 0..16 {
+        block[128 + 64 + i] = 1;
+    }
+    // qh byte 0 = 0b00000011 = 3 → quadrant 0 high2bits = 3, others 0
+    // For weight 0 (q=0,l=0,quad=0): q6 = (0 | 0x30) - 32 = 16. value = 1*1*16 = 16
+    // For weight 96 (q=3,l=0,quad=3): qh_2bits = (3 >> 6) & 3 = 0, q6 = 0 - 32 = -32. value = -32. |value| = 32.
+    block[128] = 0x03;
+
+    let weight_count = q6_k::WEIGHTS_PER_BLOCK as u64;
+    let bits_per_weight = GgufQuantType::Q6K.stealable_bits_hint() as u64;
+    let slot = TensorSlot {
+        name: "test.q6_k".to_owned(),
+        quant_type: GgufQuantType::Q6K,
+        tier: TensorTier::Tier1,
+        data_offset: 0,
+        weight_count,
+        stealable_bits_per_weight: bits_per_weight as usize,
+        capacity_bits: weight_count * bits_per_weight,
+        bit_start: 0,
+        bit_end: weight_count * bits_per_weight,
+    };
+    let map = build_map(vec![slot]);
+
+    // weight 0 has magnitude 16, weight 96 has magnitude 32; everywhere
+    // else is also -32 (since qh=0). Lowest 2 should be weight 0 (16.0)
+    // then any of the -32s, with WeightRef tiebreak putting the
+    // smallest index first.
+    let ranked = lowest_magnitude_weights(&block, &map, 2);
+    assert_eq!(ranked.len(), 2);
+    assert_eq!(ranked[0].weight_index, 0); // |16| smaller than |32|
+    let mag0 = read_weight_abs(&block, &map.slots[0], ranked[0].weight_index);
+    let mag1 = read_weight_abs(&block, &map.slots[0], ranked[1].weight_index);
+    assert_eq!(mag0, 16.0);
+    assert_eq!(mag1, 32.0);
+}
+
+#[test]
 fn weight_ref_orders_lexicographically() {
     let a = WeightRef {
         slot_index: 0,
