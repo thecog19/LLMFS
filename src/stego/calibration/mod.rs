@@ -14,6 +14,7 @@
 //!   accurate; needed for Layer 5 (error compensation).
 
 pub mod magnitude;
+pub mod placement;
 
 use crate::gguf::quant::GgufQuantType;
 
