@@ -13,6 +13,7 @@
 //!   calibration corpus, per-column diagonal as salience. Most
 //!   accurate; needed for Layer 5 (error compensation).
 
+pub mod bit_io;
 pub mod magnitude;
 pub mod placement;
 
