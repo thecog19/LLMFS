@@ -24,6 +24,7 @@ pub mod directory;
 pub mod dirty;
 pub mod freelist;
 pub mod fs;
+pub mod fuse;
 pub mod inode;
 pub mod pointer;
 pub mod super_root;
