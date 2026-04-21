@@ -45,7 +45,9 @@ fn f32_to_f16_bits(value: f32) -> u16 {
 }
 
 fn make_cover() -> (Vec<u8>, TensorMap) {
-    let weight_count = 200_000_u64;
+    // 20 K weights → 2.5 KB bitmap → fits in ~40 small_cdc chunks
+    // (under the 96-chunk cap at ppb=4).
+    let weight_count = 20_000_u64;
     let values: Vec<f32> = (0..weight_count)
         .map(|i| {
             let sign = if i % 3 == 0 { -1.0 } else { 1.0 };

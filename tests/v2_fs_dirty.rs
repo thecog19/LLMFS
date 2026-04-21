@@ -40,7 +40,8 @@ fn f32_to_f16_bits(value: f32) -> u16 {
 }
 
 fn make_cover() -> (Vec<u8>, TensorMap) {
-    let weight_count = 200_000_u64;
+    // 20 K weights → 2.5 KB bitmap → fits in ~40 small_cdc chunks.
+    let weight_count = 20_000_u64;
     let values: Vec<f32> = (0..weight_count)
         .map(|i| {
             let sign = if i % 3 == 0 { -1.0 } else { 1.0 };
@@ -222,5 +223,39 @@ fn third_write_lands_on_already_dirty_positions() {
     let bm = fs.dirty_bitmap();
     for (s, w) in &c_weights {
         assert!(bm.is_dirty(*s, *w));
+    }
+}
+
+// ------------------------------------------------------------------
+// (4) Dirty bitmap survives unmount → remount (step 10b)
+// ------------------------------------------------------------------
+
+#[test]
+fn dirty_bits_survive_unmount_and_remount() {
+    let (cover, map) = make_cover();
+    let bpw = 4_u32;
+
+    let mut fs = Filesystem::init_with_cdc_params(cover, map.clone(), small_cdc()).expect("init");
+    let data = random_bytes(300, 1);
+    fs.write(&data).expect("write");
+
+    // Snapshot the dirty weights touched by the data chunks.
+    let touched: Vec<(u16, u32)> = direct_pointers(&fs)
+        .iter()
+        .flat_map(|p| pointer_weights(p, bpw))
+        .collect();
+
+    let cover_after = fs.unmount();
+    let fs2 =
+        Filesystem::mount_with_cdc_params(cover_after, map, small_cdc()).expect("mount");
+
+    // After remount, every weight we touched should STILL be dirty —
+    // the bitmap was persisted and read back.
+    let bm = fs2.dirty_bitmap();
+    for (s, w) in &touched {
+        assert!(
+            bm.is_dirty(*s, *w),
+            "weight (slot {s}, w {w}) should still be dirty after remount",
+        );
     }
 }

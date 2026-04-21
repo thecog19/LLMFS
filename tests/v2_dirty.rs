@@ -116,3 +116,34 @@ fn mark_is_idempotent() {
     bm.mark(0, 42);
     assert!(bm.is_dirty(0, 42));
 }
+
+#[test]
+fn serialize_deserialize_round_trips() {
+    let map = two_slot_map();
+    let mut bm = DirtyBitmap::new(&map);
+    bm.mark(0, 3);
+    bm.mark(0, 99);
+    bm.mark(1, 0);
+    bm.mark(1, 49);
+
+    let bytes = bm.serialize();
+    let restored = DirtyBitmap::deserialize(&bytes, &map).expect("deserialize");
+    assert_eq!(bm, restored);
+
+    // Bits preserved.
+    assert!(restored.is_dirty(0, 3));
+    assert!(restored.is_dirty(0, 99));
+    assert!(restored.is_dirty(1, 0));
+    assert!(restored.is_dirty(1, 49));
+    assert!(!restored.is_dirty(0, 4));
+}
+
+#[test]
+fn deserialize_rejects_wrong_byte_count() {
+    let map = two_slot_map();
+    // Expected bytes = ceil((100 + 50) / 8) = 19 bytes.
+    let short = vec![0u8; 10];
+    let long = vec![0u8; 30];
+    assert!(DirtyBitmap::deserialize(&short, &map).is_err());
+    assert!(DirtyBitmap::deserialize(&long, &map).is_err());
+}

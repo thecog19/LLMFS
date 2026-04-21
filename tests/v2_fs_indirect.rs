@@ -65,9 +65,11 @@ fn small_cdc() -> FastCdcParams {
 }
 
 /// Big cover for these tests — enough F16 weights that even
-/// triple-indirect payloads don't run into OutOfSpace.
+/// triple-indirect payloads don't run into OutOfSpace. Capped at
+/// 20 K so the persistent dirty bitmap (2.5 KB) fits in the small
+/// CDC params' 96-chunk direct/indirect envelope.
 fn make_cover() -> (Vec<u8>, TensorMap) {
-    let weight_count = 200_000_u64;
+    let weight_count = 20_000_u64;
     let values: Vec<f32> = (0..weight_count)
         .map(|i| {
             let sign = if i % 3 == 0 { -1.0 } else { 1.0 };

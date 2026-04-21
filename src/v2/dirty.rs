@@ -20,7 +20,15 @@
 //! persist the bitmap via `super_root.dirty_bitmap_inode` and
 //! close that gap.
 
+use thiserror::Error;
+
 use crate::stego::tensor_map::TensorMap;
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum DirtyBitmapError {
+    #[error("bitmap byte count mismatch: map expects {expected} bytes, deserialize got {got}")]
+    ByteCountMismatch { expected: usize, got: usize },
+}
 
 /// Packed bit-per-weight dirty bitmap. Per-slot bit offsets are
 /// computed from `TensorMap::slots` — slot 0's weights occupy bits
@@ -99,5 +107,31 @@ impl DirtyBitmap {
 
     fn bit_index(&self, slot: u16, weight_index: u32) -> u64 {
         self.slot_offsets[slot as usize] + weight_index as u64
+    }
+
+    /// Serialise the packed bit array. The map's slot layout is what
+    /// tells a decoder how to re-derive slot offsets, so only the
+    /// raw bytes are persisted — no header.
+    pub fn serialize(&self) -> Vec<u8> {
+        self.bits.clone()
+    }
+
+    /// Reconstruct a `DirtyBitmap` from persisted bytes + the
+    /// cover's `TensorMap` (which supplies per-slot offsets). Errors
+    /// if the byte count doesn't match what the map implies —
+    /// either the map changed between sessions (cover was reshaped,
+    /// shouldn't happen) or the persistence was corrupted.
+    pub fn deserialize(bytes: &[u8], map: &TensorMap) -> Result<Self, DirtyBitmapError> {
+        let fresh = Self::new(map);
+        if bytes.len() != fresh.bits.len() {
+            return Err(DirtyBitmapError::ByteCountMismatch {
+                expected: fresh.bits.len(),
+                got: bytes.len(),
+            });
+        }
+        Ok(Self {
+            bits: bytes.to_vec(),
+            ..fresh
+        })
     }
 }

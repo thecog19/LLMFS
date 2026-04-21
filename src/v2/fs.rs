@@ -48,7 +48,7 @@ use crate::v2::cdc::{FastCdcError, FastCdcParams, chunk_ranges};
 use crate::v2::ceiling::CeilingSummary;
 use crate::v2::chunk::{ChunkError, byte_capacity, read_chunk, write_chunk};
 use crate::v2::dedup::{DedupIndex, hash_chunk};
-use crate::v2::dirty::DirtyBitmap;
+use crate::v2::dirty::{DirtyBitmap, DirtyBitmapError};
 use crate::v2::inode::{INODE_BYTES, Inode, InodeError, NUM_DIRECT};
 use crate::v2::pointer::{Pointer, PointerError};
 use crate::v2::super_root::{SUPER_ROOT_BYTES, SuperRoot, SuperRootError};
@@ -110,6 +110,9 @@ pub enum FsError {
     #[error("invalid CDC params: {0}")]
     Cdc(#[from] FastCdcError),
 
+    #[error("dirty bitmap: {0}")]
+    Dirty(#[from] DirtyBitmapError),
+
     #[error("out of space: could not allocate {requested_bits} bits")]
     OutOfSpace { requested_bits: u32 },
 
@@ -167,24 +170,37 @@ impl Filesystem {
         let root_inode_ptr =
             alloc_and_write(&mut cover, &map, &mut allocator, &root_inode.encode())?;
 
+        // Fresh init: nothing dirty yet — but the root inode chunk we
+        // just wrote is. Seed the bitmap.
+        let mut dirty_bitmap = DirtyBitmap::new(&map);
+        mark_pointer_dirty(&mut dirty_bitmap, &map, root_inode_ptr);
+
+        // Persist the bitmap as a byte stream via its own inode —
+        // subsequent sessions read this at mount. The bitmap's own
+        // chunks + its inode chunk are then dirty-marked inside
+        // persist_as_byte_stream, which is expected: those
+        // positions are now V2 metadata.
+        let bitmap_bytes = dirty_bitmap.serialize();
+        let bitmap_inode_ptr = persist_as_byte_stream(
+            &mut cover,
+            &map,
+            &mut allocator,
+            &mut dirty_bitmap,
+            &cdc_params,
+            &bitmap_bytes,
+        )?;
+
         let super_root = SuperRoot {
             root_dir_inode: root_inode_ptr,
+            dirty_bitmap_inode: bitmap_inode_ptr,
             generation: 1,
             ..SuperRoot::EMPTY
         };
         let super_root_ptr =
             alloc_and_write(&mut cover, &map, &mut allocator, &super_root.encode())?;
+        mark_pointer_dirty(&mut dirty_bitmap, &map, super_root_ptr);
 
         anchor::init_anchor(&mut cover, &map, super_root_ptr)?;
-
-        // Fresh init: no prior writes → nothing dirty. Bitmap still
-        // needs map-derived slot offsets so later marks land in the
-        // right slot.
-        let mut dirty_bitmap = DirtyBitmap::new(&map);
-        // The inode + super-root chunks we just wrote ARE dirty
-        // though — those weights hold V2 metadata now.
-        mark_pointer_dirty(&mut dirty_bitmap, &map, root_inode_ptr);
-        mark_pointer_dirty(&mut dirty_bitmap, &map, super_root_ptr);
 
         Ok(Self {
             cover,
@@ -272,11 +288,36 @@ impl Filesystem {
         // mount.
         let dedup_index = build_dedup_index(&cover, &map, &root_inode)?;
 
-        // Seed the dirty bitmap by marking every weight transitively
-        // reachable from the current inode + super-root + root-inode
-        // chunk. Step 10a: other dirty state from past sessions is
-        // lost on mount (step 10b persists it).
-        let mut dirty_bitmap = DirtyBitmap::new(&map);
+        // Load the persisted dirty bitmap and reserve its chunks.
+        // A null pointer means step-10a-era cover: fall back to a
+        // fresh empty bitmap seeded from the current inode tree.
+        let mut dirty_bitmap = if super_root.dirty_bitmap_inode.is_null() {
+            DirtyBitmap::new(&map)
+        } else {
+            let bytes =
+                load_byte_stream(&cover, &map, super_root.dirty_bitmap_inode)?;
+            DirtyBitmap::deserialize(&bytes, &map)?
+        };
+        // Reserve every chunk in the dirty bitmap's inode tree so
+        // subsequent allocs don't overwrite it.
+        if !super_root.dirty_bitmap_inode.is_null() {
+            let bitmap_chunks = inode_tree_chunks(&cover, &map, super_root.dirty_bitmap_inode)?;
+            for (slot, start, len_bits) in bitmap_chunks {
+                if reserved.insert((slot, start)) {
+                    let p = Pointer {
+                        slot,
+                        start_weight: start,
+                        length_in_bits: len_bits,
+                        flags: 0,
+                        reserved: 0,
+                    };
+                    reserve_pointer(&mut allocator, &map, p)?;
+                }
+            }
+        }
+        // Make sure the current inode + its chunks are dirty in the
+        // in-memory bitmap regardless of what was persisted — they
+        // definitely hold V2 metadata now.
         mark_pointer_dirty(&mut dirty_bitmap, &map, super_root_ptr);
         mark_pointer_dirty(&mut dirty_bitmap, &map, root_inode_ptr);
         visit_inode_chunks(&root_inode, &cover, &map, |ptr| {
@@ -429,9 +470,26 @@ impl Filesystem {
             alloc_and_write(&mut self.cover, &self.map, &mut self.alloc, &new_inode.encode())?;
         mark_pointer_dirty(&mut self.dirty_bitmap, &self.map, new_inode_ptr);
 
+        // Persist the updated dirty bitmap as its own byte stream.
+        // persist_as_byte_stream marks each written weight in
+        // dirty_bitmap too — fine, those are live metadata
+        // positions. The bitmap we serialised reflects state before
+        // this persistence step; next session's mount will see the
+        // updated-but-not-quite-current snapshot (see module docs).
+        let bitmap_bytes = self.dirty_bitmap.serialize();
+        let new_bitmap_inode_ptr = persist_as_byte_stream(
+            &mut self.cover,
+            &self.map,
+            &mut self.alloc,
+            &mut self.dirty_bitmap,
+            &self.cdc_params,
+            &bitmap_bytes,
+        )?;
+
         let new_generation = self.generation + 1;
         let new_super_root = SuperRoot {
             root_dir_inode: new_inode_ptr,
+            dirty_bitmap_inode: new_bitmap_inode_ptr,
             generation: new_generation,
             ..SuperRoot::EMPTY
         };
@@ -452,23 +510,26 @@ impl Filesystem {
         )?;
         debug_assert_eq!(committed_gen, new_generation);
 
-        // Free old inode + super-root chunks and old data chunks
-        // that aren't referenced by the new inode. They re-enter
-        // the allocator's free list as "dirty" (dirty_bitmap still
-        // has them marked), which is what makes
-        // `alloc_preferring_dirty` useful on the NEXT write — it
-        // can prefer these just-freed positions over never-touched
-        // pristine ones.
+        // Free every chunk in the OLD scope (user inode tree +
+        // bitmap inode tree + super-root chunk) that isn't also in
+        // the NEW scope. Freed positions re-enter the allocator's
+        // free list as "dirty", so the next write's
+        // alloc_preferring_dirty can land on them before any
+        // pristine run.
         reclaim_abandoned_chunks(
             &mut self.alloc,
             &self.map,
             &self.cover,
-            &self.root_inode,
-            self.root_inode_ptr,
-            self.super_root_ptr,
-            &new_inode,
-            new_inode_ptr,
-            new_super_root_ptr,
+            ReclaimScope {
+                root_inode_ptr: self.root_inode_ptr,
+                bitmap_inode_ptr: self.super_root.dirty_bitmap_inode,
+                super_root_ptr: self.super_root_ptr,
+            },
+            ReclaimScope {
+                root_inode_ptr: new_inode_ptr,
+                bitmap_inode_ptr: new_bitmap_inode_ptr,
+                super_root_ptr: new_super_root_ptr,
+            },
         )?;
 
         self.generation = new_generation;
@@ -786,6 +847,136 @@ fn collect_data_pointers(
     Ok(out)
 }
 
+/// Persist an arbitrary byte stream as CDC-chunked data through a
+/// fresh inode and return the inode's chunk pointer. No dedup —
+/// used for internal V2 metadata (e.g. the dirty bitmap) where
+/// content-hash lookups aren't worth the overhead.
+fn persist_as_byte_stream(
+    cover: &mut [u8],
+    map: &TensorMap,
+    allocator: &mut Allocator,
+    dirty: &mut DirtyBitmap,
+    cdc_params: &FastCdcParams,
+    data: &[u8],
+) -> Result<Pointer, FsError> {
+    let ranges = chunk_ranges(data, cdc_params);
+    let ppb = ptrs_per_indirect_block(cdc_params.avg_size);
+    let ppb2 = ppb.saturating_mul(ppb);
+    let ppb3 = ppb2.saturating_mul(ppb);
+    let max_chunks = NUM_DIRECT
+        .saturating_add(ppb)
+        .saturating_add(ppb2)
+        .saturating_add(ppb3);
+    if ranges.len() > max_chunks {
+        return Err(FsError::FileTooLarge {
+            bytes: data.len(),
+            chunk_count: ranges.len(),
+            max_chunks,
+        });
+    }
+
+    let mut data_chunk_ptrs = Vec::with_capacity(ranges.len());
+    for range in &ranges {
+        let chunk = &data[range.clone()];
+        let bit_count = (chunk.len() * 8) as u32;
+        let ptr = allocator
+            .alloc_preferring_dirty(map, bit_count, dirty)
+            .ok_or(FsError::OutOfSpace {
+                requested_bits: bit_count,
+            })?;
+        write_chunk(cover, map, ptr, 0, chunk)?;
+        mark_pointer_dirty(dirty, map, ptr);
+        data_chunk_ptrs.push(ptr);
+    }
+    let chunk_count = data_chunk_ptrs.len();
+
+    let mut direct = [Pointer::NULL; NUM_DIRECT];
+    let direct_used = chunk_count.min(NUM_DIRECT);
+    direct[..direct_used].copy_from_slice(&data_chunk_ptrs[..direct_used]);
+
+    let mut cursor = direct_used;
+    let single_indirect = if cursor < chunk_count {
+        let end = (cursor + ppb).min(chunk_count);
+        let ptr = write_pointer_list(cover, map, allocator, &data_chunk_ptrs[cursor..end])?;
+        cursor = end;
+        ptr
+    } else {
+        Pointer::NULL
+    };
+
+    let double_indirect = if cursor < chunk_count {
+        let end = (cursor + ppb * ppb).min(chunk_count);
+        let ptr = build_double_indirect(
+            cover,
+            map,
+            allocator,
+            &data_chunk_ptrs[cursor..end],
+            ppb,
+        )?;
+        cursor = end;
+        ptr
+    } else {
+        Pointer::NULL
+    };
+
+    let triple_indirect = if cursor < chunk_count {
+        let end = chunk_count;
+        let ptr = build_triple_indirect(
+            cover,
+            map,
+            allocator,
+            &data_chunk_ptrs[cursor..end],
+            ppb,
+        )?;
+        cursor = end;
+        ptr
+    } else {
+        Pointer::NULL
+    };
+
+    debug_assert_eq!(cursor, chunk_count);
+
+    let inode = Inode {
+        length: data.len() as u64,
+        direct,
+        single_indirect,
+        double_indirect,
+        triple_indirect,
+    };
+    let inode_ptr = alloc_and_write(cover, map, allocator, &inode.encode())?;
+    mark_pointer_dirty(dirty, map, inode_ptr);
+    Ok(inode_ptr)
+}
+
+/// Reverse of [`persist_as_byte_stream`] — decode an inode chunk,
+/// walk its data chunks, concatenate, and truncate to
+/// `inode.length`.
+fn load_byte_stream(
+    cover: &[u8],
+    map: &TensorMap,
+    inode_ptr: Pointer,
+) -> Result<Vec<u8>, FsError> {
+    let mut inode_bytes = [0u8; INODE_BYTES];
+    read_chunk(cover, map, inode_ptr, 0, &mut inode_bytes)?;
+    let inode = Inode::decode(&inode_bytes)?;
+    let length = inode.length as usize;
+    let data_ptrs = collect_data_pointers(&inode, cover, map)?;
+
+    let mut out = Vec::with_capacity(length);
+    for ptr in data_ptrs {
+        if out.len() >= length {
+            break;
+        }
+        let chunk_bytes = byte_capacity(ptr) as usize;
+        let this_read = chunk_bytes.min(length - out.len());
+        let mut buf = vec![0u8; this_read];
+        read_chunk(cover, map, ptr, 0, &mut buf)?;
+        out.extend_from_slice(&buf);
+    }
+    out.truncate(length);
+    Ok(out)
+}
+
 /// Mark every weight covered by `ptr` as dirty in the bitmap. Used
 /// after every chunk write to keep dirty tracking up-to-date.
 fn mark_pointer_dirty(dirty: &mut DirtyBitmap, map: &TensorMap, ptr: Pointer) {
@@ -803,63 +994,80 @@ fn mark_pointer_dirty(dirty: &mut DirtyBitmap, map: &TensorMap, ptr: Pointer) {
     dirty.mark_range(ptr.slot, ptr.start_weight, weights);
 }
 
-/// Collect every (slot, start_weight, length_in_bits) tuple an inode
-/// transitively references — data chunks + indirect block chunks.
-/// Deduped in a HashSet so the same pointer appearing twice (via
-/// content-hash dedup) counts once.
-fn inode_chunk_set(
+/// Reads the inode bytes from the cover and collects every
+/// (slot, start_weight, length_in_bits) tuple it transitively
+/// references — data chunks + indirect block chunks + the inode's
+/// own chunk pointer. Used during reclamation (we only know the
+/// pointer, not the decoded inode) and during mount (to reserve
+/// the bitmap's inode tree).
+fn inode_tree_chunks(
     cover: &[u8],
     map: &TensorMap,
-    inode: &Inode,
+    inode_ptr: Pointer,
 ) -> Result<std::collections::HashSet<(u16, u32, u32)>, FsError> {
     let mut set = std::collections::HashSet::new();
-    visit_inode_chunks(inode, cover, map, |ptr| {
+    if inode_ptr.is_null() {
+        return Ok(set);
+    }
+    set.insert((
+        inode_ptr.slot,
+        inode_ptr.start_weight,
+        inode_ptr.length_in_bits,
+    ));
+    let mut inode_bytes = [0u8; INODE_BYTES];
+    read_chunk(cover, map, inode_ptr, 0, &mut inode_bytes)?;
+    let inode = Inode::decode(&inode_bytes)?;
+    visit_inode_chunks(&inode, cover, map, |ptr| {
         set.insert((ptr.slot, ptr.start_weight, ptr.length_in_bits));
         Ok(())
     })?;
     Ok(set)
 }
 
-/// Free chunks referenced by the old inode (and its indirect
-/// blocks) that aren't referenced by the new inode, plus the old
-/// inode chunk and the old super-root chunk. Returning them to the
-/// allocator's free list makes their positions available for the
-/// next alloc — and because their dirty bits are still set,
-/// `alloc_preferring_dirty` will reach for them before any
-/// pristine run.
-#[allow(clippy::too_many_arguments)]
+/// Every chunk position reachable from a particular snapshot of
+/// `Filesystem` state — root inode's tree + bitmap inode's tree +
+/// root_inode_ptr itself + super_root_ptr itself. Used to diff old
+/// vs new snapshots at commit time.
+struct ReclaimScope {
+    root_inode_ptr: Pointer,
+    bitmap_inode_ptr: Pointer,
+    super_root_ptr: Pointer,
+}
+
+fn collect_scope_chunks(
+    cover: &[u8],
+    map: &TensorMap,
+    scope: &ReclaimScope,
+) -> Result<std::collections::HashSet<(u16, u32, u32)>, FsError> {
+    let mut set = std::collections::HashSet::new();
+    set.extend(inode_tree_chunks(cover, map, scope.root_inode_ptr)?);
+    set.extend(inode_tree_chunks(cover, map, scope.bitmap_inode_ptr)?);
+    if !scope.super_root_ptr.is_null() {
+        set.insert((
+            scope.super_root_ptr.slot,
+            scope.super_root_ptr.start_weight,
+            scope.super_root_ptr.length_in_bits,
+        ));
+    }
+    Ok(set)
+}
+
+/// Free every chunk referenced by `old` that isn't referenced by
+/// `new`. Returns abandoned positions to the allocator's free list
+/// while leaving their dirty bits set, so `alloc_preferring_dirty`
+/// reaches them on the next allocation instead of perturbing
+/// pristine weights.
 fn reclaim_abandoned_chunks(
     allocator: &mut Allocator,
     map: &TensorMap,
     cover: &[u8],
-    old_inode: &Inode,
-    old_inode_ptr: Pointer,
-    old_super_root_ptr: Pointer,
-    new_inode: &Inode,
-    new_inode_ptr: Pointer,
-    new_super_root_ptr: Pointer,
+    old: ReclaimScope,
+    new: ReclaimScope,
 ) -> Result<(), FsError> {
-    let old_chunks = inode_chunk_set(cover, map, old_inode)?;
-    let new_chunks = inode_chunk_set(cover, map, new_inode)?;
-
-    let new_meta = [
-        (new_inode_ptr.slot, new_inode_ptr.start_weight, new_inode_ptr.length_in_bits),
-        (
-            new_super_root_ptr.slot,
-            new_super_root_ptr.start_weight,
-            new_super_root_ptr.length_in_bits,
-        ),
-    ];
-
-    // Free each chunk in old_chunks that isn't in new_chunks (and
-    // isn't the new inode/super-root — couldn't happen for data
-    // chunks since their bit-lengths differ from inode/super-root,
-    // but defensive).
+    let old_chunks = collect_scope_chunks(cover, map, &old)?;
+    let new_chunks = collect_scope_chunks(cover, map, &new)?;
     for (slot, start_weight, length_in_bits) in &old_chunks {
         if new_chunks.contains(&(*slot, *start_weight, *length_in_bits)) {
-            continue;
-        }
-        if new_meta.contains(&(*slot, *start_weight, *length_in_bits)) {
             continue;
         }
         let ptr = Pointer {
@@ -871,36 +1079,6 @@ fn reclaim_abandoned_chunks(
         };
         allocator.free(map, ptr)?;
     }
-
-    // Free the old inode chunk unless it's the same as the new
-    // inode chunk (shouldn't happen — allocator gave us fresh
-    // positions — but the guard is free).
-    let old_inode_key = (
-        old_inode_ptr.slot,
-        old_inode_ptr.start_weight,
-        old_inode_ptr.length_in_bits,
-    );
-    if !old_chunks.contains(&old_inode_key)
-        && !new_chunks.contains(&old_inode_key)
-        && !new_meta.contains(&old_inode_key)
-    {
-        allocator.free(map, old_inode_ptr)?;
-    }
-
-    // Free the old super-root chunk.
-    let old_sr_key = (
-        old_super_root_ptr.slot,
-        old_super_root_ptr.start_weight,
-        old_super_root_ptr.length_in_bits,
-    );
-    if !old_chunks.contains(&old_sr_key)
-        && !new_chunks.contains(&old_sr_key)
-        && !new_meta.contains(&old_sr_key)
-        && old_sr_key != old_inode_key
-    {
-        allocator.free(map, old_super_root_ptr)?;
-    }
-
     Ok(())
 }
 
