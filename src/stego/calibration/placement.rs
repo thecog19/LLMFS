@@ -56,7 +56,20 @@ pub fn compute_metadata_placement(
     map: &TensorMap,
     needed_bits: u64,
 ) -> MetadataPlacement {
-    let weights = lowest_magnitude_weights_for_bits(mmap, map, needed_bits);
+    let mut weights = lowest_magnitude_weights_for_bits(mmap, map, needed_bits);
+    // Canonical order for findability: magnitude picks the bottom-N
+    // set, but the layout *within* that set has to use a key that
+    // doesn't shift under metadata writes. Writes perturb mantissa
+    // bits (F16) or low-nibble bits (Q8_0, K-quants) — enough to
+    // re-rank two neighbouring weights by magnitude — but they never
+    // change `(slot_index, weight_index)`. Sorting the selected set
+    // by `WeightRef` makes the bit positions in the placement
+    // invariant under any write that doesn't ALSO change the set
+    // itself. `tests/calibration_layer0_findability.rs` witnesses
+    // the F16 bug we'd ship without this: selection was stable,
+    // ordering wasn't, and recomputed placements read back garbled
+    // metadata.
+    weights.sort_unstable();
     let mut positions = Vec::with_capacity(needed_bits.max(1) as usize);
 
     for r in weights {
