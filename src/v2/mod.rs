@@ -20,6 +20,7 @@ pub mod cdc;
 pub mod ceiling;
 pub mod chunk;
 pub mod dedup;
+pub mod directory;
 pub mod dirty;
 pub mod freelist;
 pub mod fs;
