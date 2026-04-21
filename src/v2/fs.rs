@@ -48,6 +48,7 @@ use crate::v2::cdc::{FastCdcError, FastCdcParams, chunk_ranges};
 use crate::v2::ceiling::CeilingSummary;
 use crate::v2::chunk::{ChunkError, byte_capacity, read_chunk, write_chunk};
 use crate::v2::dedup::{DedupIndex, hash_chunk};
+use crate::v2::dirty::DirtyBitmap;
 use crate::v2::inode::{INODE_BYTES, Inode, InodeError, NUM_DIRECT};
 use crate::v2::pointer::{Pointer, PointerError};
 use crate::v2::super_root::{SUPER_ROOT_BYTES, SuperRoot, SuperRootError};
@@ -78,6 +79,12 @@ pub struct Filesystem {
     /// pointer, skip alloc + write." Rebuilt from scratch at
     /// `mount` (step 9 scope; persistence lands in a later step).
     dedup_index: DedupIndex,
+    /// In-memory dirty-weight bitmap. Marked as each chunk write
+    /// hits the cover; allocator prefers dirty-free runs over
+    /// pristine ones. Not yet persisted across mount (step 10b will
+    /// wire it to `super_root.dirty_bitmap_inode`); step 10a seeds
+    /// the bitmap at mount by marking the current inode's chunks.
+    dirty_bitmap: DirtyBitmap,
 }
 
 #[derive(Debug, Error)]
@@ -170,6 +177,15 @@ impl Filesystem {
 
         anchor::init_anchor(&mut cover, &map, super_root_ptr)?;
 
+        // Fresh init: no prior writes → nothing dirty. Bitmap still
+        // needs map-derived slot offsets so later marks land in the
+        // right slot.
+        let mut dirty_bitmap = DirtyBitmap::new(&map);
+        // The inode + super-root chunks we just wrote ARE dirty
+        // though — those weights hold V2 metadata now.
+        mark_pointer_dirty(&mut dirty_bitmap, &map, root_inode_ptr);
+        mark_pointer_dirty(&mut dirty_bitmap, &map, super_root_ptr);
+
         Ok(Self {
             cover,
             map,
@@ -183,6 +199,7 @@ impl Filesystem {
             cdc_params,
             // Fresh init: no files yet → empty dedup index.
             dedup_index: DedupIndex::new(),
+            dirty_bitmap,
         })
     }
 
@@ -255,6 +272,18 @@ impl Filesystem {
         // mount.
         let dedup_index = build_dedup_index(&cover, &map, &root_inode)?;
 
+        // Seed the dirty bitmap by marking every weight transitively
+        // reachable from the current inode + super-root + root-inode
+        // chunk. Step 10a: other dirty state from past sessions is
+        // lost on mount (step 10b persists it).
+        let mut dirty_bitmap = DirtyBitmap::new(&map);
+        mark_pointer_dirty(&mut dirty_bitmap, &map, super_root_ptr);
+        mark_pointer_dirty(&mut dirty_bitmap, &map, root_inode_ptr);
+        visit_inode_chunks(&root_inode, &cover, &map, |ptr| {
+            mark_pointer_dirty(&mut dirty_bitmap, &map, ptr);
+            Ok(())
+        })?;
+
         Ok(Self {
             cover,
             map,
@@ -267,6 +296,7 @@ impl Filesystem {
             root_inode_ptr,
             cdc_params,
             dedup_index,
+            dirty_bitmap,
         })
     }
 
@@ -299,14 +329,14 @@ impl Filesystem {
             });
         }
 
-        // Allocate + write every data chunk in order. Consult the
-        // dedup index first: if the chunk's content hash matches an
-        // already-allocated chunk (either from the current inode's
-        // pre-write state or from earlier in this same write),
-        // reuse that pointer and skip alloc + write entirely.
-        let mut data_chunk_ptrs = Vec::with_capacity(ranges.len());
+        // Allocate + write every data chunk in order. Priority:
+        //   1. Content-match in dedup index → reuse pointer, no
+        //      write (step 9).
+        //   2. Allocate preferring dirty positions (step 10a).
+        //   3. Fall back to pristine-lowest-ceiling allocation.
         // `new_index` accumulates chunks from THIS write so later
         // chunks in the same file can dedup against earlier ones.
+        let mut data_chunk_ptrs = Vec::with_capacity(ranges.len());
         let mut new_index = DedupIndex::new();
         for range in &ranges {
             let chunk = &data[range.clone()];
@@ -320,11 +350,13 @@ impl Filesystem {
                 let bit_count = (chunk.len() * 8) as u32;
                 let p = self
                     .alloc
-                    .alloc(&self.map, bit_count)
+                    .alloc_preferring_dirty(&self.map, bit_count, &self.dirty_bitmap)
                     .ok_or(FsError::OutOfSpace {
                         requested_bits: bit_count,
                     })?;
                 write_chunk(&mut self.cover, &self.map, p, 0, chunk)?;
+                // The newly-written weights are now dirty forever.
+                mark_pointer_dirty(&mut self.dirty_bitmap, &self.map, p);
                 p
             };
 
@@ -395,6 +427,7 @@ impl Filesystem {
         };
         let new_inode_ptr =
             alloc_and_write(&mut self.cover, &self.map, &mut self.alloc, &new_inode.encode())?;
+        mark_pointer_dirty(&mut self.dirty_bitmap, &self.map, new_inode_ptr);
 
         let new_generation = self.generation + 1;
         let new_super_root = SuperRoot {
@@ -408,6 +441,7 @@ impl Filesystem {
             &mut self.alloc,
             &new_super_root.encode(),
         )?;
+        mark_pointer_dirty(&mut self.dirty_bitmap, &self.map, new_super_root_ptr);
 
         let committed_gen = anchor::commit_anchor_with_placement(
             &mut self.cover,
@@ -417,6 +451,25 @@ impl Filesystem {
             self.generation,
         )?;
         debug_assert_eq!(committed_gen, new_generation);
+
+        // Free old inode + super-root chunks and old data chunks
+        // that aren't referenced by the new inode. They re-enter
+        // the allocator's free list as "dirty" (dirty_bitmap still
+        // has them marked), which is what makes
+        // `alloc_preferring_dirty` useful on the NEXT write — it
+        // can prefer these just-freed positions over never-touched
+        // pristine ones.
+        reclaim_abandoned_chunks(
+            &mut self.alloc,
+            &self.map,
+            &self.cover,
+            &self.root_inode,
+            self.root_inode_ptr,
+            self.super_root_ptr,
+            &new_inode,
+            new_inode_ptr,
+            new_super_root_ptr,
+        )?;
 
         self.generation = new_generation;
         self.super_root = new_super_root;
@@ -490,6 +543,19 @@ impl Filesystem {
     /// hashes.
     pub fn dedup_index(&self) -> &DedupIndex {
         &self.dedup_index
+    }
+
+    /// Read-only view of the dirty bitmap — lets tests verify that
+    /// writes correctly mark the weights they touch.
+    pub fn dirty_bitmap(&self) -> &DirtyBitmap {
+        &self.dirty_bitmap
+    }
+
+    /// Total free weights in the allocator — useful for tests that
+    /// want to confirm reclamation grew the free list after a
+    /// rewrite.
+    pub fn allocator_free_weights(&self) -> u64 {
+        self.alloc.total_free_weights()
     }
 }
 
@@ -718,6 +784,124 @@ fn collect_data_pointers(
     }
 
     Ok(out)
+}
+
+/// Mark every weight covered by `ptr` as dirty in the bitmap. Used
+/// after every chunk write to keep dirty tracking up-to-date.
+fn mark_pointer_dirty(dirty: &mut DirtyBitmap, map: &TensorMap, ptr: Pointer) {
+    if ptr.is_null() {
+        return;
+    }
+    let Some(slot) = map.slots.get(ptr.slot as usize) else {
+        return;
+    };
+    let bpw = slot.stealable_bits_per_weight as u32;
+    if bpw == 0 {
+        return;
+    }
+    let weights = ptr.length_in_bits.div_ceil(bpw);
+    dirty.mark_range(ptr.slot, ptr.start_weight, weights);
+}
+
+/// Collect every (slot, start_weight, length_in_bits) tuple an inode
+/// transitively references — data chunks + indirect block chunks.
+/// Deduped in a HashSet so the same pointer appearing twice (via
+/// content-hash dedup) counts once.
+fn inode_chunk_set(
+    cover: &[u8],
+    map: &TensorMap,
+    inode: &Inode,
+) -> Result<std::collections::HashSet<(u16, u32, u32)>, FsError> {
+    let mut set = std::collections::HashSet::new();
+    visit_inode_chunks(inode, cover, map, |ptr| {
+        set.insert((ptr.slot, ptr.start_weight, ptr.length_in_bits));
+        Ok(())
+    })?;
+    Ok(set)
+}
+
+/// Free chunks referenced by the old inode (and its indirect
+/// blocks) that aren't referenced by the new inode, plus the old
+/// inode chunk and the old super-root chunk. Returning them to the
+/// allocator's free list makes their positions available for the
+/// next alloc — and because their dirty bits are still set,
+/// `alloc_preferring_dirty` will reach for them before any
+/// pristine run.
+#[allow(clippy::too_many_arguments)]
+fn reclaim_abandoned_chunks(
+    allocator: &mut Allocator,
+    map: &TensorMap,
+    cover: &[u8],
+    old_inode: &Inode,
+    old_inode_ptr: Pointer,
+    old_super_root_ptr: Pointer,
+    new_inode: &Inode,
+    new_inode_ptr: Pointer,
+    new_super_root_ptr: Pointer,
+) -> Result<(), FsError> {
+    let old_chunks = inode_chunk_set(cover, map, old_inode)?;
+    let new_chunks = inode_chunk_set(cover, map, new_inode)?;
+
+    let new_meta = [
+        (new_inode_ptr.slot, new_inode_ptr.start_weight, new_inode_ptr.length_in_bits),
+        (
+            new_super_root_ptr.slot,
+            new_super_root_ptr.start_weight,
+            new_super_root_ptr.length_in_bits,
+        ),
+    ];
+
+    // Free each chunk in old_chunks that isn't in new_chunks (and
+    // isn't the new inode/super-root — couldn't happen for data
+    // chunks since their bit-lengths differ from inode/super-root,
+    // but defensive).
+    for (slot, start_weight, length_in_bits) in &old_chunks {
+        if new_chunks.contains(&(*slot, *start_weight, *length_in_bits)) {
+            continue;
+        }
+        if new_meta.contains(&(*slot, *start_weight, *length_in_bits)) {
+            continue;
+        }
+        let ptr = Pointer {
+            slot: *slot,
+            start_weight: *start_weight,
+            length_in_bits: *length_in_bits,
+            flags: 0,
+            reserved: 0,
+        };
+        allocator.free(map, ptr)?;
+    }
+
+    // Free the old inode chunk unless it's the same as the new
+    // inode chunk (shouldn't happen — allocator gave us fresh
+    // positions — but the guard is free).
+    let old_inode_key = (
+        old_inode_ptr.slot,
+        old_inode_ptr.start_weight,
+        old_inode_ptr.length_in_bits,
+    );
+    if !old_chunks.contains(&old_inode_key)
+        && !new_chunks.contains(&old_inode_key)
+        && !new_meta.contains(&old_inode_key)
+    {
+        allocator.free(map, old_inode_ptr)?;
+    }
+
+    // Free the old super-root chunk.
+    let old_sr_key = (
+        old_super_root_ptr.slot,
+        old_super_root_ptr.start_weight,
+        old_super_root_ptr.length_in_bits,
+    );
+    if !old_chunks.contains(&old_sr_key)
+        && !new_chunks.contains(&old_sr_key)
+        && !new_meta.contains(&old_sr_key)
+        && old_sr_key != old_inode_key
+    {
+        allocator.free(map, old_super_root_ptr)?;
+    }
+
+    Ok(())
 }
 
 /// Rebuild the dedup index by walking every data chunk referenced

@@ -179,18 +179,56 @@ impl Allocator {
         }
 
         let picked = self.freelist.pop_best_fit_where(|run| {
-            let slot = &map.slots[run.slot as usize];
-            let bpw = slot.stealable_bits_per_weight as u32;
-            if bpw == 0 {
+            run_fits_length(map, run, length_in_bits)
+        })?;
+        Some(self.finalize_alloc(map, picked, length_in_bits))
+    }
+
+    /// Allocate preferring runs whose first-N weights are already
+    /// dirty. Priority 2 per DESIGN-NEW §15.5: writing to
+    /// already-perturbed weights costs less cover damage than
+    /// perturbing pristine ones. Falls back to plain
+    /// [`Self::alloc`] when no dirty-sufficient run exists.
+    pub fn alloc_preferring_dirty(
+        &mut self,
+        map: &TensorMap,
+        length_in_bits: u32,
+        dirty: &crate::v2::dirty::DirtyBitmap,
+    ) -> Option<Pointer> {
+        if length_in_bits == 0 {
+            return Some(Pointer::NULL);
+        }
+
+        // Pass 1: smallest-max-ceiling run where `length fits` AND
+        // the first-needed_weights are dirty.
+        let picked = self.freelist.pop_best_fit_where(|run| {
+            if !run_fits_length(map, run, length_in_bits) {
                 return false;
             }
-            let run_bits = run.length_in_weights.saturating_mul(bpw);
-            run_bits >= length_in_bits
-        })?;
+            let slot = &map.slots[run.slot as usize];
+            let bpw = slot.stealable_bits_per_weight as u32;
+            let needed = weights_for_bits(length_in_bits, bpw);
+            dirty.is_range_dirty(run.slot, run.start_weight, needed)
+        });
+        if let Some(run) = picked {
+            return Some(self.finalize_alloc(map, run, length_in_bits));
+        }
 
+        // Pass 2: fall back to plain alloc (pristine ordering).
+        self.alloc(map, length_in_bits)
+    }
+
+    /// Split a picked run if longer than needed, push the remainder
+    /// back to the free list, and return a `Pointer` to the
+    /// allocated prefix. Shared by every alloc path.
+    fn finalize_alloc(
+        &mut self,
+        map: &TensorMap,
+        picked: FreeRun,
+        length_in_bits: u32,
+    ) -> Pointer {
         let slot = &map.slots[picked.slot as usize];
         let bpw = slot.stealable_bits_per_weight as u32;
-        // ceil-div: cover any request that isn't an exact multiple of bpw
         let needed_weights = weights_for_bits(length_in_bits, bpw);
 
         let allocated_pointer = Pointer {
@@ -201,8 +239,6 @@ impl Allocator {
             reserved: 0,
         };
 
-        // If the picked run is longer than needed, split and push
-        // the remainder back with a recomputed ceiling.
         if picked.length_in_weights > needed_weights {
             let remainder_start = picked.start_weight + needed_weights;
             let remainder_len = picked.length_in_weights - needed_weights;
@@ -219,7 +255,7 @@ impl Allocator {
             });
         }
 
-        Some(allocated_pointer)
+        allocated_pointer
     }
 
     /// Free a previously-allocated chunk. Returns `Err(DoubleFree)`
@@ -279,6 +315,18 @@ fn weights_for_bits(length_in_bits: u32, bits_per_weight: u32) -> u32 {
     } else {
         length_in_bits.div_ceil(bits_per_weight)
     }
+}
+
+/// True when `run` has enough capacity (in bits) to hold a chunk of
+/// `length_in_bits`. Shared by every alloc path.
+fn run_fits_length(map: &TensorMap, run: &FreeRun, length_in_bits: u32) -> bool {
+    let slot = &map.slots[run.slot as usize];
+    let bpw = slot.stealable_bits_per_weight as u32;
+    if bpw == 0 {
+        return false;
+    }
+    let run_bits = run.length_in_weights.saturating_mul(bpw);
+    run_bits >= length_in_bits
 }
 
 fn pointer_end_weight(start_weight: u32, length_in_weights: u32) -> u64 {
