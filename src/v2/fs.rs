@@ -47,6 +47,7 @@ use crate::v2::anchor::{self, AnchorError};
 use crate::v2::cdc::{FastCdcError, FastCdcParams, chunk_ranges};
 use crate::v2::ceiling::CeilingSummary;
 use crate::v2::chunk::{ChunkError, byte_capacity, read_chunk, write_chunk};
+use crate::v2::dedup::{DedupIndex, hash_chunk};
 use crate::v2::inode::{INODE_BYTES, Inode, InodeError, NUM_DIRECT};
 use crate::v2::pointer::{Pointer, PointerError};
 use crate::v2::super_root::{SUPER_ROOT_BYTES, SuperRoot, SuperRootError};
@@ -71,6 +72,12 @@ pub struct Filesystem {
     root_inode: Inode,
     root_inode_ptr: Pointer,
     cdc_params: FastCdcParams,
+    /// In-memory content-hash index of the data chunks currently
+    /// referenced by `root_inode`. `Filesystem::write` consults this
+    /// before allocating each new chunk — a hit means "reuse the
+    /// pointer, skip alloc + write." Rebuilt from scratch at
+    /// `mount` (step 9 scope; persistence lands in a later step).
+    dedup_index: DedupIndex,
 }
 
 #[derive(Debug, Error)]
@@ -174,6 +181,8 @@ impl Filesystem {
             root_inode,
             root_inode_ptr,
             cdc_params,
+            // Fresh init: no files yet → empty dedup index.
+            dedup_index: DedupIndex::new(),
         })
     }
 
@@ -226,10 +235,25 @@ impl Filesystem {
         reserve_pointer(&mut allocator, &map, root_inode_ptr)?;
         // Walk the full inode tree — direct + indirect blocks + the
         // data chunks each indirect tier reaches — and reserve
-        // every chunk so subsequent allocs avoid live state.
+        // every chunk so subsequent allocs avoid live state. Dedup
+        // can cause the same data-chunk pointer to appear multiple
+        // times in one inode; reserve each unique pointer once so
+        // the allocator doesn't error on the second visit.
+        let mut reserved: std::collections::HashSet<(u16, u32)> =
+            std::collections::HashSet::new();
         visit_inode_chunks(&root_inode, &cover, &map, |ptr| {
-            reserve_pointer(&mut allocator, &map, ptr)
+            if reserved.insert((ptr.slot, ptr.start_weight)) {
+                reserve_pointer(&mut allocator, &map, ptr)
+            } else {
+                Ok(())
+            }
         })?;
+
+        // Rebuild the dedup index: walk every data chunk, read its
+        // content, hash it, insert (hash → pointer). Lets subsequent
+        // writes dedup-hit against chunks that existed before the
+        // mount.
+        let dedup_index = build_dedup_index(&cover, &map, &root_inode)?;
 
         Ok(Self {
             cover,
@@ -242,6 +266,7 @@ impl Filesystem {
             root_inode,
             root_inode_ptr,
             cdc_params,
+            dedup_index,
         })
     }
 
@@ -274,18 +299,36 @@ impl Filesystem {
             });
         }
 
-        // Allocate + write every data chunk in order.
+        // Allocate + write every data chunk in order. Consult the
+        // dedup index first: if the chunk's content hash matches an
+        // already-allocated chunk (either from the current inode's
+        // pre-write state or from earlier in this same write),
+        // reuse that pointer and skip alloc + write entirely.
         let mut data_chunk_ptrs = Vec::with_capacity(ranges.len());
+        // `new_index` accumulates chunks from THIS write so later
+        // chunks in the same file can dedup against earlier ones.
+        let mut new_index = DedupIndex::new();
         for range in &ranges {
             let chunk = &data[range.clone()];
-            let bit_count = (chunk.len() * 8) as u32;
-            let ptr = self
-                .alloc
-                .alloc(&self.map, bit_count)
-                .ok_or(FsError::OutOfSpace {
-                    requested_bits: bit_count,
-                })?;
-            write_chunk(&mut self.cover, &self.map, ptr, 0, chunk)?;
+            let hash = hash_chunk(chunk);
+
+            let ptr = if let Some(existing) = self.dedup_index.lookup(&hash) {
+                existing
+            } else if let Some(this_write) = new_index.lookup(&hash) {
+                this_write
+            } else {
+                let bit_count = (chunk.len() * 8) as u32;
+                let p = self
+                    .alloc
+                    .alloc(&self.map, bit_count)
+                    .ok_or(FsError::OutOfSpace {
+                        requested_bits: bit_count,
+                    })?;
+                write_chunk(&mut self.cover, &self.map, p, 0, chunk)?;
+                p
+            };
+
+            new_index.insert(hash, ptr);
             data_chunk_ptrs.push(ptr);
         }
         let chunk_count = data_chunk_ptrs.len();
@@ -380,6 +423,11 @@ impl Filesystem {
         self.super_root_ptr = new_super_root_ptr;
         self.root_inode = new_inode;
         self.root_inode_ptr = new_inode_ptr;
+        // The old dedup index held entries for the old inode's
+        // chunks; now only the new inode is live. Replace wholesale
+        // — stale entries pointing at chunks that aren't in the new
+        // inode would misdirect future dedup lookups.
+        self.dedup_index = new_index;
 
         Ok(())
     }
@@ -435,6 +483,13 @@ impl Filesystem {
     /// diagnostics.
     pub fn cdc_params(&self) -> &FastCdcParams {
         &self.cdc_params
+    }
+
+    /// Read-only view of the dedup index — lets tests verify that
+    /// a write populated the expected number of unique content
+    /// hashes.
+    pub fn dedup_index(&self) -> &DedupIndex {
+        &self.dedup_index
     }
 }
 
@@ -663,6 +718,26 @@ fn collect_data_pointers(
     }
 
     Ok(out)
+}
+
+/// Rebuild the dedup index by walking every data chunk referenced
+/// by `inode`, reading its content from the cover, hashing it, and
+/// inserting (hash, pointer) into a fresh [`DedupIndex`]. Called
+/// at mount time.
+fn build_dedup_index(
+    cover: &[u8],
+    map: &TensorMap,
+    inode: &Inode,
+) -> Result<DedupIndex, FsError> {
+    let mut idx = DedupIndex::new();
+    let data_ptrs = collect_data_pointers(inode, cover, map)?;
+    for ptr in data_ptrs {
+        let chunk_bytes = byte_capacity(ptr) as usize;
+        let mut buf = vec![0u8; chunk_bytes];
+        read_chunk(cover, map, ptr, 0, &mut buf)?;
+        idx.insert(hash_chunk(&buf), ptr);
+    }
+    Ok(idx)
 }
 
 /// Visit every non-null pointer the inode transitively references —
