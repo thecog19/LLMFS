@@ -44,13 +44,12 @@ use crate::stego::calibration::placement::MetadataPlacement;
 use crate::stego::tensor_map::TensorMap;
 use crate::v2::alloc::{AllocError, Allocator};
 use crate::v2::anchor::{self, AnchorError};
+use crate::v2::cdc::{FastCdcError, FastCdcParams, chunk_ranges};
 use crate::v2::ceiling::CeilingSummary;
 use crate::v2::chunk::{ChunkError, byte_capacity, read_chunk, write_chunk};
 use crate::v2::inode::{INODE_BYTES, Inode, InodeError, NUM_DIRECT};
 use crate::v2::pointer::{Pointer, PointerError};
 use crate::v2::super_root::{SUPER_ROOT_BYTES, SuperRoot, SuperRootError};
-
-const DEFAULT_CHUNK_SIZE_BYTES: u32 = 4096;
 
 /// Top-level V2 filesystem. Owns the cover bytes for the lifetime of
 /// the mount; [`Self::unmount`] returns them for persistence.
@@ -71,7 +70,7 @@ pub struct Filesystem {
     super_root_ptr: Pointer,
     root_inode: Inode,
     root_inode_ptr: Pointer,
-    data_chunk_size_bytes: u32,
+    cdc_params: FastCdcParams,
 }
 
 #[derive(Debug, Error)]
@@ -94,19 +93,19 @@ pub enum FsError {
     #[error("pointer codec: {0}")]
     Pointer(#[from] PointerError),
 
+    #[error("invalid CDC params: {0}")]
+    Cdc(#[from] FastCdcError),
+
     #[error("out of space: could not allocate {requested_bits} bits")]
     OutOfSpace { requested_bits: u32 },
 
-    #[error("invalid data chunk size {chunk_size}; must be greater than zero")]
-    InvalidChunkSize { chunk_size: u32 },
-
     #[error(
-        "file of {bytes} bytes needs more than {max_chunks} direct chunks at chunk size {chunk_size}; indirect pointers land in a later step"
+        "file of {bytes} bytes produced {chunk_count} chunks, exceeding the inode's {max_chunks}-chunk capacity (direct + single/double/triple indirect)"
     )]
     FileTooLarge {
         bytes: usize,
+        chunk_count: usize,
         max_chunks: usize,
-        chunk_size: u32,
     },
 
     #[error("super-root generation {super_root} disagrees with anchor generation {anchor}")]
@@ -129,20 +128,19 @@ pub enum FsError {
 
 impl Filesystem {
     /// Initialise a fresh V2 filesystem on a cover that has no prior
-    /// V2 state. Uses the default data chunk size
-    /// ([`DEFAULT_CHUNK_SIZE_BYTES`] = 4 KB).
+    /// V2 state. Uses the default CDC params (1 KB / 4 KB / 16 KB).
     pub fn init(cover: Vec<u8>, map: TensorMap) -> Result<Self, FsError> {
-        Self::init_with_chunk_size(cover, map, DEFAULT_CHUNK_SIZE_BYTES)
+        Self::init_with_cdc_params(cover, map, FastCdcParams::default())
     }
 
-    /// As [`Self::init`] but with a configurable data chunk size —
+    /// As [`Self::init`] but with configurable CDC parameters —
     /// useful for tests on smaller covers.
-    pub fn init_with_chunk_size(
+    pub fn init_with_cdc_params(
         mut cover: Vec<u8>,
         map: TensorMap,
-        data_chunk_size_bytes: u32,
+        cdc_params: FastCdcParams,
     ) -> Result<Self, FsError> {
-        validate_chunk_size(data_chunk_size_bytes)?;
+        cdc_params.validate()?;
         let ceiling = CeilingSummary::build(&cover, &map);
         let mut allocator = Allocator::new_for_map(&map, ceiling)?;
 
@@ -175,24 +173,25 @@ impl Filesystem {
             super_root_ptr,
             root_inode,
             root_inode_ptr,
-            data_chunk_size_bytes,
+            cdc_params,
         })
     }
 
     /// Mount an existing V2 filesystem from the cover.
     pub fn mount(cover: Vec<u8>, map: TensorMap) -> Result<Self, FsError> {
-        Self::mount_with_chunk_size(cover, map, DEFAULT_CHUNK_SIZE_BYTES)
+        Self::mount_with_cdc_params(cover, map, FastCdcParams::default())
     }
 
-    /// As [`Self::mount`] but with a configurable data chunk size —
-    /// must match the size used at init-time for subsequent writes
-    /// to stay within the direct-pointer budget (step 6 limitation).
-    pub fn mount_with_chunk_size(
+    /// As [`Self::mount`] but with configurable CDC parameters. Must
+    /// match the params used at init-time for subsequent writes to
+    /// produce compatible chunking (the inode / super-root chunks
+    /// themselves aren't CDC-chunked; they're fixed-size metadata).
+    pub fn mount_with_cdc_params(
         cover: Vec<u8>,
         map: TensorMap,
-        data_chunk_size_bytes: u32,
+        cdc_params: FastCdcParams,
     ) -> Result<Self, FsError> {
-        validate_chunk_size(data_chunk_size_bytes)?;
+        cdc_params.validate()?;
         // Compute the anchor placement once. The cover's ceiling
         // magnitudes are the same whether we're inside read_anchor or
         // new_for_map, so this single scan covers both.
@@ -242,59 +241,54 @@ impl Filesystem {
             super_root_ptr,
             root_inode,
             root_inode_ptr,
-            data_chunk_size_bytes,
+            cdc_params,
         })
     }
 
-    /// Replace the single-file contents with `data`. Allocates fresh
-    /// chunks, builds a new inode + super-root (with indirect blocks
-    /// as needed), and commits via an anchor-slot swap. Old chunks
-    /// leak for this milestone.
+    /// Replace the single-file contents with `data`. Runs FastCDC to
+    /// pick content-defined chunk boundaries, allocates + writes
+    /// each chunk, builds a new inode + super-root (with indirect
+    /// blocks as needed), and commits via an anchor-slot swap. Old
+    /// chunks leak for this milestone.
     pub fn write(&mut self, data: &[u8]) -> Result<(), FsError> {
-        let chunk_size = self.data_chunk_size_bytes as usize;
-        let ppb = ptrs_per_indirect_block(chunk_size);
-        let chunk_count = if data.is_empty() {
-            0
-        } else {
-            data.len().div_ceil(chunk_size.max(1))
-        };
+        // Content-defined chunking. For empty data, ranges is empty
+        // and we end up with an EMPTY inode.
+        let ranges = chunk_ranges(data, &self.cdc_params);
 
+        // ppb threshold for spilling into the next indirect tier is
+        // derived from avg_size — it's the "canonical full indirect
+        // block" pointer count even though actual indirect blocks
+        // are variable-sized in V2.
+        let ppb = ptrs_per_indirect_block(self.cdc_params.avg_size);
         let ppb2 = ppb.saturating_mul(ppb);
         let ppb3 = ppb2.saturating_mul(ppb);
         let max_chunks = NUM_DIRECT
             .saturating_add(ppb)
             .saturating_add(ppb2)
             .saturating_add(ppb3);
-        if chunk_count > max_chunks {
+        if ranges.len() > max_chunks {
             return Err(FsError::FileTooLarge {
                 bytes: data.len(),
+                chunk_count: ranges.len(),
                 max_chunks,
-                chunk_size: self.data_chunk_size_bytes,
             });
         }
 
         // Allocate + write every data chunk in order.
-        let mut data_chunk_ptrs = Vec::with_capacity(chunk_count);
-        let mut offset = 0;
-        for _ in 0..chunk_count {
-            let this_bytes = (data.len() - offset).min(chunk_size);
-            let bit_count = (this_bytes * 8) as u32;
+        let mut data_chunk_ptrs = Vec::with_capacity(ranges.len());
+        for range in &ranges {
+            let chunk = &data[range.clone()];
+            let bit_count = (chunk.len() * 8) as u32;
             let ptr = self
                 .alloc
                 .alloc(&self.map, bit_count)
                 .ok_or(FsError::OutOfSpace {
                     requested_bits: bit_count,
                 })?;
-            write_chunk(
-                &mut self.cover,
-                &self.map,
-                ptr,
-                0,
-                &data[offset..offset + this_bytes],
-            )?;
+            write_chunk(&mut self.cover, &self.map, ptr, 0, chunk)?;
             data_chunk_ptrs.push(ptr);
-            offset += this_bytes;
         }
+        let chunk_count = data_chunk_ptrs.len();
 
         // Thread data chunk pointers into direct + single/double/triple
         // indirect blocks per the standard ext2-style layout.
@@ -429,6 +423,19 @@ impl Filesystem {
     pub fn file_length(&self) -> u64 {
         self.root_inode.length
     }
+
+    /// Read-only view of the current root inode — lets callers see
+    /// which indirect tiers are populated and confirm the layout
+    /// matches the data. Primarily for tests.
+    pub fn root_inode(&self) -> &Inode {
+        &self.root_inode
+    }
+
+    /// Current CDC parameters (set at init/mount). Primarily for
+    /// diagnostics.
+    pub fn cdc_params(&self) -> &FastCdcParams {
+        &self.cdc_params
+    }
 }
 
 /// Collect the unique `(slot, weight_index)` pairs that appear in a
@@ -444,15 +451,6 @@ fn unique_weights(placement: &MetadataPlacement) -> Vec<(u16, u32)> {
         }
     }
     out
-}
-
-fn validate_chunk_size(data_chunk_size_bytes: u32) -> Result<(), FsError> {
-    if data_chunk_size_bytes == 0 {
-        return Err(FsError::InvalidChunkSize {
-            chunk_size: data_chunk_size_bytes,
-        });
-    }
-    Ok(())
 }
 
 /// Reserve every weight covered by `ptr` in the allocator.

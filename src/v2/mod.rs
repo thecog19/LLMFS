@@ -16,6 +16,7 @@
 
 pub mod alloc;
 pub mod anchor;
+pub mod cdc;
 pub mod ceiling;
 pub mod chunk;
 pub mod freelist;

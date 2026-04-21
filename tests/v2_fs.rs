@@ -25,10 +25,22 @@ use llmdb::gguf::quant::GgufQuantType;
 use llmdb::stego::planner::TensorTier;
 use llmdb::stego::tensor_map::{TensorMap, TensorSlot};
 use llmdb::v2::anchor;
+use llmdb::v2::cdc::FastCdcParams;
 use llmdb::v2::chunk::{read_chunk, write_chunk};
 use llmdb::v2::fs::{Filesystem, FsError};
 use llmdb::v2::inode::{INODE_BYTES, Inode};
 use llmdb::v2::super_root::{SUPER_ROOT_BYTES, SuperRoot};
+
+/// Small CDC parameters for tests — avg must be a power of two ≥ 4.
+/// Matches the 64-byte fixed-chunk tests' spirit; mean chunk is 64 B
+/// but individual chunks range 32..128 B based on content.
+fn small_cdc() -> FastCdcParams {
+    FastCdcParams {
+        min_size: 32,
+        avg_size: 64,
+        max_size: 128,
+    }
+}
 
 fn f32_to_f16_bits(value: f32) -> u16 {
     let bits = value.to_bits();
@@ -94,12 +106,12 @@ fn make_cover(weight_count: u64) -> (Vec<u8>, TensorMap) {
 #[test]
 fn init_then_unmount_remount_sees_empty_file() {
     let (cover, map) = make_cover(20_000);
-    let fs = Filesystem::init_with_chunk_size(cover, map.clone(), 64).expect("init");
+    let fs = Filesystem::init_with_cdc_params(cover, map.clone(), small_cdc()).expect("init");
     assert_eq!(fs.file_length(), 0);
     assert_eq!(fs.read().expect("read empty"), Vec::<u8>::new());
     let cover_after = fs.unmount();
 
-    let fs2 = Filesystem::mount_with_chunk_size(cover_after, map, 64).expect("mount");
+    let fs2 = Filesystem::mount_with_cdc_params(cover_after, map, small_cdc()).expect("mount");
     assert_eq!(fs2.file_length(), 0);
     assert_eq!(fs2.read().expect("read empty on mount"), Vec::<u8>::new());
 }
@@ -107,7 +119,7 @@ fn init_then_unmount_remount_sees_empty_file() {
 #[test]
 fn single_chunk_file_round_trips_across_remount() {
     let (cover, map) = make_cover(20_000);
-    let mut fs = Filesystem::init_with_chunk_size(cover, map.clone(), 64).expect("init");
+    let mut fs = Filesystem::init_with_cdc_params(cover, map.clone(), small_cdc()).expect("init");
 
     let data = b"Hello, V2 filesystem! This is a round trip.";
     fs.write(data).expect("write");
@@ -115,7 +127,7 @@ fn single_chunk_file_round_trips_across_remount() {
     assert_eq!(fs.read().expect("read after write"), data);
 
     let cover_after = fs.unmount();
-    let fs2 = Filesystem::mount_with_chunk_size(cover_after, map, 64).expect("mount");
+    let fs2 = Filesystem::mount_with_cdc_params(cover_after, map, small_cdc()).expect("mount");
     let readback = fs2.read().expect("read after mount");
     assert_eq!(readback, data);
     assert_eq!(fs2.file_length(), data.len() as u64);
@@ -126,21 +138,21 @@ fn multi_chunk_file_round_trips() {
     let (cover, map) = make_cover(30_000);
     // 32-byte chunks; 400 bytes = 13 chunks. Oops, over direct limit.
     // Use 40-byte chunks instead: 400 / 40 = 10 chunks, fits in direct.
-    let mut fs = Filesystem::init_with_chunk_size(cover, map.clone(), 40).expect("init");
+    let mut fs = Filesystem::init_with_cdc_params(cover, map.clone(), small_cdc()).expect("init");
 
     let data: Vec<u8> = (0..400_u32).map(|i| (i & 0xFF) as u8).collect();
     fs.write(&data).expect("write");
     assert_eq!(fs.read().expect("read"), data);
 
     let cover_after = fs.unmount();
-    let fs2 = Filesystem::mount_with_chunk_size(cover_after, map, 40).expect("mount");
+    let fs2 = Filesystem::mount_with_cdc_params(cover_after, map, small_cdc()).expect("mount");
     assert_eq!(fs2.read().expect("read remount"), data);
 }
 
 #[test]
 fn generation_bumps_on_each_write() {
     let (cover, map) = make_cover(20_000);
-    let mut fs = Filesystem::init_with_chunk_size(cover, map.clone(), 64).expect("init");
+    let mut fs = Filesystem::init_with_cdc_params(cover, map.clone(), small_cdc()).expect("init");
     // init puts gen=1 in the active slot.
     assert_eq!(fs.generation(), 1);
 
@@ -154,13 +166,13 @@ fn generation_bumps_on_each_write() {
 #[test]
 fn rewrite_replaces_file_contents() {
     let (cover, map) = make_cover(20_000);
-    let mut fs = Filesystem::init_with_chunk_size(cover, map.clone(), 64).expect("init");
+    let mut fs = Filesystem::init_with_cdc_params(cover, map.clone(), small_cdc()).expect("init");
     fs.write(b"first version").expect("write 1");
     fs.write(b"second version is longer").expect("write 2");
     assert_eq!(fs.read().expect("read"), b"second version is longer");
 
     let cover_after = fs.unmount();
-    let fs2 = Filesystem::mount_with_chunk_size(cover_after, map, 64).expect("mount");
+    let fs2 = Filesystem::mount_with_cdc_params(cover_after, map, small_cdc()).expect("mount");
     assert_eq!(fs2.read().expect("read"), b"second version is longer");
 }
 
@@ -170,7 +182,7 @@ fn write_beyond_direct_pointer_count_succeeds_with_indirect() {
     // work — they spill into single / double / triple indirect
     // blocks. Used to error FileTooLarge at > 12 chunks.
     let (cover, map) = make_cover(50_000);
-    let mut fs = Filesystem::init_with_chunk_size(cover, map.clone(), 40).expect("init");
+    let mut fs = Filesystem::init_with_cdc_params(cover, map.clone(), small_cdc()).expect("init");
     // 13 × 40 = 520 bytes — one chunk past direct's 12-pointer limit.
     let data = vec![0xAA_u8; 13 * 40];
     fs.write(&data).expect("write beyond direct limit");
@@ -182,37 +194,48 @@ fn mount_fails_on_cover_with_no_anchor() {
     // Fresh cover without init — anchor positions hold whatever the
     // cover bytes happened to have. Mount should fail cleanly.
     let (cover, map) = make_cover(20_000);
-    match Filesystem::mount_with_chunk_size(cover, map, 64) {
+    match Filesystem::mount_with_cdc_params(cover, map, small_cdc()) {
         Err(FsError::Anchor(_)) => {}
         other => panic!("expected Anchor error on unintialised cover, got {other:?}"),
     }
 }
 
 #[test]
-fn init_rejects_zero_chunk_size() {
+fn init_rejects_invalid_cdc_params() {
+    // avg_size must be a power of two ≥ 4.
     let (cover, map) = make_cover(20_000);
-    match Filesystem::init_with_chunk_size(cover, map, 0) {
-        Err(FsError::InvalidChunkSize { chunk_size: 0 }) => {}
-        other => panic!("expected InvalidChunkSize(0), got {other:?}"),
+    let bad = FastCdcParams {
+        min_size: 32,
+        avg_size: 100, // not a power of two
+        max_size: 256,
+    };
+    match Filesystem::init_with_cdc_params(cover, map, bad) {
+        Err(FsError::Cdc(_)) => {}
+        other => panic!("expected FsError::Cdc, got {other:?}"),
     }
 }
 
 #[test]
-fn mount_rejects_zero_chunk_size() {
+fn mount_rejects_invalid_cdc_params() {
     let (cover, map) = make_cover(20_000);
-    let fs = Filesystem::init_with_chunk_size(cover, map.clone(), 64).expect("init");
+    let fs = Filesystem::init_with_cdc_params(cover, map.clone(), small_cdc()).expect("init");
     let cover_after = fs.unmount();
 
-    match Filesystem::mount_with_chunk_size(cover_after, map, 0) {
-        Err(FsError::InvalidChunkSize { chunk_size: 0 }) => {}
-        other => panic!("expected InvalidChunkSize(0), got {other:?}"),
+    let bad = FastCdcParams {
+        min_size: 128,
+        avg_size: 64, // avg < min
+        max_size: 256,
+    };
+    match Filesystem::mount_with_cdc_params(cover_after, map, bad) {
+        Err(FsError::Cdc(_)) => {}
+        other => panic!("expected FsError::Cdc, got {other:?}"),
     }
 }
 
 #[test]
 fn mount_fails_cleanly_on_inode_pointer_with_invalid_slot() {
     let (cover, map) = make_cover(20_000);
-    let mut fs = Filesystem::init_with_chunk_size(cover, map.clone(), 64).expect("init");
+    let mut fs = Filesystem::init_with_cdc_params(cover, map.clone(), small_cdc()).expect("init");
     fs.write(b"hello").expect("write");
     let mut cover_after = fs.unmount();
 
@@ -231,7 +254,7 @@ fn mount_fails_cleanly_on_inode_pointer_with_invalid_slot() {
     inode.direct[0].slot = u16::MAX;
     write_chunk(&mut cover_after, &map, root_inode_ptr, 0, &inode.encode()).expect("write inode");
 
-    match Filesystem::mount_with_chunk_size(cover_after, map, 64) {
+    match Filesystem::mount_with_cdc_params(cover_after, map, small_cdc()) {
         Err(FsError::PointerSlotOutOfRange {
             slot: u16::MAX,
             slot_count: 1,
@@ -245,29 +268,29 @@ fn write_then_read_binary_data_round_trips() {
     // Non-ASCII bytes to guard against any accidental
     // text-only assumption.
     let (cover, map) = make_cover(30_000);
-    let mut fs = Filesystem::init_with_chunk_size(cover, map.clone(), 48).expect("init");
+    let mut fs = Filesystem::init_with_cdc_params(cover, map.clone(), small_cdc()).expect("init");
     let data: Vec<u8> = (0..256_u32).map(|i| (i.wrapping_mul(37) & 0xFF) as u8).collect();
     fs.write(&data).expect("write");
     assert_eq!(fs.read().expect("read"), data);
 
     let cover_after = fs.unmount();
-    let fs2 = Filesystem::mount_with_chunk_size(cover_after, map, 48).expect("mount");
+    let fs2 = Filesystem::mount_with_cdc_params(cover_after, map, small_cdc()).expect("mount");
     assert_eq!(fs2.read().expect("read"), data);
 }
 
 #[test]
 fn multiple_writes_across_multiple_sessions() {
     let (cover, map) = make_cover(30_000);
-    let mut fs = Filesystem::init_with_chunk_size(cover, map.clone(), 40).expect("init");
+    let mut fs = Filesystem::init_with_cdc_params(cover, map.clone(), small_cdc()).expect("init");
     fs.write(b"session-1 data").expect("write 1");
     let cover1 = fs.unmount();
 
     let mut fs2 =
-        Filesystem::mount_with_chunk_size(cover1, map.clone(), 40).expect("mount 1");
+        Filesystem::mount_with_cdc_params(cover1, map.clone(), small_cdc()).expect("mount 1");
     assert_eq!(fs2.read().expect("read"), b"session-1 data");
     fs2.write(b"session-2 replaces").expect("write 2");
     let cover2 = fs2.unmount();
 
-    let fs3 = Filesystem::mount_with_chunk_size(cover2, map, 40).expect("mount 2");
+    let fs3 = Filesystem::mount_with_cdc_params(cover2, map, small_cdc()).expect("mount 2");
     assert_eq!(fs3.read().expect("read"), b"session-2 replaces");
 }
