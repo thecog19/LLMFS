@@ -15,3 +15,5 @@
 //!   runs without a per-weight scan.
 
 pub mod ceiling;
+pub mod chunk;
+pub mod pointer;
