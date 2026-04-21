@@ -14,7 +14,9 @@
 //!   magnitudes, used by the allocator to find low-max-ceiling free
 //!   runs without a per-weight scan.
 
+pub mod alloc;
 pub mod anchor;
 pub mod ceiling;
 pub mod chunk;
+pub mod freelist;
 pub mod pointer;
