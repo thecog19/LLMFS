@@ -27,7 +27,7 @@ use llmdb::gguf::quant::GgufQuantType;
 use llmdb::stego::calibration::bit_io::{read_bit, write_bit};
 use llmdb::stego::calibration::placement::{MetadataBitPos, compute_metadata_placement};
 use llmdb::stego::calibration::stealable_bits_for;
-use llmdb::stego::packing::{q4_k, q5_k, q6_k};
+use llmdb::stego::packing::{q3_k, q4_k, q5_k, q6_k};
 use llmdb::stego::planner::TensorTier;
 use llmdb::stego::tensor_map::{TensorMap, TensorSlot};
 
@@ -238,6 +238,48 @@ fn single_bit_roundtrip_q8_0() {
     assert_eq!(positions.len(), 20);
     for pos in positions {
         assert_single_bit_roundtrip(&mut bytes, &slot, pos);
+    }
+}
+
+#[test]
+fn single_bit_roundtrip_q3_k() {
+    let (slot, mut bytes) = q_k_like_slot(
+        GgufQuantType::Q3K,
+        q3_k::WEIGHTS_PER_BLOCK as u64,
+        q3_k::BLOCK_BYTES,
+        0,
+    );
+    let map = single_slot_map(slot.clone());
+    // 256 weights × 1 bit = 256 positions.
+    let positions = enumerate_all_positions(&map);
+    assert_eq!(positions.len(), 256);
+    for pos in positions {
+        assert_single_bit_roundtrip(&mut bytes, &slot, pos);
+    }
+}
+
+#[test]
+fn write_does_not_alias_other_positions_q3_k() {
+    // Q3_K shares one qs byte across 4 weights (one per quadrant via
+    // shifts 0,2,4,6). Verify the 4-way split is actually disjoint —
+    // an earlier version of this test would have caught me picking
+    // the wrong bit position for quadrant 3.
+    let (slot, initial) = q_k_like_slot(
+        GgufQuantType::Q3K,
+        q3_k::WEIGHTS_PER_BLOCK as u64,
+        q3_k::BLOCK_BYTES,
+        0,
+    );
+    let map = single_slot_map(slot.clone());
+    let positions = enumerate_all_positions(&map);
+    for (a_idx, a) in positions.iter().enumerate() {
+        let mut bytes = initial.clone();
+        write_bit(&mut bytes, &slot, *a, true);
+        for (b_idx, b) in positions.iter().enumerate() {
+            let expected = a_idx == b_idx;
+            let got = read_bit(&bytes, &slot, *b);
+            assert_eq!(got, expected, "q3_k aliasing: write {a:?} flipped {b:?}");
+        }
     }
 }
 

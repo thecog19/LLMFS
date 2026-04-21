@@ -21,19 +21,26 @@ use std::path::Path;
 
 use llmdb::gguf::parser::parse_path;
 use llmdb::gguf::quant::GgufQuantType;
-use llmdb::stego::packing::{float, q4_k, q5_k, q6_k};
+use llmdb::stego::packing::{float, q3_k, q4_k, q5_k, q6_k};
 use memmap2::Mmap;
 
 const SRC_F16: &str = "models/pristine/smollm2-135m-f16.gguf";
+// Q3_K_M on SmolLM2-135M yields zero Q3_K tensors in practice — the
+// model's ffn_down rows pick Q4_K/Q5_K instead because of the mixing
+// heuristic. Q3_K_S pushes ffn_down rows to Q3_K, so we use it as the
+// reference fixture for Q3_K validation.
+const Q3_K_S_FIXTURE: &str = "benches/fixtures/k-quant/smollm2-135m-q3_k_s.gguf";
 const Q4_K_M_FIXTURE: &str = "benches/fixtures/k-quant/smollm2-135m-q4_k_m.gguf";
 const Q5_K_M_FIXTURE: &str = "benches/fixtures/k-quant/smollm2-135m-q5_k_m.gguf";
 
 /// Q4_K_M ships F16 weights as Q4_K, Q5_K, Q6_K, Q5_0 mixed; Q5_K_M
-/// pushes most tensors to Q5_K specifically. Different K-quant types
-/// surface in different fixtures, so the validation tests pick the
-/// fixture that's most likely to contain the target type.
+/// pushes most tensors to Q5_K specifically. Q3_K_M pushes down to
+/// Q3_K where possible. Different K-quant types surface in different
+/// fixtures, so the validation tests pick the fixture that's most
+/// likely to contain the target type.
 fn fixture_for(target: GgufQuantType) -> &'static str {
     match target {
+        GgufQuantType::Q3K => Q3_K_S_FIXTURE,
         GgufQuantType::Q5K => Q5_K_M_FIXTURE,
         _ => Q4_K_M_FIXTURE,
     }
@@ -55,6 +62,12 @@ fn open_cover(path: &str) -> Option<ParsedCover> {
 
 #[test]
 #[ignore = "needs ~100MB regen fixture; run with --ignored"]
+fn q3_k_decoder_matches_ggml_quantization() {
+    validate_kquant_against_f16(GgufQuantType::Q3K, q3_k_decode);
+}
+
+#[test]
+#[ignore = "needs ~100MB regen fixture; run with --ignored"]
 fn q4_k_decoder_matches_ggml_quantization() {
     validate_kquant_against_f16(GgufQuantType::Q4K, q4_k_decode);
 }
@@ -69,6 +82,10 @@ fn q5_k_decoder_matches_ggml_quantization() {
 #[ignore = "needs ~100MB regen fixture; run with --ignored"]
 fn q6_k_decoder_matches_ggml_quantization() {
     validate_kquant_against_f16(GgufQuantType::Q6K, q6_k_decode);
+}
+
+fn q3_k_decode(block: &[u8], i: usize) -> f32 {
+    q3_k::read_weight_value(block, i).expect("q3_k decode")
 }
 
 fn q4_k_decode(block: &[u8], i: usize) -> f32 {
@@ -102,12 +119,14 @@ fn validate_kquant_against_f16(target: GgufQuantType, decode: fn(&[u8], usize) -
     let quant_base = quant.parsed.tensor_data_offset as u64;
 
     let block_bytes = match target {
+        GgufQuantType::Q3K => q3_k::BLOCK_BYTES,
         GgufQuantType::Q4K => q4_k::BLOCK_BYTES,
         GgufQuantType::Q5K => q5_k::BLOCK_BYTES,
         GgufQuantType::Q6K => q6_k::BLOCK_BYTES,
         _ => unreachable!(),
     };
     let weights_per_block = match target {
+        GgufQuantType::Q3K => q3_k::WEIGHTS_PER_BLOCK,
         GgufQuantType::Q4K => q4_k::WEIGHTS_PER_BLOCK,
         GgufQuantType::Q5K => q5_k::WEIGHTS_PER_BLOCK,
         GgufQuantType::Q6K => q6_k::WEIGHTS_PER_BLOCK,
@@ -191,12 +210,18 @@ fn validate_kquant_against_f16(target: GgufQuantType, decode: fn(&[u8], usize) -
     // ballpark?" not "is it pixel-perfect?". A wrong decoder produces
     // values 100×-1000× off, which these bounds would catch instantly.
     let mean_bound = match target {
+        // Q3_K has 3 bits/weight so the reconstruction envelope is
+        // wider than Q4_K's; empirically mean_err on transformer
+        // weights is ~0.024 with max up to ~0.66 due to the hmask
+        // high-bit stepping through ±4×scale.
+        GgufQuantType::Q3K => 0.05,
         GgufQuantType::Q4K => 0.05,
         GgufQuantType::Q5K => 0.025,
         GgufQuantType::Q6K => 0.012,
         _ => unreachable!(),
     };
     let max_bound = match target {
+        GgufQuantType::Q3K => 1.0,
         GgufQuantType::Q4K => 0.5,
         GgufQuantType::Q5K => 0.3,
         GgufQuantType::Q6K => 0.2,

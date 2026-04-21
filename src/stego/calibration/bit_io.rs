@@ -21,7 +21,7 @@
 use crate::gguf::quant::GgufQuantType;
 use crate::stego::calibration::placement::MetadataBitPos;
 use crate::stego::calibration::stealable_bits_for;
-use crate::stego::packing::{q4_k, q5_k, q6_k};
+use crate::stego::packing::{q3_k, q4_k, q5_k, q6_k};
 use crate::stego::tensor_map::TensorSlot;
 
 /// Byte offset + bit position (0..7) of a stealable bit in the mmap.
@@ -81,6 +81,31 @@ fn locate(slot: &TensorSlot, pos: MetadataBitPos) -> BitSite {
             BitSite {
                 byte_offset,
                 bit_in_byte: pos.bit_index,
+            }
+        }
+        GgufQuantType::Q3K => {
+            // 110-byte block: hmask[32] + qs[64] + scales[12] + d[2].
+            // 3 bits per weight, 2 of which come from qs and 1 from
+            // hmask. Only the LSB of the qs 2-bit value is stealable
+            // (flipping it shifts the decoded value by a single scale
+            // step); the hmask high-bit sits on the far side of the
+            // bias branch and moves the weight by 4×scale.
+            //
+            // qs[k] packs 4 weights at shifts {0,2,4,6}; for weight
+            // at shift = j*2 the stealable bit is bit j*2 of qs[k].
+            let block_weights = q3_k::WEIGHTS_PER_BLOCK as u64;
+            let block_bytes = q3_k::BLOCK_BYTES;
+            let block_idx = pos.weight_index / block_weights;
+            let in_block = pos.weight_index % block_weights;
+            let super_n = (in_block / 128) as usize;
+            let within_quadrant = (in_block % 32) as usize;
+            let j = ((in_block / 32) & 3) as u8;
+            let qs_byte_idx = q3_k::QS_OFFSET + super_n * 32 + within_quadrant;
+            let byte_offset =
+                slot.data_offset as usize + block_idx as usize * block_bytes + qs_byte_idx;
+            BitSite {
+                byte_offset,
+                bit_in_byte: j * 2,
             }
         }
         GgufQuantType::Q4K => {

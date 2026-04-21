@@ -29,7 +29,7 @@
 use llmdb::gguf::quant::GgufQuantType;
 use llmdb::stego::calibration::magnitude::read_weight_abs;
 use llmdb::stego::calibration::stealable_bits_for;
-use llmdb::stego::packing::{q4_k, q5_k, q6_k};
+use llmdb::stego::packing::{q3_k, q4_k, q5_k, q6_k};
 use llmdb::stego::planner::TensorTier;
 use llmdb::stego::tensor_map::TensorSlot;
 
@@ -72,11 +72,11 @@ fn classify(t: GgufQuantType) -> Kind {
         GgufQuantType::F32
         | GgufQuantType::F16
         | GgufQuantType::Q8_0
+        | GgufQuantType::Q3K
         | GgufQuantType::Q4K
         | GgufQuantType::Q5K
         | GgufQuantType::Q6K => Kind::Decoded,
-        GgufQuantType::Q3K
-        | GgufQuantType::Q2K
+        GgufQuantType::Q2K
         | GgufQuantType::Q4_0
         | GgufQuantType::Q4_1
         | GgufQuantType::Q5_0
@@ -147,8 +147,15 @@ fn nonzero_fixture(quant_type: GgufQuantType) -> Vec<u8> {
             b[q6_k::BLOCK_BYTES - 18] = 1; // scales[0] (scales array at 128+64=192)
             b
         }
+        GgufQuantType::Q3K => {
+            // d = 1.0; hmask, qs, scales left at zero. Default q3 =
+            // 0 - 4 = -4 for every weight, scale = 0 - 32 = -32, so
+            // weight 0 = 1 * -32 * -4 = 128. |w| = 128 > 0.
+            let mut b = vec![0_u8; q3_k::BLOCK_BYTES];
+            b[q3_k::D_OFFSET..q3_k::D_OFFSET + 2].copy_from_slice(&0x3C00_u16.to_le_bytes());
+            b
+        }
         // Stubs — buffers never touched; zero bytes suffice.
-        GgufQuantType::Q3K => vec![0_u8; 110],
         GgufQuantType::Q2K
         | GgufQuantType::Q4_0
         | GgufQuantType::Q4_1
@@ -198,29 +205,28 @@ fn stub_types_return_zero_magnitude() {
 }
 
 #[test]
-fn eligible_stubs_are_the_known_bug_set() {
-    // An "eligible stub" is a quant type that the planner would give
-    // stealable capacity to but the estimator can't actually rank.
-    // Today Q3K is the only one — the rest of the stubs (Q2K, Q4_0,
-    // Q4_1, Q5_0, Q5_1, Q8_1, Q8K) advertise 0 stealable bits, so
-    // the planner skips them anyway.
+fn no_eligible_stubs_exist() {
+    // An "eligible stub" is a quant type that the planner would
+    // give stealable capacity to but the estimator can't actually
+    // rank — a latent bug where covers using that type would have
+    // their low-magnitude ranking dominated by 0.0s. We insist on
+    // zero such types today. The non-eligible stubs (Q2K, Q4_0,
+    // Q4_1, Q5_0, Q5_1, Q8_1, Q8K) all declare zero stealable bits,
+    // so the planner skips them — they're not reachable through
+    // the calibration dispatch in any supported config.
     //
-    // If this list grows without a matching decoder, covers using
-    // that quant type will have their low-magnitude ranking
-    // dominated by stub-type weights (all 0.0), producing subtly
-    // wrong metadata placements. The fix is a real decoder, not
-    // reclassification.
-    let mut eligible_stubs: Vec<GgufQuantType> = ALL_VARIANTS
+    // If this fires, it means a quant type landed with a nonzero
+    // stealable-bits budget but without a decoder. The fix is the
+    // decoder (mirroring q3_k / q4_k / q5_k / q6_k), not a bump to
+    // stealable_bits_hint.
+    let eligible_stubs: Vec<GgufQuantType> = ALL_VARIANTS
         .iter()
         .copied()
         .filter(|t| classify(*t) == Kind::Stub && stealable_bits_for(*t) > 0)
         .collect();
-    eligible_stubs.sort_by_key(|t| format!("{t:?}"));
-    assert_eq!(
-        eligible_stubs,
-        vec![GgufQuantType::Q3K],
-        "eligible-stub set changed — add a decoder (preferred) or confirm the \
-         stealable-bit budget in stealable_bits_hint() is deliberate",
+    assert!(
+        eligible_stubs.is_empty(),
+        "eligible stub(s) present: {eligible_stubs:?} — each needs a real decoder",
     );
 }
 

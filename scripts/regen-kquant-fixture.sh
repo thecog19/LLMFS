@@ -21,6 +21,7 @@ set -euo pipefail
 
 SRC="${SRC:-models/pristine/smollm2-135m-f16.gguf}"
 OUT_DIR="${OUT_DIR:-benches/fixtures/k-quant}"
+OUT_Q3="${OUT_DIR}/smollm2-135m-q3_k_s.gguf"
 OUT_Q4="${OUT_DIR}/smollm2-135m-q4_k_m.gguf"
 OUT_Q5="${OUT_DIR}/smollm2-135m-q5_k_m.gguf"
 
@@ -37,6 +38,8 @@ fi
 [ -f "$SRC" ] || { echo "missing source: $SRC" >&2; exit 1; }
 
 mkdir -p "$OUT_DIR"
+"$QBIN" "$SRC" "$OUT_Q3" Q3_K_S
+echo "wrote $OUT_Q3"
 "$QBIN" "$SRC" "$OUT_Q4" Q4_K_M
 echo "wrote $OUT_Q4"
 "$QBIN" "$SRC" "$OUT_Q5" Q5_K_M
