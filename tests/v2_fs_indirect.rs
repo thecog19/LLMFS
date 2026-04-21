@@ -6,10 +6,10 @@
 //!
 //! 1. Write at sizes that span every plausible tier bucket and
 //!    verify bytes round-trip.
-//! 2. Inspect `fs.root_inode()` to check which indirect pointers
-//!    are actually populated for each size. Soft checks (each test
-//!    asserts at least one of a reasonable set) rather than "this
-//!    size always hits triple indirect."
+//! 2. Inspect the FILE's inode (via `fs.inode_at("/data")`) to check
+//!    which indirect pointers are actually populated. Soft checks
+//!    (each test asserts at least one of a reasonable set) rather
+//!    than "this size always hits triple indirect."
 //! 3. Prove an overflow error at a size guaranteed to exceed
 //!    max_chunks even with max-size chunks.
 //!
@@ -109,18 +109,18 @@ fn small_file_round_trips() {
     let data = pattern(500, 0xA5A5);
 
     let mut fs = Filesystem::init_with_cdc_params(cover, map.clone(), small_cdc()).expect("init");
-    fs.write(&data).expect("write");
-    assert_eq!(fs.read().expect("read"), data);
+    fs.create_file("/data", &data).expect("create_file");
+    assert_eq!(fs.read_file("/data").expect("read"), data);
 
     // 500 B ≤ 1536 B → direct-only guaranteed.
-    let inode = fs.root_inode();
+    let inode = fs.inode_at("/data").expect("file inode");
     assert!(inode.single_indirect.is_null(), "should not need indirect");
     assert!(inode.double_indirect.is_null());
     assert!(inode.triple_indirect.is_null());
 
     let cover_after = fs.unmount();
     let fs2 = Filesystem::mount_with_cdc_params(cover_after, map, small_cdc()).expect("mount");
-    assert_eq!(fs2.read().expect("read after remount"), data);
+    assert_eq!(fs2.read_file("/data").expect("read after remount"), data);
 }
 
 #[test]
@@ -130,10 +130,10 @@ fn medium_file_round_trips_using_indirect() {
     let data = pattern(2048, 0xDEAD_BEEF);
 
     let mut fs = Filesystem::init_with_cdc_params(cover, map.clone(), small_cdc()).expect("init");
-    fs.write(&data).expect("write");
-    assert_eq!(fs.read().expect("read"), data);
+    fs.create_file("/data", &data).expect("create_file");
+    assert_eq!(fs.read_file("/data").expect("read"), data);
 
-    let inode = fs.root_inode();
+    let inode = fs.inode_at("/data").expect("file inode");
     assert!(
         !inode.single_indirect.is_null()
             || !inode.double_indirect.is_null()
@@ -143,7 +143,7 @@ fn medium_file_round_trips_using_indirect() {
 
     let cover_after = fs.unmount();
     let fs2 = Filesystem::mount_with_cdc_params(cover_after, map, small_cdc()).expect("mount");
-    assert_eq!(fs2.read().expect("read after remount"), data);
+    assert_eq!(fs2.read_file("/data").expect("read after remount"), data);
 }
 
 #[test]
@@ -156,18 +156,18 @@ fn large_file_round_trips_deep_indirect() {
     let data = pattern(8192, 0xCAFE_BABE);
 
     let mut fs = Filesystem::init_with_cdc_params(cover, map.clone(), small_cdc()).expect("init");
-    match fs.write(&data) {
+    match fs.create_file("/data", &data) {
         Ok(()) => {
-            let inode = fs.root_inode();
+            let inode = fs.inode_at("/data").expect("file inode");
             assert!(
                 !inode.triple_indirect.is_null(),
                 "8 KB at min=32 should need triple indirect; inode = {inode:?}",
             );
-            assert_eq!(fs.read().expect("read"), data);
+            assert_eq!(fs.read_file("/data").expect("read"), data);
             let cover_after = fs.unmount();
             let fs2 =
                 Filesystem::mount_with_cdc_params(cover_after, map, small_cdc()).expect("mount");
-            assert_eq!(fs2.read().expect("read after remount"), data);
+            assert_eq!(fs2.read_file("/data").expect("read after remount"), data);
         }
         Err(FsError::FileTooLarge { chunk_count, .. }) => {
             // Content happened to produce too many chunks. Not a
@@ -194,7 +194,7 @@ fn file_guaranteed_beyond_triple_indirect_returns_file_too_large() {
     let data = pattern(13_000, 0x0000_0001);
 
     let mut fs = Filesystem::init_with_cdc_params(cover, map, small_cdc()).expect("init");
-    match fs.write(&data) {
+    match fs.create_file("/data", &data) {
         Err(FsError::FileTooLarge {
             chunk_count,
             max_chunks,
@@ -217,17 +217,17 @@ fn rewrite_shrinks_large_to_small() {
     let mut fs = Filesystem::init_with_cdc_params(cover, map.clone(), small_cdc()).expect("init");
 
     let large = pattern(2000, 0xAAAA);
-    if fs.write(&large).is_err() {
+    if fs.create_file("/data", &large).is_err() {
         eprintln!("large write hit CDC variance → skip");
         return;
     }
-    assert_eq!(fs.read().expect("read"), large);
+    assert_eq!(fs.read_file("/data").expect("read"), large);
 
     // Shrink to well inside direct.
     let small = pattern(200, 0xBBBB);
-    fs.write(&small).expect("write small");
-    assert_eq!(fs.read().expect("read after shrink"), small);
-    let inode = fs.root_inode();
+    fs.create_file("/data", &small).expect("write small");
+    assert_eq!(fs.read_file("/data").expect("read after shrink"), small);
+    let inode = fs.inode_at("/data").expect("file inode");
     assert!(
         inode.single_indirect.is_null(),
         "200 B should fit in direct after shrink; inode = {inode:?}",
@@ -235,7 +235,7 @@ fn rewrite_shrinks_large_to_small() {
 
     let cover_after = fs.unmount();
     let fs2 = Filesystem::mount_with_cdc_params(cover_after, map, small_cdc()).expect("mount");
-    assert_eq!(fs2.read().expect("read after remount"), small);
+    assert_eq!(fs2.read_file("/data").expect("read after remount"), small);
 }
 
 #[test]
@@ -244,15 +244,15 @@ fn rewrite_grows_small_to_large() {
     let mut fs = Filesystem::init_with_cdc_params(cover, map.clone(), small_cdc()).expect("init");
 
     let small = pattern(200, 0xCCCC);
-    fs.write(&small).expect("write small");
+    fs.create_file("/data", &small).expect("write small");
 
     let large = pattern(2500, 0xDDDD);
-    if fs.write(&large).is_err() {
+    if fs.create_file("/data", &large).is_err() {
         eprintln!("large write hit CDC variance → skip");
         return;
     }
-    assert_eq!(fs.read().expect("read after grow"), large);
-    let inode = fs.root_inode();
+    assert_eq!(fs.read_file("/data").expect("read after grow"), large);
+    let inode = fs.inode_at("/data").expect("file inode");
     assert!(
         !inode.single_indirect.is_null()
             || !inode.double_indirect.is_null()
@@ -262,5 +262,5 @@ fn rewrite_grows_small_to_large() {
 
     let cover_after = fs.unmount();
     let fs2 = Filesystem::mount_with_cdc_params(cover_after, map, small_cdc()).expect("mount");
-    assert_eq!(fs2.read().expect("read after remount"), large);
+    assert_eq!(fs2.read_file("/data").expect("read after remount"), large);
 }

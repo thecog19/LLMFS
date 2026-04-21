@@ -4,14 +4,14 @@
 //! What these verify, via the visible public surface:
 //! 1. **Within-write dedup.** An all-zeros payload collapses into
 //!    one (or very few) unique data chunks — every interior chunk
-//!    has identical content, so the inode holds the same pointer
+//!    has identical content, so the file inode holds the same pointer
 //!    multiple times.
 //! 2. **Rewrite dedup.** Writing the same data twice in a session
 //!    reuses the pre-rewrite chunks — all pointers in the new inode
 //!    appeared in the old inode.
 //! 3. **Dedup survives unmount.** A remount rebuilds the dedup index
-//!    from the current inode; a subsequent write of identical data
-//!    still dedup-hits (pointers unchanged).
+//!    by walking every file in the tree; a subsequent write of
+//!    identical data still dedup-hits (pointers unchanged).
 //! 4. **Unique content allocates uniquely.** Writing distinct
 //!    chunks' worth of data produces distinct pointers — the index
 //!    doesn't collapse non-duplicates.
@@ -45,8 +45,6 @@ fn f32_to_f16_bits(value: f32) -> u16 {
 }
 
 fn make_cover() -> (Vec<u8>, TensorMap) {
-    // 20 K weights → 2.5 KB bitmap → fits in ~40 small_cdc chunks
-    // (under the 96-chunk cap at ppb=4).
     let weight_count = 20_000_u64;
     let values: Vec<f32> = (0..weight_count)
         .map(|i| {
@@ -85,9 +83,11 @@ fn small_cdc() -> FastCdcParams {
     }
 }
 
-/// Collect every non-null direct-pointer from the current inode.
+/// Collect every non-null direct-pointer from the `/data` file's
+/// inode — the test's single user-visible file.
 fn direct_pointers(fs: &Filesystem) -> Vec<Pointer> {
-    fs.root_inode()
+    fs.inode_at("/data")
+        .expect("file inode")
         .direct
         .iter()
         .filter(|p| !p.is_null())
@@ -110,23 +110,15 @@ fn all_zeros_file_collapses_to_a_single_data_chunk() {
     // 1 KB zeros → maybe 8–32 chunks at small_cdc params, all but
     // possibly the first / last identical.
     let data = vec![0u8; 1024];
-    fs.write(&data).expect("write zeros");
+    fs.create_file("/data", &data).expect("write zeros");
 
-    let inode = fs.root_inode();
-    let ptrs: Vec<Pointer> = inode
-        .direct
-        .iter()
-        .filter(|p| !p.is_null())
-        .copied()
-        .collect();
+    let ptrs = direct_pointers(&fs);
     assert!(!ptrs.is_empty(), "expected at least one chunk");
 
     // At least one pointer should appear twice — dedup hit among
     // identical interior chunks.
-    let unique: HashSet<(u16, u32)> = ptrs
-        .iter()
-        .map(|p| (p.slot, p.start_weight))
-        .collect();
+    let unique: HashSet<(u16, u32)> =
+        ptrs.iter().map(|p| (p.slot, p.start_weight)).collect();
     assert!(
         unique.len() < ptrs.len(),
         "all-zeros file should dedup some chunks: {} pointers → {} unique",
@@ -134,12 +126,14 @@ fn all_zeros_file_collapses_to_a_single_data_chunk() {
         unique.len(),
     );
 
-    // Dedup index holds only distinct content hashes — its size
-    // matches `unique` (same chunks → same hashes → one entry each).
-    assert_eq!(fs.dedup_index().len(), unique.len());
+    // The dedup index tracks every live file chunk — its size should
+    // be at least `unique.len()` (it may also include the file's
+    // indirect-tier pointers, but the direct-only file we wrote has
+    // no indirects).
+    assert!(fs.dedup_index().len() >= unique.len());
 
     // Round-trip the bytes.
-    assert_eq!(fs.read().expect("read"), data);
+    assert_eq!(fs.read_file("/data").expect("read"), data);
 }
 
 // ------------------------------------------------------------------
@@ -152,13 +146,14 @@ fn rewriting_identical_content_reuses_existing_pointers() {
     let mut fs = Filesystem::init_with_cdc_params(cover, map.clone(), small_cdc()).expect("init");
 
     let data = b"dedup in action, same content, same pointers";
-    fs.write(data).expect("first write");
+    fs.create_file("/data", data).expect("first write");
     let first: HashSet<(u16, u32)> = direct_pointers(&fs)
         .iter()
         .map(|p| (p.slot, p.start_weight))
         .collect();
 
-    fs.write(data).expect("second write of same content");
+    fs.create_file("/data", data)
+        .expect("second write of same content");
     let second: HashSet<(u16, u32)> = direct_pointers(&fs)
         .iter()
         .map(|p| (p.slot, p.start_weight))
@@ -186,7 +181,7 @@ fn dedup_survives_remount() {
     let mut fs = Filesystem::init_with_cdc_params(cover, map.clone(), small_cdc()).expect("init");
 
     let data = b"persistent dedup: identical bytes across sessions";
-    fs.write(data).expect("write 1");
+    fs.create_file("/data", data).expect("write 1");
     let original_ptrs: HashSet<(u16, u32)> = direct_pointers(&fs)
         .iter()
         .map(|p| (p.slot, p.start_weight))
@@ -196,10 +191,11 @@ fn dedup_survives_remount() {
     let mut fs2 =
         Filesystem::mount_with_cdc_params(cover1, map, small_cdc()).expect("mount");
     // After mount the dedup index should have been rebuilt from
-    // the current inode; size equals unique pointers.
-    assert_eq!(fs2.dedup_index().len(), original_ptrs.len());
+    // the current inode tree.
+    assert!(fs2.dedup_index().len() >= original_ptrs.len());
 
-    fs2.write(data).expect("second write of same content");
+    fs2.create_file("/data", data)
+        .expect("second write of same content");
     let after_remount: HashSet<(u16, u32)> = direct_pointers(&fs2)
         .iter()
         .map(|p| (p.slot, p.start_weight))
@@ -228,13 +224,11 @@ fn distinct_content_produces_distinct_pointers() {
             (state & 0xFF) as u8
         })
         .collect();
-    fs.write(&data).expect("write");
+    fs.create_file("/data", &data).expect("write");
 
     let ptrs = direct_pointers(&fs);
-    let unique: HashSet<(u16, u32)> = ptrs
-        .iter()
-        .map(|p| (p.slot, p.start_weight))
-        .collect();
+    let unique: HashSet<(u16, u32)> =
+        ptrs.iter().map(|p| (p.slot, p.start_weight)).collect();
     // Every chunk has distinct content → pointers should be all
     // distinct. Equality (not just ≤) confirms no false dedup hits.
     assert_eq!(
@@ -243,5 +237,5 @@ fn distinct_content_produces_distinct_pointers() {
         "random chunks shouldn't collide under dedup",
     );
 
-    assert_eq!(fs.read().expect("read"), data);
+    assert_eq!(fs.read_file("/data").expect("read"), data);
 }

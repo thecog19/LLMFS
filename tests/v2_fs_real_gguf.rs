@@ -58,9 +58,9 @@ fn smollm2_135m_f16_round_trips_through_v2_filesystem() {
         .map(|i| (i.wrapping_mul(2654435761) & 0xFF) as u8)
         .collect();
     let write_t = std::time::Instant::now();
-    fs.write(&payload).expect("V2 write payload");
+    fs.create_file("/data", &payload).expect("V2 write payload");
     eprintln!("write ({} bytes): {:?}", payload.len(), write_t.elapsed());
-    assert_eq!(fs.read().expect("read after write"), payload);
+    assert_eq!(fs.read_file("/data").expect("read after write"), payload);
 
     // Round-trip across unmount + remount. This is the thing that
     // would have broken if ceiling-magnitude anchor placement didn't
@@ -69,7 +69,7 @@ fn smollm2_135m_f16_round_trips_through_v2_filesystem() {
     let mount_t = std::time::Instant::now();
     let fs2 = Filesystem::mount(cover_after, map).expect("V2 mount on written cover");
     eprintln!("mount: {:?}", mount_t.elapsed());
-    let readback = fs2.read().expect("V2 read after remount");
+    let readback = fs2.read_file("/data").expect("V2 read after remount");
     assert_eq!(
         readback, payload,
         "payload must survive unmount+remount on a real GGUF cover"

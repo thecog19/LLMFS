@@ -1,42 +1,48 @@
-//! V2 [`Filesystem`] — top-level init / mount / write / read / unmount.
+//! V2 [`Filesystem`] — hierarchical path-addressed files and
+//! directories over a GGUF cover.
 //!
-//! Step 6 scope: single-file model (the "root directory inode" is a
-//! stand-in for the single user file — hierarchical directories land
-//! in step 11). Direct pointers only (step 7 adds indirect). Fixed-
-//! size chunking (step 8 swaps in FastCDC). No dedup (step 9), no
-//! dirty bitmap (step 10).
+//! The super-root's `root_dir_inode` points at the inode whose data
+//! chunks hold the serialized root [`Directory`]. Every directory —
+//! root or nested — uses the same shape: an [`Inode`] with
+//! direct / single / double / triple indirect pointers to variable-
+//! length CDC-chunked content. Files are identical in shape; only
+//! their content is user bytes instead of entry tables.
 //!
-//! # Flow
+//! # Path-based API
 //!
-//! **Init** [`Filesystem::init`]:
-//! 1. Build [`CeilingSummary`] from the pristine cover.
-//! 2. Build [`Allocator`] (full cover free).
-//! 3. Compute the anchor placement and reserve its weights in the
-//!    allocator so later allocs never hand them back.
-//! 4. Allocate + write an empty [`Inode`] (the "root") to a chunk.
-//! 5. Build a [`SuperRoot`] pointing at the root inode with
-//!    generation = 1.
-//! 6. Allocate + write the super-root to its own chunk.
-//! 7. [`anchor::init_anchor`] installs both anchor slots.
+//! All mutations target an absolute path:
 //!
-//! **Mount** [`Filesystem::mount`]:
-//! 1. Read the anchor. Use the active (higher-gen valid) slot.
-//! 2. Rebuild the allocator; reserve anchor + the currently-referenced
-//!    chunks (super-root, root inode, each direct-pointer data chunk)
-//!    so subsequent allocs don't clobber live state.
-//! 3. Cross-check super-root generation against anchor generation.
+//! - [`Filesystem::mkdir`] — create an empty directory
+//! - [`Filesystem::rmdir`] — remove an empty directory
+//! - [`Filesystem::create_file`] — create or overwrite a file
+//! - [`Filesystem::unlink`] — remove a file
+//! - [`Filesystem::read_file`] — load a file's bytes
+//! - [`Filesystem::readdir`] — list a directory's entries
+//! - [`Filesystem::exists`] — check path presence
 //!
-//! **Write** [`Filesystem::write`]:
-//! 1. Chunk the data into ≤ [`NUM_DIRECT`] fixed-size pieces.
-//! 2. Allocate + write each chunk.
-//! 3. Build + allocate + write the new root inode and super-root.
-//! 4. [`anchor::commit_anchor`] flips to the new super-root.
-//! 5. In-memory state updated; **old chunks are leaked** for this
-//!    milestone (garbage collection lands with the free-path dedup /
-//!    dirty-bitmap work in later steps).
+//! Each mutation is a single CoW commit: the leaf's new content is
+//! allocated, its parent directory is rewritten with the updated
+//! entry, and the directory chain is rewritten back up to the root.
+//! The super-root + anchor slot swap at the end makes the whole
+//! rewrite atomic.
 //!
-//! **Read** [`Filesystem::read`]: walk the root inode's direct
-//! pointers, concatenate chunks, truncate to `inode.length`.
+//! # Allocator priority
+//!
+//! File content chunks consult the dedup index first (identical
+//! bytes → same pointer; no re-allocation), fall through to
+//! `alloc_preferring_dirty` (already-perturbed free runs), and
+//! finally to the pristine ceiling-magnitude-ranked free list.
+//! Directory content, super-roots, inodes, and the dirty bitmap do
+//! not dedup — they're overwritten on every commit and the hash
+//! lookup would be wasted work.
+//!
+//! # Reclamation
+//!
+//! After each commit the old tree's chunks are returned to the
+//! free list (marked dirty) by diffing the old vs. new reachable
+//! sets. [`collect_tree_chunks`] walks the directory tree
+//! recursively and unions in the inode trees of every file and
+//! directory it reaches.
 
 use thiserror::Error;
 
@@ -48,6 +54,7 @@ use crate::v2::cdc::{FastCdcError, FastCdcParams, chunk_ranges};
 use crate::v2::ceiling::CeilingSummary;
 use crate::v2::chunk::{ChunkError, byte_capacity, read_chunk, write_chunk};
 use crate::v2::dedup::{DedupIndex, hash_chunk};
+use crate::v2::directory::{DirEntry, Directory, DirectoryError, EntryKind, MAX_NAME_LEN};
 use crate::v2::dirty::{DirtyBitmap, DirtyBitmapError};
 use crate::v2::inode::{INODE_BYTES, Inode, InodeError, NUM_DIRECT};
 use crate::v2::pointer::{Pointer, PointerError};
@@ -55,12 +62,6 @@ use crate::v2::super_root::{SUPER_ROOT_BYTES, SuperRoot, SuperRootError};
 
 /// Top-level V2 filesystem. Owns the cover bytes for the lifetime of
 /// the mount; [`Self::unmount`] returns them for persistence.
-///
-/// Caches the anchor placement so init / mount / write don't rescan
-/// every eligible weight on each operation. Without the cache, a 270
-/// MB cover pays ~30 s per write (the scan is O(eligible_weights)
-/// and dominates the commit); with the cache it's a one-shot cost at
-/// init / mount.
 #[derive(Debug)]
 pub struct Filesystem {
     cover: Vec<u8>,
@@ -70,20 +71,20 @@ pub struct Filesystem {
     generation: u64,
     super_root: SuperRoot,
     super_root_ptr: Pointer,
+    /// The root directory's inode (describes where the serialized
+    /// [`Directory`] lives). Decoded in-memory for cheap lookups.
     root_inode: Inode,
     root_inode_ptr: Pointer,
+    /// Deserialized root directory. Kept in memory for O(log n)
+    /// path walks without re-reading inode + content chunks each
+    /// time.
+    root_directory: Directory,
     cdc_params: FastCdcParams,
-    /// In-memory content-hash index of the data chunks currently
-    /// referenced by `root_inode`. `Filesystem::write` consults this
-    /// before allocating each new chunk — a hit means "reuse the
-    /// pointer, skip alloc + write." Rebuilt from scratch at
-    /// `mount` (step 9 scope; persistence lands in a later step).
+    /// Content-hash index of every live **file** data chunk. Rebuilt
+    /// from scratch at mount and after every commit.
     dedup_index: DedupIndex,
-    /// In-memory dirty-weight bitmap. Marked as each chunk write
-    /// hits the cover; allocator prefers dirty-free runs over
-    /// pristine ones. Not yet persisted across mount (step 10b will
-    /// wire it to `super_root.dirty_bitmap_inode`); step 10a seeds
-    /// the bitmap at mount by marking the current inode's chunks.
+    /// Dirty-weight bitmap. Marked as chunks get written; allocator
+    /// uses it to prefer previously-perturbed free runs.
     dirty_bitmap: DirtyBitmap,
 }
 
@@ -113,6 +114,9 @@ pub enum FsError {
     #[error("dirty bitmap: {0}")]
     Dirty(#[from] DirtyBitmapError),
 
+    #[error("directory codec: {0}")]
+    Directory(#[from] DirectoryError),
+
     #[error("out of space: could not allocate {requested_bits} bits")]
     OutOfSpace { requested_bits: u32 },
 
@@ -134,24 +138,50 @@ pub enum FsError {
     #[error("pointer targets slot {slot}, which has no stealable bits")]
     PointerTargetsNonStealableSlot { slot: u16 },
 
-    #[error("pointer range [{start_weight}, {end_weight}) lies outside slot {slot} with {weight_count} weights")]
+    #[error(
+        "pointer range [{start_weight}, {end_weight}) lies outside slot {slot} with {weight_count} weights"
+    )]
     PointerOutOfBounds {
         slot: u16,
         start_weight: u32,
         end_weight: u64,
         weight_count: u64,
     },
+
+    #[error("invalid path '{0}': must be absolute and contain only valid components")]
+    InvalidPath(String),
+
+    #[error("path '{0}' does not exist")]
+    PathNotFound(String),
+
+    #[error("'{0}' is not a directory")]
+    NotADirectory(String),
+
+    #[error("'{0}' is a directory")]
+    IsADirectory(String),
+
+    #[error("'{0}' already exists")]
+    AlreadyExists(String),
+
+    #[error("directory '{0}' is not empty")]
+    DirectoryNotEmpty(String),
+
+    #[error("path cannot be '/': root has no leaf name to act on")]
+    PathCannotBeRoot,
 }
 
 impl Filesystem {
+    // --------------------------------------------------------------
+    // Init / Mount / Unmount
+    // --------------------------------------------------------------
+
     /// Initialise a fresh V2 filesystem on a cover that has no prior
     /// V2 state. Uses the default CDC params (1 KB / 4 KB / 16 KB).
     pub fn init(cover: Vec<u8>, map: TensorMap) -> Result<Self, FsError> {
         Self::init_with_cdc_params(cover, map, FastCdcParams::default())
     }
 
-    /// As [`Self::init`] but with configurable CDC parameters —
-    /// useful for tests on smaller covers.
+    /// As [`Self::init`] but with configurable CDC parameters.
     pub fn init_with_cdc_params(
         mut cover: Vec<u8>,
         map: TensorMap,
@@ -161,25 +191,25 @@ impl Filesystem {
         let ceiling = CeilingSummary::build(&cover, &map);
         let mut allocator = Allocator::new_for_map(&map, ceiling)?;
 
-        // Compute anchor placement once and keep it; every subsequent
-        // read_anchor / commit_anchor reuses this cached copy.
         let anchor_placement = anchor::find_anchor_placement(&cover, &map);
         allocator.reserve_weights(unique_weights(&anchor_placement))?;
 
-        let root_inode = Inode::EMPTY;
-        let root_inode_ptr =
-            alloc_and_write(&mut cover, &map, &mut allocator, &root_inode.encode())?;
-
-        // Fresh init: nothing dirty yet — but the root inode chunk we
-        // just wrote is. Seed the bitmap.
         let mut dirty_bitmap = DirtyBitmap::new(&map);
-        mark_pointer_dirty(&mut dirty_bitmap, &map, root_inode_ptr);
 
-        // Persist the bitmap as a byte stream via its own inode —
-        // subsequent sessions read this at mount. The bitmap's own
-        // chunks + its inode chunk are then dirty-marked inside
-        // persist_as_byte_stream, which is expected: those
-        // positions are now V2 metadata.
+        // Fresh root directory → empty serialized entry list.
+        let root_directory = Directory::new();
+        let root_inode_ptr = write_directory_content(
+            &mut cover,
+            &map,
+            &mut allocator,
+            &mut dirty_bitmap,
+            &cdc_params,
+            &root_directory,
+        )?;
+        let root_inode = read_inode(&cover, &map, root_inode_ptr)?;
+
+        // Persist the (still-all-clean but for the above writes)
+        // dirty bitmap so subsequent mounts can read it back.
         let bitmap_bytes = dirty_bitmap.serialize();
         let bitmap_inode_ptr = persist_as_byte_stream(
             &mut cover,
@@ -212,8 +242,8 @@ impl Filesystem {
             super_root_ptr,
             root_inode,
             root_inode_ptr,
+            root_directory,
             cdc_params,
-            // Fresh init: no files yet → empty dedup index.
             dedup_index: DedupIndex::new(),
             dirty_bitmap,
         })
@@ -226,24 +256,19 @@ impl Filesystem {
 
     /// As [`Self::mount`] but with configurable CDC parameters. Must
     /// match the params used at init-time for subsequent writes to
-    /// produce compatible chunking (the inode / super-root chunks
-    /// themselves aren't CDC-chunked; they're fixed-size metadata).
+    /// produce compatible chunking.
     pub fn mount_with_cdc_params(
         cover: Vec<u8>,
         map: TensorMap,
         cdc_params: FastCdcParams,
     ) -> Result<Self, FsError> {
         cdc_params.validate()?;
-        // Compute the anchor placement once. The cover's ceiling
-        // magnitudes are the same whether we're inside read_anchor or
-        // new_for_map, so this single scan covers both.
         let anchor_placement = anchor::find_anchor_placement(&cover, &map);
         let anchor_outcome =
             anchor::read_anchor_with_placement(&cover, &map, &anchor_placement)?;
 
         let ceiling = CeilingSummary::build(&cover, &map);
         let mut allocator = Allocator::new_for_map(&map, ceiling)?;
-
         allocator.reserve_weights(unique_weights(&anchor_placement))?;
 
         let super_root_ptr = anchor_outcome.active.super_root;
@@ -261,45 +286,33 @@ impl Filesystem {
         reserve_pointer(&mut allocator, &map, super_root_ptr)?;
 
         let root_inode_ptr = super_root.root_dir_inode;
-        let mut inode_bytes = [0u8; INODE_BYTES];
-        read_chunk(&cover, &map, root_inode_ptr, 0, &mut inode_bytes)?;
-        let root_inode = Inode::decode(&inode_bytes)?;
 
-        reserve_pointer(&mut allocator, &map, root_inode_ptr)?;
-        // Walk the full inode tree — direct + indirect blocks + the
-        // data chunks each indirect tier reaches — and reserve
-        // every chunk so subsequent allocs avoid live state. Dedup
-        // can cause the same data-chunk pointer to appear multiple
-        // times in one inode; reserve each unique pointer once so
-        // the allocator doesn't error on the second visit.
+        // Walk the directory tree, validating + reserving every
+        // pointer as we encounter it. Corrupted pointers (e.g. an
+        // out-of-range slot) surface through reserve_pointer's
+        // checks rather than opaque chunk-read failures downstream.
         let mut reserved: std::collections::HashSet<(u16, u32)> =
             std::collections::HashSet::new();
-        visit_inode_chunks(&root_inode, &cover, &map, |ptr| {
+        let mut tree_chunks: std::collections::HashSet<(u16, u32, u32)> =
+            std::collections::HashSet::new();
+        walk_tree_pointers(&cover, &map, root_inode_ptr, &mut |ptr| {
+            tree_chunks.insert((ptr.slot, ptr.start_weight, ptr.length_in_bits));
             if reserved.insert((ptr.slot, ptr.start_weight)) {
-                reserve_pointer(&mut allocator, &map, ptr)
-            } else {
-                Ok(())
+                reserve_pointer(&mut allocator, &map, ptr)?;
             }
+            Ok(())
         })?;
 
-        // Rebuild the dedup index: walk every data chunk, read its
-        // content, hash it, insert (hash → pointer). Lets subsequent
-        // writes dedup-hit against chunks that existed before the
-        // mount.
-        let dedup_index = build_dedup_index(&cover, &map, &root_inode)?;
+        let root_inode = read_inode(&cover, &map, root_inode_ptr)?;
+        let root_directory = read_directory(&cover, &map, root_inode_ptr)?;
 
         // Load the persisted dirty bitmap and reserve its chunks.
-        // A null pointer means step-10a-era cover: fall back to a
-        // fresh empty bitmap seeded from the current inode tree.
         let mut dirty_bitmap = if super_root.dirty_bitmap_inode.is_null() {
             DirtyBitmap::new(&map)
         } else {
-            let bytes =
-                load_byte_stream(&cover, &map, super_root.dirty_bitmap_inode)?;
+            let bytes = load_byte_stream(&cover, &map, super_root.dirty_bitmap_inode)?;
             DirtyBitmap::deserialize(&bytes, &map)?
         };
-        // Reserve every chunk in the dirty bitmap's inode tree so
-        // subsequent allocs don't overwrite it.
         if !super_root.dirty_bitmap_inode.is_null() {
             let bitmap_chunks = inode_tree_chunks(&cover, &map, super_root.dirty_bitmap_inode)?;
             for (slot, start, len_bits) in bitmap_chunks {
@@ -315,15 +328,23 @@ impl Filesystem {
                 }
             }
         }
-        // Make sure the current inode + its chunks are dirty in the
-        // in-memory bitmap regardless of what was persisted — they
-        // definitely hold V2 metadata now.
+
+        // In-memory bitmap must reflect every live V2 metadata
+        // chunk; the persisted snapshot may lag by one commit.
         mark_pointer_dirty(&mut dirty_bitmap, &map, super_root_ptr);
-        mark_pointer_dirty(&mut dirty_bitmap, &map, root_inode_ptr);
-        visit_inode_chunks(&root_inode, &cover, &map, |ptr| {
-            mark_pointer_dirty(&mut dirty_bitmap, &map, ptr);
-            Ok(())
-        })?;
+        for (slot, start, len_bits) in &tree_chunks {
+            let p = Pointer {
+                slot: *slot,
+                start_weight: *start,
+                length_in_bits: *len_bits,
+                flags: 0,
+                reserved: 0,
+            };
+            mark_pointer_dirty(&mut dirty_bitmap, &map, p);
+        }
+
+        // Rebuild the dedup index across every file in the tree.
+        let dedup_index = build_dedup_index_for_tree(&cover, &map, root_inode_ptr)?;
 
         Ok(Self {
             cover,
@@ -335,147 +356,336 @@ impl Filesystem {
             super_root_ptr,
             root_inode,
             root_inode_ptr,
+            root_directory,
             cdc_params,
             dedup_index,
             dirty_bitmap,
         })
     }
 
-    /// Replace the single-file contents with `data`. Runs FastCDC to
-    /// pick content-defined chunk boundaries, allocates + writes
-    /// each chunk, builds a new inode + super-root (with indirect
-    /// blocks as needed), and commits via an anchor-slot swap. Old
-    /// chunks leak for this milestone.
-    pub fn write(&mut self, data: &[u8]) -> Result<(), FsError> {
-        // Content-defined chunking. For empty data, ranges is empty
-        // and we end up with an EMPTY inode.
-        let ranges = chunk_ranges(data, &self.cdc_params);
+    /// Consume the filesystem and return the cover bytes for
+    /// persistence.
+    pub fn unmount(self) -> Vec<u8> {
+        self.cover
+    }
 
-        // ppb threshold for spilling into the next indirect tier is
-        // derived from avg_size — it's the "canonical full indirect
-        // block" pointer count even though actual indirect blocks
-        // are variable-sized in V2.
-        let ppb = ptrs_per_indirect_block(self.cdc_params.avg_size);
-        let ppb2 = ppb.saturating_mul(ppb);
-        let ppb3 = ppb2.saturating_mul(ppb);
-        let max_chunks = NUM_DIRECT
-            .saturating_add(ppb)
-            .saturating_add(ppb2)
-            .saturating_add(ppb3);
-        if ranges.len() > max_chunks {
-            return Err(FsError::FileTooLarge {
-                bytes: data.len(),
-                chunk_count: ranges.len(),
-                max_chunks,
-            });
+    // --------------------------------------------------------------
+    // Mutation: mkdir / rmdir / create_file / unlink
+    // --------------------------------------------------------------
+
+    /// Create an empty directory at `path`. Errors if anything
+    /// already exists there, or if any intermediate component is
+    /// missing or isn't a directory.
+    pub fn mkdir(&mut self, path: &str) -> Result<(), FsError> {
+        let components = parse_path(path)?;
+        if components.is_empty() {
+            return Err(FsError::PathCannotBeRoot);
         }
 
-        // Allocate + write every data chunk in order. Priority:
-        //   1. Content-match in dedup index → reuse pointer, no
-        //      write (step 9).
-        //   2. Allocate preferring dirty positions (step 10a).
-        //   3. Fall back to pristine-lowest-ceiling allocation.
-        // `new_index` accumulates chunks from THIS write so later
-        // chunks in the same file can dedup against earlier ones.
-        let mut data_chunk_ptrs = Vec::with_capacity(ranges.len());
-        let mut new_index = DedupIndex::new();
-        for range in &ranges {
-            let chunk = &data[range.clone()];
-            let hash = hash_chunk(chunk);
+        // Allocate the empty child directory first; its pointer is
+        // then woven into the parent.
+        let empty = Directory::new();
+        let child_inode = write_directory_content(
+            &mut self.cover,
+            &self.map,
+            &mut self.alloc,
+            &mut self.dirty_bitmap,
+            &self.cdc_params,
+            &empty,
+        )?;
 
-            let ptr = if let Some(existing) = self.dedup_index.lookup(&hash) {
-                existing
-            } else if let Some(this_write) = new_index.lookup(&hash) {
-                this_write
+        let new_root_ptr = self.mutate_parent_directory(&components, |parent, name| {
+            if parent.find(name).is_some() {
+                return Err(FsError::AlreadyExists(name.to_owned()));
+            }
+            parent.insert(DirEntry {
+                kind: EntryKind::Directory,
+                name: name.to_owned(),
+                inode: child_inode,
+            })?;
+            Ok(())
+        })?;
+
+        self.commit_with_new_root(new_root_ptr)
+    }
+
+    /// Remove an empty directory at `path`. Errors if the directory
+    /// doesn't exist, isn't empty, is actually a file, or if any
+    /// intermediate component is missing.
+    pub fn rmdir(&mut self, path: &str) -> Result<(), FsError> {
+        let components = parse_path(path)?;
+        if components.is_empty() {
+            return Err(FsError::PathCannotBeRoot);
+        }
+
+        // Check kind first (file → NotADirectory) before trying to
+        // parse the target's content as a serialized directory.
+        let (target_inode, kind) = self.lookup_leaf(&components)?;
+        if kind != EntryKind::Directory {
+            return Err(FsError::NotADirectory(path.to_owned()));
+        }
+        let target_dir = read_directory(&self.cover, &self.map, target_inode)?;
+        if !target_dir.is_empty() {
+            return Err(FsError::DirectoryNotEmpty(path.to_owned()));
+        }
+
+        let new_root_ptr = self.mutate_parent_directory(&components, |parent, name| {
+            let entry = parent
+                .find(name)
+                .ok_or_else(|| FsError::PathNotFound(name.to_owned()))?;
+            if entry.kind != EntryKind::Directory {
+                return Err(FsError::NotADirectory(name.to_owned()));
+            }
+            parent.remove(name);
+            Ok(())
+        })?;
+
+        self.commit_with_new_root(new_root_ptr)
+    }
+
+    /// Create or overwrite a file at `path` with `data`. Errors if
+    /// any intermediate component is missing or isn't a directory,
+    /// or if `path` itself is an existing directory.
+    pub fn create_file(&mut self, path: &str, data: &[u8]) -> Result<(), FsError> {
+        let components = parse_path(path)?;
+        if components.is_empty() {
+            return Err(FsError::PathCannotBeRoot);
+        }
+
+        let file_inode_ptr = self.write_file_content(data)?;
+
+        let new_root_ptr = self.mutate_parent_directory(&components, |parent, name| {
+            if let Some(existing) = parent.find(name) {
+                if existing.kind == EntryKind::Directory {
+                    return Err(FsError::IsADirectory(name.to_owned()));
+                }
+                parent.replace(name, EntryKind::File, file_inode_ptr);
             } else {
-                let bit_count = (chunk.len() * 8) as u32;
-                let p = self
-                    .alloc
-                    .alloc_preferring_dirty(&self.map, bit_count, &self.dirty_bitmap)
-                    .ok_or(FsError::OutOfSpace {
-                        requested_bits: bit_count,
-                    })?;
-                write_chunk(&mut self.cover, &self.map, p, 0, chunk)?;
-                // The newly-written weights are now dirty forever.
-                mark_pointer_dirty(&mut self.dirty_bitmap, &self.map, p);
-                p
-            };
+                parent.insert(DirEntry {
+                    kind: EntryKind::File,
+                    name: name.to_owned(),
+                    inode: file_inode_ptr,
+                })?;
+            }
+            Ok(())
+        })?;
 
-            new_index.insert(hash, ptr);
-            data_chunk_ptrs.push(ptr);
+        self.commit_with_new_root(new_root_ptr)
+    }
+
+    /// Remove the file at `path`. Errors if absent or if `path` is
+    /// a directory.
+    pub fn unlink(&mut self, path: &str) -> Result<(), FsError> {
+        let components = parse_path(path)?;
+        if components.is_empty() {
+            return Err(FsError::PathCannotBeRoot);
         }
-        let chunk_count = data_chunk_ptrs.len();
 
-        // Thread data chunk pointers into direct + single/double/triple
-        // indirect blocks per the standard ext2-style layout.
-        let mut direct = [Pointer::NULL; NUM_DIRECT];
-        let direct_used = chunk_count.min(NUM_DIRECT);
-        direct[..direct_used].copy_from_slice(&data_chunk_ptrs[..direct_used]);
+        let new_root_ptr = self.mutate_parent_directory(&components, |parent, name| {
+            let entry = parent
+                .find(name)
+                .ok_or_else(|| FsError::PathNotFound(name.to_owned()))?;
+            if entry.kind == EntryKind::Directory {
+                return Err(FsError::IsADirectory(name.to_owned()));
+            }
+            parent.remove(name);
+            Ok(())
+        })?;
 
-        let mut cursor = direct_used;
-        let single_indirect = if cursor < chunk_count {
-            let end = (cursor + ppb).min(chunk_count);
-            let ptr = write_pointer_list(
+        self.commit_with_new_root(new_root_ptr)
+    }
+
+    // --------------------------------------------------------------
+    // Reads
+    // --------------------------------------------------------------
+
+    /// Load the bytes of the file at `path`. Errors if the path is
+    /// missing, is a directory, or any intermediate component is
+    /// missing / non-directory.
+    pub fn read_file(&self, path: &str) -> Result<Vec<u8>, FsError> {
+        let components = parse_path(path)?;
+        if components.is_empty() {
+            return Err(FsError::IsADirectory(path.to_owned()));
+        }
+        let (target_inode, kind) = self.lookup_leaf(&components)?;
+        if kind == EntryKind::Directory {
+            return Err(FsError::IsADirectory(path.to_owned()));
+        }
+        load_byte_stream(&self.cover, &self.map, target_inode)
+    }
+
+    /// List the entries in the directory at `path`. Entries are
+    /// returned in sorted order. Errors if the path is missing or
+    /// isn't a directory.
+    pub fn readdir(&self, path: &str) -> Result<Vec<DirEntry>, FsError> {
+        let components = parse_path(path)?;
+        if components.is_empty() {
+            return Ok(self.root_directory.entries().to_vec());
+        }
+        let (target_inode, kind) = self.lookup_leaf(&components)?;
+        if kind != EntryKind::Directory {
+            return Err(FsError::NotADirectory(path.to_owned()));
+        }
+        let dir = read_directory(&self.cover, &self.map, target_inode)?;
+        Ok(dir.entries().to_vec())
+    }
+
+    /// Whether `path` resolves to an existing file or directory.
+    /// Invalid paths return `false` (the path cannot exist). Returns
+    /// `true` for `/` (the root always exists).
+    pub fn exists(&self, path: &str) -> bool {
+        let Ok(components) = parse_path(path) else {
+            return false;
+        };
+        if components.is_empty() {
+            return true;
+        }
+        self.lookup_leaf(&components).is_ok()
+    }
+
+    /// Return the inode at `path` (file or directory). Primarily
+    /// for tests that need to inspect the direct/indirect layout.
+    pub fn inode_at(&self, path: &str) -> Result<Inode, FsError> {
+        let components = parse_path(path)?;
+        if components.is_empty() {
+            return Ok(self.root_inode);
+        }
+        let (target_inode, _) = self.lookup_leaf(&components)?;
+        read_inode(&self.cover, &self.map, target_inode)
+    }
+
+    // --------------------------------------------------------------
+    // Diagnostic accessors
+    // --------------------------------------------------------------
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn cdc_params(&self) -> &FastCdcParams {
+        &self.cdc_params
+    }
+
+    /// The root *directory's* inode — not a per-file inode. Tests
+    /// that want the data file's inode should use [`Self::inode_at`].
+    pub fn root_inode(&self) -> &Inode {
+        &self.root_inode
+    }
+
+    pub fn root_directory(&self) -> &Directory {
+        &self.root_directory
+    }
+
+    pub fn dedup_index(&self) -> &DedupIndex {
+        &self.dedup_index
+    }
+
+    pub fn dirty_bitmap(&self) -> &DirtyBitmap {
+        &self.dirty_bitmap
+    }
+
+    pub fn allocator_free_weights(&self) -> u64 {
+        self.alloc.total_free_weights()
+    }
+
+    // --------------------------------------------------------------
+    // Internals — path walking + tree mutation
+    // --------------------------------------------------------------
+
+    /// Find the inode pointer of the leaf named by `components`.
+    /// Walks from root, following `EntryKind::Directory` components.
+    /// Returns `(leaf_inode_ptr, leaf_kind)`.
+    fn lookup_leaf(&self, components: &[&str]) -> Result<(Pointer, EntryKind), FsError> {
+        if components.is_empty() {
+            return Ok((self.root_inode_ptr, EntryKind::Directory));
+        }
+        let (leaf, parents) = components.split_last().unwrap();
+        let mut cur: Option<Directory> = None;
+        for pn in parents {
+            let dir = match cur.as_ref() {
+                Some(d) => d,
+                None => &self.root_directory,
+            };
+            let entry = dir
+                .find(pn)
+                .ok_or_else(|| FsError::PathNotFound(join_path(components)))?;
+            if entry.kind != EntryKind::Directory {
+                return Err(FsError::NotADirectory((*pn).to_owned()));
+            }
+            cur = Some(read_directory(&self.cover, &self.map, entry.inode)?);
+        }
+        let dir = cur.as_ref().unwrap_or(&self.root_directory);
+        let entry = dir
+            .find(leaf)
+            .ok_or_else(|| FsError::PathNotFound(join_path(components)))?;
+        Ok((entry.inode, entry.kind))
+    }
+
+    /// Walk to the parent directory of `components`, apply `mutate`
+    /// to that parent (passing the leaf's name), then rewrite the
+    /// directory chain from the leaf's parent back to the root.
+    /// Returns the pointer to the new root directory's inode (ready
+    /// for [`Self::commit_with_new_root`]).
+    fn mutate_parent_directory(
+        &mut self,
+        components: &[&str],
+        mutate: impl FnOnce(&mut Directory, &str) -> Result<(), FsError>,
+    ) -> Result<Pointer, FsError> {
+        let (leaf_name, parent_names) = components.split_last().unwrap();
+
+        // Load the parent chain:
+        //   dirs[0] = root
+        //   dirs[i] = root[parent_names[0]]...[parent_names[i-1]]
+        let mut dirs: Vec<Directory> = Vec::with_capacity(parent_names.len() + 1);
+        dirs.push(self.root_directory.clone());
+        for pn in parent_names {
+            let parent = dirs.last().unwrap();
+            let entry = parent
+                .find(pn)
+                .ok_or_else(|| FsError::PathNotFound(join_path(components)))?;
+            if entry.kind != EntryKind::Directory {
+                return Err(FsError::NotADirectory((*pn).to_owned()));
+            }
+            let child = read_directory(&self.cover, &self.map, entry.inode)?;
+            dirs.push(child);
+        }
+
+        // Apply the mutation to the parent-of-leaf directory.
+        let mut cur = dirs.pop().unwrap();
+        mutate(&mut cur, leaf_name)?;
+
+        // Write it and walk up, rewriting each ancestor.
+        let mut new_child_ptr = write_directory_content(
+            &mut self.cover,
+            &self.map,
+            &mut self.alloc,
+            &mut self.dirty_bitmap,
+            &self.cdc_params,
+            &cur,
+        )?;
+        for i in (0..parent_names.len()).rev() {
+            let name = parent_names[i];
+            let mut parent = dirs.pop().unwrap();
+            parent.replace(name, EntryKind::Directory, new_child_ptr);
+            new_child_ptr = write_directory_content(
                 &mut self.cover,
                 &self.map,
                 &mut self.alloc,
-                &data_chunk_ptrs[cursor..end],
+                &mut self.dirty_bitmap,
+                &self.cdc_params,
+                &parent,
             )?;
-            cursor = end;
-            ptr
-        } else {
-            Pointer::NULL
-        };
+        }
+        debug_assert!(dirs.is_empty());
+        Ok(new_child_ptr)
+    }
 
-        let double_indirect = if cursor < chunk_count {
-            let end = (cursor + ppb * ppb).min(chunk_count);
-            let ptr = build_double_indirect(
-                &mut self.cover,
-                &self.map,
-                &mut self.alloc,
-                &data_chunk_ptrs[cursor..end],
-                ppb,
-            )?;
-            cursor = end;
-            ptr
-        } else {
-            Pointer::NULL
-        };
-
-        let triple_indirect = if cursor < chunk_count {
-            let end = chunk_count;
-            let ptr = build_triple_indirect(
-                &mut self.cover,
-                &self.map,
-                &mut self.alloc,
-                &data_chunk_ptrs[cursor..end],
-                ppb,
-            )?;
-            cursor = end;
-            ptr
-        } else {
-            Pointer::NULL
-        };
-
-        debug_assert_eq!(cursor, chunk_count);
-
-        let new_inode = Inode {
-            length: data.len() as u64,
-            direct,
-            single_indirect,
-            double_indirect,
-            triple_indirect,
-        };
-        let new_inode_ptr =
-            alloc_and_write(&mut self.cover, &self.map, &mut self.alloc, &new_inode.encode())?;
-        mark_pointer_dirty(&mut self.dirty_bitmap, &self.map, new_inode_ptr);
-
-        // Persist the updated dirty bitmap as its own byte stream.
-        // persist_as_byte_stream marks each written weight in
-        // dirty_bitmap too — fine, those are live metadata
-        // positions. The bitmap we serialised reflects state before
-        // this persistence step; next session's mount will see the
-        // updated-but-not-quite-current snapshot (see module docs).
+    /// Finalise a CoW mutation: persist the dirty bitmap, write a
+    /// new super-root that points at `new_root_dir_inode`, swap
+    /// anchor slots, then reclaim the chunks the old tree used
+    /// but the new tree doesn't.
+    fn commit_with_new_root(&mut self, new_root_dir_inode: Pointer) -> Result<(), FsError> {
+        // Persist the in-memory dirty bitmap.
         let bitmap_bytes = self.dirty_bitmap.serialize();
         let new_bitmap_inode_ptr = persist_as_byte_stream(
             &mut self.cover,
@@ -488,7 +698,7 @@ impl Filesystem {
 
         let new_generation = self.generation + 1;
         let new_super_root = SuperRoot {
-            root_dir_inode: new_inode_ptr,
+            root_dir_inode: new_root_dir_inode,
             dirty_bitmap_inode: new_bitmap_inode_ptr,
             generation: new_generation,
             ..SuperRoot::EMPTY
@@ -510,119 +720,168 @@ impl Filesystem {
         )?;
         debug_assert_eq!(committed_gen, new_generation);
 
-        // Free every chunk in the OLD scope (user inode tree +
-        // bitmap inode tree + super-root chunk) that isn't also in
-        // the NEW scope. Freed positions re-enter the allocator's
-        // free list as "dirty", so the next write's
-        // alloc_preferring_dirty can land on them before any
-        // pristine run.
+        // Reclaim every chunk referenced by the old snapshot that
+        // the new snapshot doesn't reach.
         reclaim_abandoned_chunks(
             &mut self.alloc,
             &self.map,
             &self.cover,
-            ReclaimScope {
-                root_inode_ptr: self.root_inode_ptr,
+            TreeScope {
+                root_dir_inode_ptr: self.root_inode_ptr,
                 bitmap_inode_ptr: self.super_root.dirty_bitmap_inode,
                 super_root_ptr: self.super_root_ptr,
             },
-            ReclaimScope {
-                root_inode_ptr: new_inode_ptr,
+            TreeScope {
+                root_dir_inode_ptr: new_root_dir_inode,
                 bitmap_inode_ptr: new_bitmap_inode_ptr,
                 super_root_ptr: new_super_root_ptr,
             },
         )?;
 
+        // Update in-memory state.
         self.generation = new_generation;
         self.super_root = new_super_root;
         self.super_root_ptr = new_super_root_ptr;
-        self.root_inode = new_inode;
-        self.root_inode_ptr = new_inode_ptr;
-        // The old dedup index held entries for the old inode's
-        // chunks; now only the new inode is live. Replace wholesale
-        // — stale entries pointing at chunks that aren't in the new
-        // inode would misdirect future dedup lookups.
-        self.dedup_index = new_index;
+        self.root_inode_ptr = new_root_dir_inode;
+        self.root_inode = read_inode(&self.cover, &self.map, new_root_dir_inode)?;
+        self.root_directory = read_directory(&self.cover, &self.map, new_root_dir_inode)?;
 
+        // Rebuild the dedup index from the new tree's files.
+        self.dedup_index =
+            build_dedup_index_for_tree(&self.cover, &self.map, new_root_dir_inode)?;
         Ok(())
     }
 
-    /// Read the single file's full byte contents. Walks the inode's
-    /// direct + single / double / triple indirect chains to collect
-    /// every data chunk in order, concatenates their bytes, and
-    /// truncates to `inode.length`.
-    pub fn read(&self) -> Result<Vec<u8>, FsError> {
-        let length = self.root_inode.length as usize;
-        let data_ptrs = collect_data_pointers(&self.root_inode, &self.cover, &self.map)?;
-
-        let mut out = Vec::with_capacity(length);
-        for ptr in data_ptrs {
-            if out.len() >= length {
-                break;
-            }
-            let chunk_bytes = byte_capacity(ptr) as usize;
-            let this_read = chunk_bytes.min(length - out.len());
-            let mut buf = vec![0u8; this_read];
-            read_chunk(&self.cover, &self.map, ptr, 0, &mut buf)?;
-            out.extend_from_slice(&buf);
+    /// Chunk + write a user file's bytes (consulting dedup) and
+    /// return the file's inode pointer. Internal helper shared by
+    /// [`Self::create_file`] and any future file-content mutator.
+    fn write_file_content(&mut self, data: &[u8]) -> Result<Pointer, FsError> {
+        let ranges = chunk_ranges(data, &self.cdc_params);
+        let max_chunks = max_chunks_for(&self.cdc_params);
+        if ranges.len() > max_chunks {
+            return Err(FsError::FileTooLarge {
+                bytes: data.len(),
+                chunk_count: ranges.len(),
+                max_chunks,
+            });
         }
-        out.truncate(length);
-        Ok(out)
-    }
 
-    /// Consume the filesystem and return the cover bytes for
-    /// persistence.
-    pub fn unmount(self) -> Vec<u8> {
-        self.cover
-    }
+        // Per-file in-flight dedup map — lets later chunks in the
+        // same write dedup against earlier ones even when neither
+        // exists in the persistent index yet.
+        let mut this_file = DedupIndex::new();
+        let mut data_chunk_ptrs = Vec::with_capacity(ranges.len());
+        for range in &ranges {
+            let chunk = &data[range.clone()];
+            let hash = hash_chunk(chunk);
+            let ptr = if let Some(p) = self.dedup_index.lookup(&hash) {
+                p
+            } else if let Some(p) = this_file.lookup(&hash) {
+                p
+            } else {
+                let bit_count = (chunk.len() * 8) as u32;
+                let p = self
+                    .alloc
+                    .alloc_preferring_dirty(&self.map, bit_count, &self.dirty_bitmap)
+                    .ok_or(FsError::OutOfSpace {
+                        requested_bits: bit_count,
+                    })?;
+                write_chunk(&mut self.cover, &self.map, p, 0, chunk)?;
+                mark_pointer_dirty(&mut self.dirty_bitmap, &self.map, p);
+                p
+            };
+            this_file.insert(hash, ptr);
+            data_chunk_ptrs.push(ptr);
+        }
 
-    /// Current committed anchor generation. Bumps by 1 per successful
-    /// [`Self::write`].
-    pub fn generation(&self) -> u64 {
-        self.generation
-    }
-
-    /// Length of the single file in bytes.
-    pub fn file_length(&self) -> u64 {
-        self.root_inode.length
-    }
-
-    /// Read-only view of the current root inode — lets callers see
-    /// which indirect tiers are populated and confirm the layout
-    /// matches the data. Primarily for tests.
-    pub fn root_inode(&self) -> &Inode {
-        &self.root_inode
-    }
-
-    /// Current CDC parameters (set at init/mount). Primarily for
-    /// diagnostics.
-    pub fn cdc_params(&self) -> &FastCdcParams {
-        &self.cdc_params
-    }
-
-    /// Read-only view of the dedup index — lets tests verify that
-    /// a write populated the expected number of unique content
-    /// hashes.
-    pub fn dedup_index(&self) -> &DedupIndex {
-        &self.dedup_index
-    }
-
-    /// Read-only view of the dirty bitmap — lets tests verify that
-    /// writes correctly mark the weights they touch.
-    pub fn dirty_bitmap(&self) -> &DirtyBitmap {
-        &self.dirty_bitmap
-    }
-
-    /// Total free weights in the allocator — useful for tests that
-    /// want to confirm reclamation grew the free list after a
-    /// rewrite.
-    pub fn allocator_free_weights(&self) -> u64 {
-        self.alloc.total_free_weights()
+        let inode = build_inode(
+            &mut self.cover,
+            &self.map,
+            &mut self.alloc,
+            &self.cdc_params,
+            data.len() as u64,
+            &data_chunk_ptrs,
+        )?;
+        let inode_ptr =
+            alloc_and_write(&mut self.cover, &self.map, &mut self.alloc, &inode.encode())?;
+        mark_pointer_dirty(&mut self.dirty_bitmap, &self.map, inode_ptr);
+        Ok(inode_ptr)
     }
 }
 
-/// Collect the unique `(slot, weight_index)` pairs that appear in a
-/// placement's bit positions. Deduplicates across the multiple bits
-/// of a single weight (e.g. F16 contributes 4 bits per weight).
+// ==================================================================
+// Path parsing
+// ==================================================================
+
+/// Validate and split an absolute path into its non-empty components.
+/// Rejects relative paths, `.` / `..`, empty components with bytes
+/// (NUL), and components longer than 255 bytes.
+fn parse_path(path: &str) -> Result<Vec<&str>, FsError> {
+    if !path.starts_with('/') {
+        return Err(FsError::InvalidPath(path.to_owned()));
+    }
+    let mut out = Vec::new();
+    for component in path.split('/') {
+        if component.is_empty() {
+            continue;
+        }
+        if component == "." || component == ".." {
+            return Err(FsError::InvalidPath(path.to_owned()));
+        }
+        if component.len() > MAX_NAME_LEN {
+            return Err(FsError::InvalidPath(path.to_owned()));
+        }
+        if component.as_bytes().contains(&0) {
+            return Err(FsError::InvalidPath(path.to_owned()));
+        }
+        out.push(component);
+    }
+    Ok(out)
+}
+
+fn join_path(components: &[&str]) -> String {
+    let mut s = String::with_capacity(components.iter().map(|c| c.len() + 1).sum());
+    for c in components {
+        s.push('/');
+        s.push_str(c);
+    }
+    if s.is_empty() { "/".to_owned() } else { s }
+}
+
+// ==================================================================
+// Cover-side directory + file helpers
+// ==================================================================
+
+/// Read + decode an inode at `ptr`.
+fn read_inode(cover: &[u8], map: &TensorMap, ptr: Pointer) -> Result<Inode, FsError> {
+    let mut buf = [0u8; INODE_BYTES];
+    read_chunk(cover, map, ptr, 0, &mut buf)?;
+    Ok(Inode::decode(&buf)?)
+}
+
+/// Read + decode the directory whose inode is at `ptr`.
+fn read_directory(cover: &[u8], map: &TensorMap, ptr: Pointer) -> Result<Directory, FsError> {
+    let bytes = load_byte_stream(cover, map, ptr)?;
+    Ok(Directory::deserialize(&bytes)?)
+}
+
+/// Allocate + write a directory's serialized bytes through an inode
+/// and return the inode's pointer.
+fn write_directory_content(
+    cover: &mut [u8],
+    map: &TensorMap,
+    allocator: &mut Allocator,
+    dirty: &mut DirtyBitmap,
+    cdc_params: &FastCdcParams,
+    dir: &Directory,
+) -> Result<Pointer, FsError> {
+    let bytes = dir.serialize();
+    persist_as_byte_stream(cover, map, allocator, dirty, cdc_params, &bytes)
+}
+
+/// Collect the `(slot, weight_index)` pairs across a placement's bit
+/// positions. Deduplicates across the multiple bits of a single
+/// weight.
 fn unique_weights(placement: &MetadataPlacement) -> Vec<(u16, u32)> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
@@ -688,21 +947,109 @@ fn alloc_and_write(
     Ok(ptr)
 }
 
-// ------------------------------------------------------------------
-// Indirect-block helpers
-// ------------------------------------------------------------------
+fn mark_pointer_dirty(dirty: &mut DirtyBitmap, map: &TensorMap, ptr: Pointer) {
+    if ptr.is_null() {
+        return;
+    }
+    let Some(slot) = map.slots.get(ptr.slot as usize) else {
+        return;
+    };
+    let bpw = slot.stealable_bits_per_weight as u32;
+    if bpw == 0 {
+        return;
+    }
+    let weights = ptr.length_in_bits.div_ceil(bpw);
+    dirty.mark_range(ptr.slot, ptr.start_weight, weights);
+}
 
-/// Max pointers a full indirect block can hold at the given data
-/// chunk size — the threshold for overflowing to the next indirect
-/// tier. A "full" indirect block is sized exactly like a data chunk.
+// ==================================================================
+// Indirect-block helpers
+// ==================================================================
+
+/// Max pointers a "full" indirect block can hold at the average
+/// chunk size. Used as the threshold for spilling to the next tier.
 fn ptrs_per_indirect_block(data_chunk_size_bytes: usize) -> usize {
     data_chunk_size_bytes / Pointer::SIZE
 }
 
-/// Allocate + write a pointer list as a chunk. Returns the chunk's
-/// pointer. The chunk is sized to hold exactly `pointers.len()`
-/// pointers — partial indirect blocks are not padded out to the
-/// full `ptrs_per_indirect_block` size.
+fn max_chunks_for(cdc_params: &FastCdcParams) -> usize {
+    let ppb = ptrs_per_indirect_block(cdc_params.avg_size);
+    let ppb2 = ppb.saturating_mul(ppb);
+    let ppb3 = ppb2.saturating_mul(ppb);
+    NUM_DIRECT
+        .saturating_add(ppb)
+        .saturating_add(ppb2)
+        .saturating_add(ppb3)
+}
+
+/// Thread `data_chunk_ptrs` through direct + indirect blocks and
+/// build an [`Inode`] describing them. Writes the indirect blocks
+/// via `allocator` as needed.
+fn build_inode(
+    cover: &mut [u8],
+    map: &TensorMap,
+    allocator: &mut Allocator,
+    cdc_params: &FastCdcParams,
+    length: u64,
+    data_chunk_ptrs: &[Pointer],
+) -> Result<Inode, FsError> {
+    let ppb = ptrs_per_indirect_block(cdc_params.avg_size);
+    let chunk_count = data_chunk_ptrs.len();
+
+    let mut direct = [Pointer::NULL; NUM_DIRECT];
+    let direct_used = chunk_count.min(NUM_DIRECT);
+    direct[..direct_used].copy_from_slice(&data_chunk_ptrs[..direct_used]);
+
+    let mut cursor = direct_used;
+    let single_indirect = if cursor < chunk_count {
+        let end = (cursor + ppb).min(chunk_count);
+        let ptr = write_pointer_list(cover, map, allocator, &data_chunk_ptrs[cursor..end])?;
+        cursor = end;
+        ptr
+    } else {
+        Pointer::NULL
+    };
+
+    let double_indirect = if cursor < chunk_count {
+        let end = (cursor + ppb * ppb).min(chunk_count);
+        let ptr = build_double_indirect(
+            cover,
+            map,
+            allocator,
+            &data_chunk_ptrs[cursor..end],
+            ppb,
+        )?;
+        cursor = end;
+        ptr
+    } else {
+        Pointer::NULL
+    };
+
+    let triple_indirect = if cursor < chunk_count {
+        let end = chunk_count;
+        let ptr = build_triple_indirect(
+            cover,
+            map,
+            allocator,
+            &data_chunk_ptrs[cursor..end],
+            ppb,
+        )?;
+        cursor = end;
+        ptr
+    } else {
+        Pointer::NULL
+    };
+    debug_assert_eq!(cursor, chunk_count);
+
+    Ok(Inode {
+        length,
+        direct,
+        single_indirect,
+        double_indirect,
+        triple_indirect,
+    })
+}
+
 fn write_pointer_list(
     cover: &mut [u8],
     map: &TensorMap,
@@ -716,9 +1063,6 @@ fn write_pointer_list(
     alloc_and_write(cover, map, allocator, &bytes)
 }
 
-/// Read the pointer list out of an indirect block. The block's
-/// pointer count is derived from its byte capacity — `byte_capacity /
-/// 16` — so variable-size partial blocks decode correctly.
 fn read_pointer_list(
     cover: &[u8],
     map: &TensorMap,
@@ -743,11 +1087,6 @@ fn read_pointer_list(
     Ok(out)
 }
 
-/// Build a double-indirect block: group `data_ptrs` into chunks of
-/// `ppb` data pointers each, write a single-indirect block per
-/// group, then write the list of single-indirect-block pointers as
-/// the double-indirect block. Returns the double-indirect block's
-/// pointer.
 fn build_double_indirect(
     cover: &mut [u8],
     map: &TensorMap,
@@ -763,10 +1102,6 @@ fn build_double_indirect(
     write_pointer_list(cover, map, allocator, &single_indirect_ptrs)
 }
 
-/// Build a triple-indirect block: group `data_ptrs` into chunks of
-/// `ppb² data pointers each, each of which becomes a
-/// double-indirect block via [`build_double_indirect`]. Returns the
-/// triple-indirect block's pointer.
 fn build_triple_indirect(
     cover: &mut [u8],
     map: &TensorMap,
@@ -783,11 +1118,8 @@ fn build_triple_indirect(
     write_pointer_list(cover, map, allocator, &double_indirect_ptrs)
 }
 
-/// Walk the inode's direct + single / double / triple indirect tree
-/// and collect every non-null **data** chunk pointer in order. The
-/// indirect block pointers themselves are traversed but not
-/// included — callers asking "where's my file's bytes?" want leaves
-/// only.
+/// Walk an inode's tree and collect every non-null data-chunk pointer
+/// (leaves only — indirect blocks are traversed but not emitted).
 fn collect_data_pointers(
     inode: &Inode,
     cover: &[u8],
@@ -849,8 +1181,8 @@ fn collect_data_pointers(
 
 /// Persist an arbitrary byte stream as CDC-chunked data through a
 /// fresh inode and return the inode's chunk pointer. No dedup —
-/// used for internal V2 metadata (e.g. the dirty bitmap) where
-/// content-hash lookups aren't worth the overhead.
+/// used for internal V2 metadata (dirty bitmap, directory content)
+/// where content-hash lookups aren't worth the overhead.
 fn persist_as_byte_stream(
     cover: &mut [u8],
     map: &TensorMap,
@@ -860,13 +1192,7 @@ fn persist_as_byte_stream(
     data: &[u8],
 ) -> Result<Pointer, FsError> {
     let ranges = chunk_ranges(data, cdc_params);
-    let ppb = ptrs_per_indirect_block(cdc_params.avg_size);
-    let ppb2 = ppb.saturating_mul(ppb);
-    let ppb3 = ppb2.saturating_mul(ppb);
-    let max_chunks = NUM_DIRECT
-        .saturating_add(ppb)
-        .saturating_add(ppb2)
-        .saturating_add(ppb3);
+    let max_chunks = max_chunks_for(cdc_params);
     if ranges.len() > max_chunks {
         return Err(FsError::FileTooLarge {
             bytes: data.len(),
@@ -888,77 +1214,28 @@ fn persist_as_byte_stream(
         mark_pointer_dirty(dirty, map, ptr);
         data_chunk_ptrs.push(ptr);
     }
-    let chunk_count = data_chunk_ptrs.len();
 
-    let mut direct = [Pointer::NULL; NUM_DIRECT];
-    let direct_used = chunk_count.min(NUM_DIRECT);
-    direct[..direct_used].copy_from_slice(&data_chunk_ptrs[..direct_used]);
-
-    let mut cursor = direct_used;
-    let single_indirect = if cursor < chunk_count {
-        let end = (cursor + ppb).min(chunk_count);
-        let ptr = write_pointer_list(cover, map, allocator, &data_chunk_ptrs[cursor..end])?;
-        cursor = end;
-        ptr
-    } else {
-        Pointer::NULL
-    };
-
-    let double_indirect = if cursor < chunk_count {
-        let end = (cursor + ppb * ppb).min(chunk_count);
-        let ptr = build_double_indirect(
-            cover,
-            map,
-            allocator,
-            &data_chunk_ptrs[cursor..end],
-            ppb,
-        )?;
-        cursor = end;
-        ptr
-    } else {
-        Pointer::NULL
-    };
-
-    let triple_indirect = if cursor < chunk_count {
-        let end = chunk_count;
-        let ptr = build_triple_indirect(
-            cover,
-            map,
-            allocator,
-            &data_chunk_ptrs[cursor..end],
-            ppb,
-        )?;
-        cursor = end;
-        ptr
-    } else {
-        Pointer::NULL
-    };
-
-    debug_assert_eq!(cursor, chunk_count);
-
-    let inode = Inode {
-        length: data.len() as u64,
-        direct,
-        single_indirect,
-        double_indirect,
-        triple_indirect,
-    };
+    let inode = build_inode(
+        cover,
+        map,
+        allocator,
+        cdc_params,
+        data.len() as u64,
+        &data_chunk_ptrs,
+    )?;
     let inode_ptr = alloc_and_write(cover, map, allocator, &inode.encode())?;
     mark_pointer_dirty(dirty, map, inode_ptr);
     Ok(inode_ptr)
 }
 
-/// Reverse of [`persist_as_byte_stream`] — decode an inode chunk,
-/// walk its data chunks, concatenate, and truncate to
-/// `inode.length`.
+/// Decode an inode chunk, walk its data chunks, concatenate, and
+/// truncate to `inode.length`.
 fn load_byte_stream(
     cover: &[u8],
     map: &TensorMap,
     inode_ptr: Pointer,
 ) -> Result<Vec<u8>, FsError> {
-    let mut inode_bytes = [0u8; INODE_BYTES];
-    read_chunk(cover, map, inode_ptr, 0, &mut inode_bytes)?;
-    let inode = Inode::decode(&inode_bytes)?;
+    let inode = read_inode(cover, map, inode_ptr)?;
     let length = inode.length as usize;
     let data_ptrs = collect_data_pointers(&inode, cover, map)?;
 
@@ -977,29 +1254,10 @@ fn load_byte_stream(
     Ok(out)
 }
 
-/// Mark every weight covered by `ptr` as dirty in the bitmap. Used
-/// after every chunk write to keep dirty tracking up-to-date.
-fn mark_pointer_dirty(dirty: &mut DirtyBitmap, map: &TensorMap, ptr: Pointer) {
-    if ptr.is_null() {
-        return;
-    }
-    let Some(slot) = map.slots.get(ptr.slot as usize) else {
-        return;
-    };
-    let bpw = slot.stealable_bits_per_weight as u32;
-    if bpw == 0 {
-        return;
-    }
-    let weights = ptr.length_in_bits.div_ceil(bpw);
-    dirty.mark_range(ptr.slot, ptr.start_weight, weights);
-}
-
-/// Reads the inode bytes from the cover and collects every
-/// (slot, start_weight, length_in_bits) tuple it transitively
-/// references — data chunks + indirect block chunks + the inode's
-/// own chunk pointer. Used during reclamation (we only know the
-/// pointer, not the decoded inode) and during mount (to reserve
-/// the bitmap's inode tree).
+/// Every chunk position reachable from an inode (the inode itself +
+/// indirect blocks + data chunks). Same as the old
+/// `inode_tree_chunks` — used during mount reservation and inside
+/// `walk_tree_chunks`.
 fn inode_tree_chunks(
     cover: &[u8],
     map: &TensorMap,
@@ -1014,9 +1272,7 @@ fn inode_tree_chunks(
         inode_ptr.start_weight,
         inode_ptr.length_in_bits,
     ));
-    let mut inode_bytes = [0u8; INODE_BYTES];
-    read_chunk(cover, map, inode_ptr, 0, &mut inode_bytes)?;
-    let inode = Inode::decode(&inode_bytes)?;
+    let inode = read_inode(cover, map, inode_ptr)?;
     visit_inode_chunks(&inode, cover, map, |ptr| {
         set.insert((ptr.slot, ptr.start_weight, ptr.length_in_bits));
         Ok(())
@@ -1024,12 +1280,69 @@ fn inode_tree_chunks(
     Ok(set)
 }
 
-/// Every chunk position reachable from a particular snapshot of
-/// `Filesystem` state — root inode's tree + bitmap inode's tree +
-/// root_inode_ptr itself + super_root_ptr itself. Used to diff old
-/// vs new snapshots at commit time.
-struct ReclaimScope {
-    root_inode_ptr: Pointer,
+/// Recursively visit every pointer reachable from a directory tree —
+/// each directory's inode + indirect blocks + content chunks, and
+/// recursively into every child directory. The `visit` callback
+/// fires per-pointer **before** any chunk at that pointer is read,
+/// so corrupted pointers fail fast (e.g. at mount-time reservation)
+/// rather than producing an opaque chunk-read error.
+fn walk_tree_pointers<F>(
+    cover: &[u8],
+    map: &TensorMap,
+    dir_inode_ptr: Pointer,
+    visit: &mut F,
+) -> Result<(), FsError>
+where
+    F: FnMut(Pointer) -> Result<(), FsError>,
+{
+    if dir_inode_ptr.is_null() {
+        return Ok(());
+    }
+    // Visit the directory's inode chunk first — reads to follow
+    // rely on its position being valid.
+    visit(dir_inode_ptr)?;
+    let inode = read_inode(cover, map, dir_inode_ptr)?;
+    // Visit every pointer in the inode tree (indirect blocks + the
+    // directory's content chunks). Each pointer is validated by
+    // `visit` before the corresponding chunk is read downstream.
+    visit_inode_chunks(&inode, cover, map, &mut *visit)?;
+    // With the directory's tree validated + (optionally) reserved,
+    // we can safely read its content and recurse.
+    let dir = read_directory(cover, map, dir_inode_ptr)?;
+    for entry in dir.entries() {
+        match entry.kind {
+            EntryKind::File => {
+                visit(entry.inode)?;
+                let finode = read_inode(cover, map, entry.inode)?;
+                visit_inode_chunks(&finode, cover, map, &mut *visit)?;
+            }
+            EntryKind::Directory => {
+                walk_tree_pointers(cover, map, entry.inode, visit)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Collect every `(slot, start, length_in_bits)` reachable from a
+/// directory tree. Thin wrapper over [`walk_tree_pointers`].
+fn collect_tree_chunks(
+    cover: &[u8],
+    map: &TensorMap,
+    dir_inode_ptr: Pointer,
+) -> Result<std::collections::HashSet<(u16, u32, u32)>, FsError> {
+    let mut set = std::collections::HashSet::new();
+    walk_tree_pointers(cover, map, dir_inode_ptr, &mut |ptr| {
+        set.insert((ptr.slot, ptr.start_weight, ptr.length_in_bits));
+        Ok(())
+    })?;
+    Ok(set)
+}
+
+/// A snapshot of "what's reachable from this commit": the root
+/// directory tree, the bitmap inode tree, and the super-root chunk.
+struct TreeScope {
+    root_dir_inode_ptr: Pointer,
     bitmap_inode_ptr: Pointer,
     super_root_ptr: Pointer,
 }
@@ -1037,11 +1350,12 @@ struct ReclaimScope {
 fn collect_scope_chunks(
     cover: &[u8],
     map: &TensorMap,
-    scope: &ReclaimScope,
+    scope: &TreeScope,
 ) -> Result<std::collections::HashSet<(u16, u32, u32)>, FsError> {
-    let mut set = std::collections::HashSet::new();
-    set.extend(inode_tree_chunks(cover, map, scope.root_inode_ptr)?);
-    set.extend(inode_tree_chunks(cover, map, scope.bitmap_inode_ptr)?);
+    let mut set = collect_tree_chunks(cover, map, scope.root_dir_inode_ptr)?;
+    for e in inode_tree_chunks(cover, map, scope.bitmap_inode_ptr)? {
+        set.insert(e);
+    }
     if !scope.super_root_ptr.is_null() {
         set.insert((
             scope.super_root_ptr.slot,
@@ -1052,17 +1366,12 @@ fn collect_scope_chunks(
     Ok(set)
 }
 
-/// Free every chunk referenced by `old` that isn't referenced by
-/// `new`. Returns abandoned positions to the allocator's free list
-/// while leaving their dirty bits set, so `alloc_preferring_dirty`
-/// reaches them on the next allocation instead of perturbing
-/// pristine weights.
 fn reclaim_abandoned_chunks(
     allocator: &mut Allocator,
     map: &TensorMap,
     cover: &[u8],
-    old: ReclaimScope,
-    new: ReclaimScope,
+    old: TreeScope,
+    new: TreeScope,
 ) -> Result<(), FsError> {
     let old_chunks = collect_scope_chunks(cover, map, &old)?;
     let new_chunks = collect_scope_chunks(cover, map, &new)?;
@@ -1082,29 +1391,53 @@ fn reclaim_abandoned_chunks(
     Ok(())
 }
 
-/// Rebuild the dedup index by walking every data chunk referenced
-/// by `inode`, reading its content from the cover, hashing it, and
-/// inserting (hash, pointer) into a fresh [`DedupIndex`]. Called
-/// at mount time.
-fn build_dedup_index(
+/// Rebuild the dedup index by walking every **file** in the tree
+/// rooted at `root_dir_inode_ptr` and inserting each data chunk's
+/// (hash, pointer) pair.
+fn build_dedup_index_for_tree(
     cover: &[u8],
     map: &TensorMap,
-    inode: &Inode,
+    root_dir_inode_ptr: Pointer,
 ) -> Result<DedupIndex, FsError> {
     let mut idx = DedupIndex::new();
-    let data_ptrs = collect_data_pointers(inode, cover, map)?;
-    for ptr in data_ptrs {
-        let chunk_bytes = byte_capacity(ptr) as usize;
-        let mut buf = vec![0u8; chunk_bytes];
-        read_chunk(cover, map, ptr, 0, &mut buf)?;
-        idx.insert(hash_chunk(&buf), ptr);
-    }
+    walk_files(cover, map, root_dir_inode_ptr, &mut |file_inode_ptr| {
+        let file_inode = read_inode(cover, map, file_inode_ptr)?;
+        for dptr in collect_data_pointers(&file_inode, cover, map)? {
+            let chunk_bytes = byte_capacity(dptr) as usize;
+            let mut buf = vec![0u8; chunk_bytes];
+            read_chunk(cover, map, dptr, 0, &mut buf)?;
+            idx.insert(hash_chunk(&buf), dptr);
+        }
+        Ok(())
+    })?;
     Ok(idx)
 }
 
-/// Visit every non-null pointer the inode transitively references —
-/// data chunks AND the indirect block chunks themselves. Used by
-/// mount to reserve all live chunks in the allocator.
+/// Recursively walk the directory tree rooted at `dir_inode_ptr`,
+/// calling `visit_file` once per file-kind entry encountered (with
+/// that file's inode pointer).
+fn walk_files<F>(
+    cover: &[u8],
+    map: &TensorMap,
+    dir_inode_ptr: Pointer,
+    visit_file: &mut F,
+) -> Result<(), FsError>
+where
+    F: FnMut(Pointer) -> Result<(), FsError>,
+{
+    let dir = read_directory(cover, map, dir_inode_ptr)?;
+    for entry in dir.entries() {
+        match entry.kind {
+            EntryKind::File => visit_file(entry.inode)?,
+            EntryKind::Directory => walk_files(cover, map, entry.inode, visit_file)?,
+        }
+    }
+    Ok(())
+}
+
+/// Visit every non-null pointer an inode transitively references —
+/// data chunks AND indirect block chunks. Used by mount-time
+/// reservation + reclamation tree walks.
 fn visit_inode_chunks(
     inode: &Inode,
     cover: &[u8],

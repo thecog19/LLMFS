@@ -1,4 +1,4 @@
-//! V2 Filesystem dirty-tracking integration tests (step 10a).
+//! V2 Filesystem dirty-tracking integration tests.
 //!
 //! Verifies:
 //! 1. A write marks every allocated weight dirty.
@@ -6,6 +6,7 @@
 //!    positions enter the free list, still marked dirty).
 //! 3. A subsequent write's allocator prefers the just-freed dirty
 //!    positions over never-touched pristine ones.
+//! 4. Dirty bits persist across unmount → remount.
 //!
 //! (3) is the load-bearing property: cover-damage stays bounded
 //! because rewrites land on already-perturbed weights rather than
@@ -100,7 +101,8 @@ fn random_bytes(len: usize, salt: u64) -> Vec<u8> {
 }
 
 fn direct_pointers(fs: &Filesystem) -> Vec<Pointer> {
-    fs.root_inode()
+    fs.inode_at("/data")
+        .expect("file inode")
         .direct
         .iter()
         .filter(|p| !p.is_null())
@@ -126,7 +128,7 @@ fn write_marks_every_allocated_chunk_weight_dirty() {
 
     let mut fs = Filesystem::init_with_cdc_params(cover, map, small_cdc()).expect("init");
     let data = random_bytes(500, 1);
-    fs.write(&data).expect("write");
+    fs.create_file("/data", &data).expect("write");
 
     let bm = fs.dirty_bitmap();
     for p in direct_pointers(&fs) {
@@ -149,11 +151,11 @@ fn rewriting_returns_old_chunks_to_the_free_list() {
     let mut fs = Filesystem::init_with_cdc_params(cover, map, small_cdc()).expect("init");
 
     let data1 = random_bytes(400, 1);
-    fs.write(&data1).expect("write 1");
+    fs.create_file("/data", &data1).expect("write 1");
     let free_after_first = fs.allocator_free_weights();
 
     let data2 = random_bytes(400, 2);
-    fs.write(&data2).expect("write 2");
+    fs.create_file("/data", &data2).expect("write 2");
     let free_after_second = fs.allocator_free_weights();
 
     // Rewriting freed the old chunks (≥ their weight count) while
@@ -184,21 +186,21 @@ fn third_write_lands_on_already_dirty_positions() {
     let mut fs = Filesystem::init_with_cdc_params(cover, map, small_cdc()).expect("init");
 
     let data_a = random_bytes(400, 1);
-    fs.write(&data_a).expect("write A");
+    fs.create_file("/data", &data_a).expect("write A");
     let a_weights: HashSet<(u16, u32)> = direct_pointers(&fs)
         .iter()
         .flat_map(|p| pointer_weights(p, bpw))
         .collect();
 
     let data_b = random_bytes(400, 2);
-    fs.write(&data_b).expect("write B");
+    fs.create_file("/data", &data_b).expect("write B");
     let b_weights: HashSet<(u16, u32)> = direct_pointers(&fs)
         .iter()
         .flat_map(|p| pointer_weights(p, bpw))
         .collect();
 
     let data_c = random_bytes(400, 3);
-    fs.write(&data_c).expect("write C");
+    fs.create_file("/data", &data_c).expect("write C");
     let c_weights: HashSet<(u16, u32)> = direct_pointers(&fs)
         .iter()
         .flat_map(|p| pointer_weights(p, bpw))
@@ -227,7 +229,7 @@ fn third_write_lands_on_already_dirty_positions() {
 }
 
 // ------------------------------------------------------------------
-// (4) Dirty bitmap survives unmount → remount (step 10b)
+// (4) Dirty bitmap survives unmount → remount
 // ------------------------------------------------------------------
 
 #[test]
@@ -237,7 +239,7 @@ fn dirty_bits_survive_unmount_and_remount() {
 
     let mut fs = Filesystem::init_with_cdc_params(cover, map.clone(), small_cdc()).expect("init");
     let data = random_bytes(300, 1);
-    fs.write(&data).expect("write");
+    fs.create_file("/data", &data).expect("write");
 
     // Snapshot the dirty weights touched by the data chunks.
     let touched: Vec<(u16, u32)> = direct_pointers(&fs)
