@@ -338,3 +338,51 @@ fn lsb_first_byte_to_bit_ordering() {
     assert_eq!(cover[0] & 0x0F, 0x01, "bit 0 only in stealable nibble");
     assert_eq!(cover[2] & 0x0F, 0x00, "weight 1 not touched");
 }
+
+#[test]
+fn partial_final_byte_round_trips_low_bits_only() {
+    // 3 F16 weights × 4 bits = 12 bits. Chunk I/O should expose that
+    // as 2 bytes, with only the low 4 bits of the second byte live.
+    let values = [0.0_f32, 0.0, 0.0];
+    let mut cover = f16_cover(&values);
+    let slot = f16_slot(3, 0);
+    let map = single_slot_map(slot);
+    let ptr = Pointer {
+        slot: 0,
+        start_weight: 0,
+        length_in_bits: 12,
+        flags: 0,
+        reserved: 0,
+    };
+
+    write_chunk(&mut cover, &map, ptr, 0, &[0xA5, 0xFF]).expect("write partial-byte chunk");
+
+    let mut out = [0u8; 2];
+    read_chunk(&cover, &map, ptr, 0, &mut out).expect("read partial-byte chunk");
+    assert_eq!(out[0], 0xA5);
+    assert_eq!(out[1], 0x0F, "only the low 4 bits of the tail byte are addressable");
+}
+
+#[test]
+fn pointer_crossing_slot_end_errors_and_preserves_cover() {
+    let values = [0.1_f32, 0.2];
+    let mut cover = f16_cover(&values);
+    let before = cover.clone();
+    let slot = f16_slot(2, 0);
+    let map = single_slot_map(slot);
+    let ptr = Pointer {
+        slot: 0,
+        start_weight: 1,
+        length_in_bits: 8, // needs 2 F16 weights; only one remains
+        flags: 0,
+        reserved: 0,
+    };
+
+    let err = write_chunk(&mut cover, &map, ptr, 0, &[0xAB]).expect_err("cross-slot write");
+    assert!(matches!(err, ChunkError::PointerOutOfBounds { .. }));
+    assert_eq!(cover, before, "invalid pointer must not mutate the cover");
+
+    let mut out = [0u8; 1];
+    let err = read_chunk(&cover, &map, ptr, 0, &mut out).expect_err("cross-slot read");
+    assert!(matches!(err, ChunkError::PointerOutOfBounds { .. }));
+}

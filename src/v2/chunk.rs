@@ -25,6 +25,11 @@
 //! in place, so the early check is what prevents partial-write
 //! corruption on OOB callers.
 //!
+//! If `length_in_bits` is not a multiple of 8, the chunk still exposes
+//! a final partial byte. Reads zero the unused high bits of that last
+//! byte; writes consume only the low live bits and leave the rest of
+//! the cover unchanged.
+//!
 //! [`byte_io`]: crate::stego::calibration::byte_io
 //! [`MetadataPlacement`]: crate::stego::calibration::placement::MetadataPlacement
 //! [`GgufQuantType::stealable_bits_hint`]: crate::gguf::quant::GgufQuantType::stealable_bits_hint
@@ -46,13 +51,21 @@ pub enum ChunkError {
     },
     #[error("pointer slot {slot} out of range (map has {slot_count} slots)")]
     SlotOutOfRange { slot: u16, slot_count: usize },
+    #[error("pointer targets slot {slot}, which has no stealable bits")]
+    NonStealableSlot { slot: u16 },
+    #[error("pointer range [{start_weight}, {end_weight}) lies outside slot {slot} with {weight_count} weights")]
+    PointerOutOfBounds {
+        slot: u16,
+        start_weight: u32,
+        end_weight: u64,
+        weight_count: u64,
+    },
 }
 
-/// Bytes addressable through the chunk — `length_in_bits / 8`. Tail
-/// bits (those below a byte boundary) aren't reachable via this API;
-/// a caller that needs them must drop to `bit_io` directly.
+/// Bytes addressable through the chunk — `ceil(length_in_bits / 8)`.
+/// A tail below a byte boundary is surfaced as a partial final byte.
 pub fn byte_capacity(pointer: Pointer) -> u64 {
-    pointer.length_in_bits as u64 / 8
+    (pointer.length_in_bits as u64).div_ceil(8)
 }
 
 /// Read `buf.len()` bytes from the chunk starting at `byte_offset`.
@@ -67,12 +80,15 @@ pub fn read_chunk(
     buf: &mut [u8],
 ) -> Result<(), ChunkError> {
     let slot = resolve_slot(map, pointer)?;
+    let bits_per_weight = bits_per_weight(slot, pointer.slot)?;
+    validate_pointer_range(slot, pointer, bits_per_weight)?;
     check_bounds(pointer, byte_offset, buf.len() as u64)?;
-    let bits_per_weight = slot.stealable_bits_per_weight as u64;
+    let bit_len = pointer.length_in_bits as u64;
     for (i, dst) in buf.iter_mut().enumerate() {
         let chunk_bit_base = (byte_offset + i as u64) * 8;
         let mut v: u8 = 0;
-        for k in 0..8_u64 {
+        let live_bits = bit_len.saturating_sub(chunk_bit_base).min(8);
+        for k in 0..live_bits {
             let bit_i = chunk_bit_base + k;
             let pos = position_for_bit(pointer, bits_per_weight, bit_i);
             if read_bit(mmap, slot, pos) {
@@ -96,11 +112,14 @@ pub fn write_chunk(
     data: &[u8],
 ) -> Result<(), ChunkError> {
     let slot = resolve_slot(map, pointer)?;
+    let bits_per_weight = bits_per_weight(slot, pointer.slot)?;
+    validate_pointer_range(slot, pointer, bits_per_weight)?;
     check_bounds(pointer, byte_offset, data.len() as u64)?;
-    let bits_per_weight = slot.stealable_bits_per_weight as u64;
+    let bit_len = pointer.length_in_bits as u64;
     for (i, &byte) in data.iter().enumerate() {
         let chunk_bit_base = (byte_offset + i as u64) * 8;
-        for k in 0..8_u64 {
+        let live_bits = bit_len.saturating_sub(chunk_bit_base).min(8);
+        for k in 0..live_bits {
             let bit_i = chunk_bit_base + k;
             let pos = position_for_bit(pointer, bits_per_weight, bit_i);
             let bit = ((byte >> k) & 1) == 1;
@@ -120,6 +139,40 @@ fn resolve_slot(
             slot: pointer.slot,
             slot_count: map.slots.len(),
         })
+}
+
+fn bits_per_weight(
+    slot: &crate::stego::tensor_map::TensorSlot,
+    slot_index: u16,
+) -> Result<u64, ChunkError> {
+    let bits = slot.stealable_bits_per_weight as u64;
+    if bits == 0 {
+        Err(ChunkError::NonStealableSlot { slot: slot_index })
+    } else {
+        Ok(bits)
+    }
+}
+
+fn validate_pointer_range(
+    slot: &crate::stego::tensor_map::TensorSlot,
+    pointer: Pointer,
+    bits_per_weight: u64,
+) -> Result<(), ChunkError> {
+    let covered_weights = if pointer.length_in_bits == 0 {
+        0
+    } else {
+        (pointer.length_in_bits as u64).div_ceil(bits_per_weight)
+    };
+    let end_weight = pointer.start_weight as u64 + covered_weights;
+    if end_weight > slot.weight_count {
+        return Err(ChunkError::PointerOutOfBounds {
+            slot: pointer.slot,
+            start_weight: pointer.start_weight,
+            end_weight,
+            weight_count: slot.weight_count,
+        });
+    }
+    Ok(())
 }
 
 fn check_bounds(pointer: Pointer, byte_offset: u64, len: u64) -> Result<(), ChunkError> {

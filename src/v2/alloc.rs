@@ -28,6 +28,10 @@
 //!   existing free run (allocator assumption: pointers come from a
 //!   prior alloc call; freeing the same pointer twice is a programmer
 //!   error).
+//! - `AllocError::PointerOutOfBounds` — the pointer's covered weights
+//!   extend past the end of its slot.
+//! - `AllocError::SlotTooLarge` / `AllocError::TooManySlots` — the
+//!   cover shape exceeds V2's current `Pointer`/freelist address widths.
 
 use thiserror::Error;
 
@@ -55,20 +59,55 @@ pub enum AllocError {
     #[error("pointer references slot {slot} but map has only {slot_count} slots")]
     SlotOutOfRange { slot: u16, slot_count: usize },
 
-    #[error("pointer's length_in_bits ({length}) is not a multiple of the slot's stealable bits per weight ({bpw})")]
-    UnalignedLength { length: u32, bpw: u32 },
+    #[error("pointer targets slot {slot}, which has no stealable bits")]
+    NonStealableSlot { slot: u16 },
+
+    #[error("pointer range [{start_weight}, {end_weight}) lies outside slot {slot} with {weight_count} weights")]
+    PointerOutOfBounds {
+        slot: u16,
+        start_weight: u32,
+        end_weight: u64,
+        weight_count: u64,
+    },
+
+    #[error("slot {slot} has {weight_count} weights, exceeding V2's current max of {max_weights}")]
+    SlotTooLarge {
+        slot: usize,
+        weight_count: u64,
+        max_weights: u64,
+    },
+
+    #[error("map has {slot_count} slots, exceeding V2's current max of {max_slots}")]
+    TooManySlots { slot_count: usize, max_slots: usize },
 }
 
 impl Allocator {
     /// Build an allocator over a fresh cover: each eligible slot
     /// contributes one initial free run spanning its full weight
     /// range. Non-stealable slots are skipped.
-    pub fn new_for_map(map: &TensorMap, ceiling: CeilingSummary) -> Self {
+    pub fn new_for_map(map: &TensorMap, ceiling: CeilingSummary) -> Result<Self, AllocError> {
+        const MAX_SLOTS: usize = u16::MAX as usize + 1;
+        const MAX_WEIGHTS_PER_SLOT: u64 = u32::MAX as u64;
+
+        if map.slots.len() > MAX_SLOTS {
+            return Err(AllocError::TooManySlots {
+                slot_count: map.slots.len(),
+                max_slots: MAX_SLOTS,
+            });
+        }
+
         let mut freelist = FreeRunSet::new();
         for (slot_idx, slot) in map.slots.iter().enumerate() {
             let bpw = stealable_bits_for(slot.quant_type);
             if bpw == 0 || slot.weight_count == 0 {
                 continue;
+            }
+            if slot.weight_count > MAX_WEIGHTS_PER_SLOT {
+                return Err(AllocError::SlotTooLarge {
+                    slot: slot_idx,
+                    weight_count: slot.weight_count,
+                    max_weights: MAX_WEIGHTS_PER_SLOT,
+                });
             }
             let max_ceiling = ceiling.max_over_range(
                 slot_idx as u32,
@@ -82,7 +121,7 @@ impl Allocator {
                 max_ceiling,
             });
         }
-        Self { freelist, ceiling }
+        Ok(Self { freelist, ceiling })
     }
 
     /// Count of free runs, for diagnostics and tests.
@@ -122,7 +161,7 @@ impl Allocator {
         let slot = &map.slots[picked.slot as usize];
         let bpw = slot.stealable_bits_per_weight as u32;
         // ceil-div: cover any request that isn't an exact multiple of bpw
-        let needed_weights = length_in_bits.div_ceil(bpw);
+        let needed_weights = weights_for_bits(length_in_bits, bpw);
 
         let allocated_pointer = Pointer {
             slot: picked.slot,
@@ -167,13 +206,19 @@ impl Allocator {
         }
         let slot = &map.slots[pointer.slot as usize];
         let bpw = slot.stealable_bits_per_weight as u32;
-        if bpw == 0 || !pointer.length_in_bits.is_multiple_of(bpw) {
-            return Err(AllocError::UnalignedLength {
-                length: pointer.length_in_bits,
-                bpw,
+        if bpw == 0 {
+            return Err(AllocError::NonStealableSlot { slot: pointer.slot });
+        }
+        let length_in_weights = weights_for_bits(pointer.length_in_bits, bpw);
+        let end_weight = pointer_end_weight(pointer.start_weight, length_in_weights);
+        if end_weight > slot.weight_count {
+            return Err(AllocError::PointerOutOfBounds {
+                slot: pointer.slot,
+                start_weight: pointer.start_weight,
+                end_weight,
+                weight_count: slot.weight_count,
             });
         }
-        let length_in_weights = pointer.length_in_bits / bpw;
         if self
             .freelist
             .overlaps_run(pointer.slot, pointer.start_weight, length_in_weights)
@@ -196,4 +241,16 @@ impl Allocator {
         });
         Ok(())
     }
+}
+
+fn weights_for_bits(length_in_bits: u32, bits_per_weight: u32) -> u32 {
+    if length_in_bits == 0 {
+        0
+    } else {
+        length_in_bits.div_ceil(bits_per_weight)
+    }
+}
+
+fn pointer_end_weight(start_weight: u32, length_in_weights: u32) -> u64 {
+    start_weight as u64 + length_in_weights as u64
 }
