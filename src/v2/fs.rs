@@ -381,9 +381,13 @@ impl Filesystem {
         if components.is_empty() {
             return Err(FsError::PathCannotBeRoot);
         }
+        let (parent_dir, leaf_name) = self.read_parent_directory(&components)?;
+        if parent_dir.find(leaf_name).is_some() {
+            return Err(FsError::AlreadyExists(leaf_name.to_owned()));
+        }
 
-        // Allocate the empty child directory first; its pointer is
-        // then woven into the parent.
+        // Semantic failures must be a no-op, so prove the parent path
+        // and leaf availability before allocating the child directory.
         let empty = Directory::new();
         let child_inode = write_directory_content(
             &mut self.cover,
@@ -451,7 +455,15 @@ impl Filesystem {
         if components.is_empty() {
             return Err(FsError::PathCannotBeRoot);
         }
+        let (parent_dir, leaf_name) = self.read_parent_directory(&components)?;
+        if let Some(existing) = parent_dir.find(leaf_name) {
+            if existing.kind == EntryKind::Directory {
+                return Err(FsError::IsADirectory(leaf_name.to_owned()));
+            }
+        }
 
+        // Path errors must not perturb allocator state or cover bytes,
+        // so write the file content only after the path preflight above.
         let file_inode_ptr = self.write_file_content(data)?;
 
         let new_root_ptr = self.mutate_parent_directory(&components, |parent, name| {
@@ -619,6 +631,29 @@ impl Filesystem {
             .find(leaf)
             .ok_or_else(|| FsError::PathNotFound(join_path(components)))?;
         Ok((entry.inode, entry.kind))
+    }
+
+    /// Load the directory that should contain `components`' leaf and
+    /// return it alongside the leaf name. Used by mutators to prove
+    /// path semantics before they allocate any new chunks.
+    fn read_parent_directory<'a>(
+        &self,
+        components: &'a [&'a str],
+    ) -> Result<(Directory, &'a str), FsError> {
+        let (leaf, parent_names) = components.split_last().unwrap();
+        let mut cur: Option<Directory> = None;
+        for pn in parent_names {
+            let dir = cur.as_ref().unwrap_or(&self.root_directory);
+            let entry = dir
+                .find(pn)
+                .ok_or_else(|| FsError::PathNotFound(join_path(components)))?;
+            if entry.kind != EntryKind::Directory {
+                return Err(FsError::NotADirectory((*pn).to_owned()));
+            }
+            cur = Some(read_directory(&self.cover, &self.map, entry.inode)?);
+        }
+        let parent = cur.unwrap_or_else(|| self.root_directory.clone());
+        Ok((parent, *leaf))
     }
 
     /// Walk to the parent directory of `components`, apply `mutate`

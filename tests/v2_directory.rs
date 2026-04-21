@@ -350,6 +350,18 @@ fn deserialize_rejects_invalid_kind() {
 }
 
 #[test]
+fn deserialize_rejects_nonzero_reserved_bytes() {
+    let mut bytes = vec![1u8, 0, 0, 0];
+    bytes.push(0); // file
+    bytes.push(1);
+    bytes.extend_from_slice(&[0xAA, 0xBB]); // reserved must stay zero
+    bytes.extend_from_slice(&ptr(0, 0).encode());
+    bytes.push(b'x');
+    let err = Directory::deserialize(&bytes).unwrap_err();
+    assert!(matches!(err, DirectoryError::ReservedNotZero { .. }));
+}
+
+#[test]
 fn deserialize_rejects_trailing_bytes() {
     let dir = Directory::new();
     let mut bytes = dir.serialize();

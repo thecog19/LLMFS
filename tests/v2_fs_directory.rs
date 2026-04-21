@@ -140,6 +140,22 @@ fn mkdir_nested_requires_parent() {
 }
 
 #[test]
+fn failed_mkdir_is_a_noop() {
+    let (cover, map) = make_cover();
+    let mut fs = init(cover.clone(), map.clone());
+    let baseline = init(cover, map);
+    let free_before = fs.allocator_free_weights();
+    let generation_before = fs.generation();
+
+    let err = fs.mkdir("/missing/child").unwrap_err();
+    assert!(matches!(err, FsError::PathNotFound(_)), "got {err:?}");
+    assert_eq!(fs.allocator_free_weights(), free_before);
+    assert_eq!(fs.generation(), generation_before);
+    assert!(fs.readdir("/").unwrap().is_empty());
+    assert_eq!(fs.unmount(), baseline.unmount());
+}
+
+#[test]
 fn mkdir_collision_errors() {
     let (cover, map) = make_cover();
     let mut fs = init(cover, map);
@@ -203,6 +219,24 @@ fn create_file_where_directory_exists_errors() {
     fs.mkdir("/foo").unwrap();
     let err = fs.create_file("/foo", b"data").unwrap_err();
     assert!(matches!(err, FsError::IsADirectory(_)), "got {err:?}");
+}
+
+#[test]
+fn failed_create_file_is_a_noop() {
+    let (cover, map) = make_cover();
+    let mut fs = init(cover.clone(), map.clone());
+    let mut baseline = init(cover, map);
+    fs.mkdir("/foo").unwrap();
+    baseline.mkdir("/foo").unwrap();
+    let free_before = fs.allocator_free_weights();
+    let generation_before = fs.generation();
+
+    let err = fs.create_file("/foo", b"data").unwrap_err();
+    assert!(matches!(err, FsError::IsADirectory(_)), "got {err:?}");
+    assert_eq!(fs.allocator_free_weights(), free_before);
+    assert_eq!(fs.generation(), generation_before);
+    assert!(fs.readdir("/foo").unwrap().is_empty());
+    assert_eq!(fs.unmount(), baseline.unmount());
 }
 
 #[test]

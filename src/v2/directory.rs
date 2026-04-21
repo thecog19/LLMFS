@@ -121,6 +121,9 @@ pub enum DirectoryError {
     #[error("invalid entry kind byte: {0}")]
     InvalidKind(u8),
 
+    #[error("entry reserved bytes at offset {offset} must be zero, got {bytes:?}")]
+    ReservedNotZero { offset: usize, bytes: [u8; 2] },
+
     #[error(
         "invalid entry name: must be 1..={MAX_NAME_LEN} UTF-8 bytes and contain no '/' or NUL"
     )]
@@ -229,8 +232,13 @@ impl Directory {
             }
             let kind = EntryKind::from_byte(bytes[cursor])?;
             let name_len = bytes[cursor + 1] as usize;
-            // reserved: bytes[cursor+2..=cursor+3] — ignored on read
-            // so minor-version bumps can repurpose them.
+            let reserved = [bytes[cursor + 2], bytes[cursor + 3]];
+            if reserved != [0, 0] {
+                return Err(DirectoryError::ReservedNotZero {
+                    offset: cursor + 2,
+                    bytes: reserved,
+                });
+            }
             let ptr = Pointer::decode(&bytes[cursor + 4..cursor + 4 + Pointer::SIZE])?;
             cursor += ENTRY_HEADER_BYTES;
             if cursor + name_len > bytes.len() {
