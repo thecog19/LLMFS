@@ -4,6 +4,7 @@ pub mod fs;
 pub mod fuse;
 pub mod gguf;
 pub mod stego;
+pub mod v2;
 
 pub const APP_NAME: &str = "llmdb";
 pub const BLOCK_SIZE: usize = 4096;

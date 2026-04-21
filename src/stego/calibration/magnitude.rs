@@ -9,6 +9,8 @@
 //! positions.
 
 use crate::gguf::quant::GgufQuantType;
+use crate::stego::calibration::bit_io::write_bit;
+use crate::stego::calibration::placement::MetadataBitPos;
 use crate::stego::calibration::{WeightRef, stealable_bits_for};
 use crate::stego::packing::{float, q3_k, q4_k, q5_k, q6_k};
 use crate::stego::tensor_map::{TensorMap, TensorSlot};
@@ -42,6 +44,149 @@ pub fn read_weight_abs(mmap: &[u8], slot: &TensorSlot, weight_index: u64) -> f32
         | GgufQuantType::Q8_1
         | GgufQuantType::Q8K => 0.0,
     }
+}
+
+/// Read the **ceiling magnitude** of a single weight:
+/// `max_over_stealable_bit_values(|w|)`. Invariant under any V2 write
+/// — depends only on the non-stealable bits of the weight and the
+/// block's shared parameters. Used by Layer 0 anchor placement
+/// (DESIGN-NEW §15.2) and Layer 3 pristine allocation (§15.5), both
+/// of which need a ranking that doesn't shift when stealable bits
+/// change under writes.
+///
+/// Per-quant-type formulas are in DESIGN-NEW §15.10.
+///
+/// Non-stealable quant types (`stealable_bits_hint == 0`) return
+/// `0.0`, matching `read_weight_abs`'s convention.
+pub fn read_weight_ceiling_abs(
+    mmap: &[u8],
+    slot: &TensorSlot,
+    weight_index: u64,
+) -> f32 {
+    match slot.quant_type {
+        GgufQuantType::F16 => read_f16_ceiling(mmap, slot.data_offset, weight_index),
+        GgufQuantType::F32 => read_f32_ceiling(mmap, slot.data_offset, weight_index),
+        GgufQuantType::Q8_0 => read_q8_0_ceiling(mmap, slot.data_offset, weight_index),
+        // K-quants use enumeration over the 2-4 stealable-bit values.
+        // The per-packer decode formulas are complex enough that
+        // replicating them inline would drift from the packer; using
+        // the packer's own `read_weight_value` via a probe copy of the
+        // block keeps them in lockstep.
+        GgufQuantType::Q3K
+        | GgufQuantType::Q4K
+        | GgufQuantType::Q5K
+        | GgufQuantType::Q6K => read_kquant_ceiling(mmap, slot, weight_index),
+        // Non-stealable quant types — same 0.0 convention as
+        // `read_weight_abs`.
+        GgufQuantType::Q2K
+        | GgufQuantType::Q4_0
+        | GgufQuantType::Q4_1
+        | GgufQuantType::Q5_0
+        | GgufQuantType::Q5_1
+        | GgufQuantType::Q8_1
+        | GgufQuantType::Q8K => 0.0,
+    }
+}
+
+fn read_f16_ceiling(mmap: &[u8], data_offset: u64, weight_index: u64) -> f32 {
+    // F16 layout: sign (1) | exp (5) | mantissa (10). Stealable = low
+    // 4 mantissa bits. OR'ing in 0x000F yields the mantissa-maximized
+    // variant; |w| is monotonic in mantissa for fixed sign/exp (in
+    // both the normal and subnormal ranges), so this is the ceiling.
+    let off = (data_offset + weight_index * 2) as usize;
+    let bits = u16::from_le_bytes([mmap[off], mmap[off + 1]]);
+    float::f16_to_f32(bits | 0x000F).abs()
+}
+
+fn read_f32_ceiling(mmap: &[u8], data_offset: u64, weight_index: u64) -> f32 {
+    // F32 layout: sign (1) | exp (8) | mantissa (23). Stealable = low
+    // 8 mantissa bits. Same monotonic argument as F16.
+    let off = (data_offset + weight_index * 4) as usize;
+    let bits = u32::from_le_bytes([mmap[off], mmap[off + 1], mmap[off + 2], mmap[off + 3]]);
+    f32::from_bits(bits | 0x0000_00FF).abs()
+}
+
+fn read_q8_0_ceiling(mmap: &[u8], data_offset: u64, weight_index: u64) -> f32 {
+    // Q8_0: 2-byte fp16 scale + 32 signed int8. Stealable = low nibble
+    // of int8. Over all low-nibble values, |int8 × scale| is maximized
+    // at either the `int8 & 0xF0` endpoint (for negative high-nibble)
+    // or the `(int8 & 0xF0) + 15` endpoint (for non-negative
+    // high-nibble). The two-argument max handles both branches.
+    //
+    // Worked examples (DESIGN-NEW §15.10):
+    //   int8 = 0x08 → H = 0    → max(0, 15)   = 15
+    //   int8 = 0xFF → H = -16  → max(16, 1)   = 16
+    //   int8 = 0x80 → H = -128 → max(128, 113) = 128
+    //   int8 = 0x7F → H = 112  → max(112, 127) = 127
+    const BLOCK_WEIGHTS: u64 = 32;
+    const BLOCK_BYTES: u64 = 34;
+    let block_idx = weight_index / BLOCK_WEIGHTS;
+    let in_block = (weight_index % BLOCK_WEIGHTS) as usize;
+    let block_off = (data_offset + block_idx * BLOCK_BYTES) as usize;
+    let scale_bits = u16::from_le_bytes([mmap[block_off], mmap[block_off + 1]]);
+    let scale = float::f16_to_f32(scale_bits);
+    let int8_u = mmap[block_off + 2 + in_block];
+    // Signed view of the zero-low-nibble variant. i16 avoids overflow
+    // at H = -128 (whose `|H|` is 128, outside i8's range).
+    let h_i16 = ((int8_u & 0xF0) as i8) as i16;
+    let h_abs = h_i16.unsigned_abs() as u32;
+    let h_plus_15_abs = (h_i16 + 15).unsigned_abs() as u32;
+    let max_mag = h_abs.max(h_plus_15_abs) as f32;
+    max_mag * scale.abs()
+}
+
+/// K-quant ceiling via enumeration. Copies the target block, probes
+/// each of the 2-4 stealable-bit variants via `bit_io::write_bit`, and
+/// re-decodes the weight via the packer's `read_weight_abs` path. Cost
+/// is O(2^stealable × decode_cost) per weight — small constant.
+fn read_kquant_ceiling(mmap: &[u8], slot: &TensorSlot, weight_index: u64) -> f32 {
+    let stealable = stealable_bits_for(slot.quant_type);
+    if stealable == 0 {
+        return 0.0;
+    }
+
+    let (block_bytes, weights_per_block) = match slot.quant_type {
+        GgufQuantType::Q3K => (q3_k::BLOCK_BYTES, q3_k::WEIGHTS_PER_BLOCK as u64),
+        GgufQuantType::Q4K => (q4_k::BLOCK_BYTES, q4_k::WEIGHTS_PER_BLOCK as u64),
+        GgufQuantType::Q5K => (q5_k::BLOCK_BYTES, q5_k::WEIGHTS_PER_BLOCK as u64),
+        GgufQuantType::Q6K => (q6_k::BLOCK_BYTES, q6_k::WEIGHTS_PER_BLOCK as u64),
+        _ => return 0.0,
+    };
+
+    let block_idx = weight_index / weights_per_block;
+    let block_start = slot.data_offset as usize + block_idx as usize * block_bytes;
+    let mut probe = mmap[block_start..block_start + block_bytes].to_vec();
+
+    let synth_slot = TensorSlot {
+        name: slot.name.clone(),
+        quant_type: slot.quant_type,
+        tier: slot.tier,
+        data_offset: 0,
+        weight_count: weights_per_block,
+        stealable_bits_per_weight: slot.stealable_bits_per_weight,
+        capacity_bits: weights_per_block * stealable as u64,
+        bit_start: 0,
+        bit_end: weights_per_block * stealable as u64,
+    };
+    let synth_weight_index = weight_index % weights_per_block;
+
+    let mut max_mag: f32 = 0.0;
+    let variants = 1_u32 << stealable;
+    for v in 0..variants {
+        for bit_idx in 0..stealable {
+            let pos = MetadataBitPos {
+                slot_index: 0,
+                weight_index: synth_weight_index,
+                bit_index: bit_idx as u8,
+            };
+            write_bit(&mut probe, &synth_slot, pos, ((v >> bit_idx) & 1) == 1);
+        }
+        let mag = read_weight_abs(&probe, &synth_slot, synth_weight_index);
+        if mag > max_mag {
+            max_mag = mag;
+        }
+    }
+    max_mag
 }
 
 fn read_q3_k_abs(mmap: &[u8], data_offset: u64, weight_index: u64) -> f32 {
