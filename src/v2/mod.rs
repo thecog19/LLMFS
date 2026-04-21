@@ -19,6 +19,7 @@ pub mod anchor;
 pub mod ceiling;
 pub mod chunk;
 pub mod freelist;
+pub mod fs;
 pub mod inode;
 pub mod pointer;
 pub mod super_root;
