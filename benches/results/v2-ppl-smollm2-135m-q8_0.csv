@@ -1,0 +1,4 @@
+model,stage,bytes_loaded,ppl,ppl_stderr,chunks,ctx
+smollm2-135m-q8_0.gguf,pristine,0,18.8873,0.49705,50,512
+smollm2-135m-q8_0.gguf,post_init,0,18.9516,0.49907,50,512
+smollm2-135m-q8_0.gguf,post_write,1048576,22.7185,0.59917,50,512

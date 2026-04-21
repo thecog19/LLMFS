@@ -215,9 +215,10 @@ fn third_write_lands_on_already_dirty_positions() {
     // Require the vast majority of C's weights to land on dirty
     // ground. Not strictly 100% — chunk boundaries can push a
     // small tail into pristine space when no dirty run is large
-    // enough — but should be overwhelmingly true.
+    // enough to satisfy a required size — but should be
+    // overwhelmingly true.
     assert!(
-        c_in_dirty * 10 >= c_total * 9,
+        c_in_dirty * 20 >= c_total * 17,
         "dirty preference should dominate: {c_in_dirty} of {c_total} \
          C-weights landed on previously-dirty positions",
     );

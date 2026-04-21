@@ -195,6 +195,7 @@ impl Filesystem {
         allocator.reserve_weights(unique_weights(&anchor_placement))?;
 
         let mut dirty_bitmap = DirtyBitmap::new(&map);
+        let mut dedup_index = DedupIndex::new();
 
         // Fresh root directory → empty serialized entry list.
         let root_directory = Directory::new();
@@ -203,19 +204,25 @@ impl Filesystem {
             &map,
             &mut allocator,
             &mut dirty_bitmap,
+            &mut dedup_index,
             &cdc_params,
             &root_directory,
         )?;
         let root_inode = read_inode(&cover, &map, root_inode_ptr)?;
 
-        // Persist the (still-all-clean but for the above writes)
-        // dirty bitmap so subsequent mounts can read it back.
+        // Persist the dirty bitmap. At init it's all zeros —
+        // every CDC chunk of the 17 MB blob hashes identically,
+        // and the shared `dedup_index` collapses them to a single
+        // physical allocation (plus a handful of indirect blocks),
+        // keeping init-time perturbation bounded regardless of
+        // cover size.
         let bitmap_bytes = dirty_bitmap.serialize();
         let bitmap_inode_ptr = persist_as_byte_stream(
             &mut cover,
             &map,
             &mut allocator,
             &mut dirty_bitmap,
+            &mut dedup_index,
             &cdc_params,
             &bitmap_bytes,
         )?;
@@ -244,7 +251,7 @@ impl Filesystem {
             root_inode_ptr,
             root_directory,
             cdc_params,
-            dedup_index: DedupIndex::new(),
+            dedup_index,
             dirty_bitmap,
         })
     }
@@ -343,8 +350,15 @@ impl Filesystem {
             mark_pointer_dirty(&mut dirty_bitmap, &map, p);
         }
 
-        // Rebuild the dedup index across every file in the tree.
-        let dedup_index = build_dedup_index_for_tree(&cover, &map, root_inode_ptr)?;
+        // Rebuild the dedup index across every content chunk in
+        // the tree plus the bitmap's inode tree — writes consult
+        // the same index for files, directories, and the bitmap.
+        let dedup_index = build_dedup_index(
+            &cover,
+            &map,
+            root_inode_ptr,
+            super_root.dirty_bitmap_inode,
+        )?;
 
         Ok(Self {
             cover,
@@ -394,6 +408,7 @@ impl Filesystem {
             &self.map,
             &mut self.alloc,
             &mut self.dirty_bitmap,
+            &mut self.dedup_index,
             &self.cdc_params,
             &empty,
         )?;
@@ -695,6 +710,7 @@ impl Filesystem {
             &self.map,
             &mut self.alloc,
             &mut self.dirty_bitmap,
+            &mut self.dedup_index,
             &self.cdc_params,
             &cur,
         )?;
@@ -707,6 +723,7 @@ impl Filesystem {
                 &self.map,
                 &mut self.alloc,
                 &mut self.dirty_bitmap,
+                &mut self.dedup_index,
                 &self.cdc_params,
                 &parent,
             )?;
@@ -727,6 +744,7 @@ impl Filesystem {
             &self.map,
             &mut self.alloc,
             &mut self.dirty_bitmap,
+            &mut self.dedup_index,
             &self.cdc_params,
             &bitmap_bytes,
         )?;
@@ -781,66 +799,33 @@ impl Filesystem {
         self.root_inode = read_inode(&self.cover, &self.map, new_root_dir_inode)?;
         self.root_directory = read_directory(&self.cover, &self.map, new_root_dir_inode)?;
 
-        // Rebuild the dedup index from the new tree's files.
-        self.dedup_index =
-            build_dedup_index_for_tree(&self.cover, &self.map, new_root_dir_inode)?;
+        // Rebuild the dedup index across the new tree + new bitmap
+        // tree. Next commit's writes (file, directory, or bitmap)
+        // all consult this shared index.
+        self.dedup_index = build_dedup_index(
+            &self.cover,
+            &self.map,
+            new_root_dir_inode,
+            new_bitmap_inode_ptr,
+        )?;
         Ok(())
     }
 
-    /// Chunk + write a user file's bytes (consulting dedup) and
-    /// return the file's inode pointer. Internal helper shared by
-    /// [`Self::create_file`] and any future file-content mutator.
+    /// Chunk + write a user file's bytes through the shared dedup
+    /// path and return the file's inode pointer. Thin wrapper over
+    /// [`persist_as_byte_stream`] — file, directory, and bitmap
+    /// writes all go through the same function so identical chunks
+    /// across any of them collapse to one physical allocation.
     fn write_file_content(&mut self, data: &[u8]) -> Result<Pointer, FsError> {
-        let ranges = chunk_ranges(data, &self.cdc_params);
-        let max_chunks = max_chunks_for(&self.cdc_params);
-        if ranges.len() > max_chunks {
-            return Err(FsError::FileTooLarge {
-                bytes: data.len(),
-                chunk_count: ranges.len(),
-                max_chunks,
-            });
-        }
-
-        // Per-file in-flight dedup map — lets later chunks in the
-        // same write dedup against earlier ones even when neither
-        // exists in the persistent index yet.
-        let mut this_file = DedupIndex::new();
-        let mut data_chunk_ptrs = Vec::with_capacity(ranges.len());
-        for range in &ranges {
-            let chunk = &data[range.clone()];
-            let hash = hash_chunk(chunk);
-            let ptr = if let Some(p) = self.dedup_index.lookup(&hash) {
-                p
-            } else if let Some(p) = this_file.lookup(&hash) {
-                p
-            } else {
-                let bit_count = (chunk.len() * 8) as u32;
-                let p = self
-                    .alloc
-                    .alloc_preferring_dirty(&self.map, bit_count, &self.dirty_bitmap)
-                    .ok_or(FsError::OutOfSpace {
-                        requested_bits: bit_count,
-                    })?;
-                write_chunk(&mut self.cover, &self.map, p, 0, chunk)?;
-                mark_pointer_dirty(&mut self.dirty_bitmap, &self.map, p);
-                p
-            };
-            this_file.insert(hash, ptr);
-            data_chunk_ptrs.push(ptr);
-        }
-
-        let inode = build_inode(
+        persist_as_byte_stream(
             &mut self.cover,
             &self.map,
             &mut self.alloc,
+            &mut self.dirty_bitmap,
+            &mut self.dedup_index,
             &self.cdc_params,
-            data.len() as u64,
-            &data_chunk_ptrs,
-        )?;
-        let inode_ptr =
-            alloc_and_write(&mut self.cover, &self.map, &mut self.alloc, &inode.encode())?;
-        mark_pointer_dirty(&mut self.dirty_bitmap, &self.map, inode_ptr);
-        Ok(inode_ptr)
+            data,
+        )
     }
 }
 
@@ -907,11 +892,12 @@ fn write_directory_content(
     map: &TensorMap,
     allocator: &mut Allocator,
     dirty: &mut DirtyBitmap,
+    dedup: &mut DedupIndex,
     cdc_params: &FastCdcParams,
     dir: &Directory,
 ) -> Result<Pointer, FsError> {
     let bytes = dir.serialize();
-    persist_as_byte_stream(cover, map, allocator, dirty, cdc_params, &bytes)
+    persist_as_byte_stream(cover, map, allocator, dirty, dedup, cdc_params, &bytes)
 }
 
 /// Collect the `(slot, weight_index)` pairs across a placement's bit
@@ -1017,13 +1003,53 @@ fn max_chunks_for(cdc_params: &FastCdcParams) -> usize {
         .saturating_add(ppb3)
 }
 
+/// Allocate-or-reuse a content chunk. Consults the dedup index
+/// first; on a miss, allocates a fresh chunk, writes, marks dirty,
+/// and inserts the `(hash, pointer)` pair.
+///
+/// All byte-stream data and every indirect block routes through
+/// here. Sharing one dedup index across files, directories, and the
+/// dirty bitmap is what keeps `llmdb v2-init` from perturbing ~34M
+/// Q8_0 weights on the first commit: the fresh bitmap is 17 MB of
+/// zeros, every CDC chunk of which hashes identically, so the whole
+/// inode tree collapses to a handful of physically-written chunks.
+fn dedup_or_write(
+    cover: &mut [u8],
+    map: &TensorMap,
+    allocator: &mut Allocator,
+    dirty: &mut DirtyBitmap,
+    dedup: &mut DedupIndex,
+    chunk: &[u8],
+) -> Result<Pointer, FsError> {
+    let hash = hash_chunk(chunk);
+    if let Some(p) = dedup.lookup(&hash) {
+        return Ok(p);
+    }
+    let bit_count = (chunk.len() * 8) as u32;
+    let p = allocator
+        .alloc_preferring_dirty(map, bit_count, dirty)
+        .ok_or(FsError::OutOfSpace {
+            requested_bits: bit_count,
+        })?;
+    write_chunk(cover, map, p, 0, chunk)?;
+    mark_pointer_dirty(dirty, map, p);
+    dedup.insert(hash, p);
+    Ok(p)
+}
+
 /// Thread `data_chunk_ptrs` through direct + indirect blocks and
-/// build an [`Inode`] describing them. Writes the indirect blocks
-/// via `allocator` as needed.
+/// build an [`Inode`] describing them. Indirect blocks also route
+/// through [`dedup_or_write`] — when the incoming pointer list has
+/// a lot of repeats (the bitmap-of-zeros case), many indirect
+/// blocks end up with byte-identical content and collapse to one
+/// physical chunk.
+#[allow(clippy::too_many_arguments)]
 fn build_inode(
     cover: &mut [u8],
     map: &TensorMap,
     allocator: &mut Allocator,
+    dirty: &mut DirtyBitmap,
+    dedup: &mut DedupIndex,
     cdc_params: &FastCdcParams,
     length: u64,
     data_chunk_ptrs: &[Pointer],
@@ -1038,7 +1064,14 @@ fn build_inode(
     let mut cursor = direct_used;
     let single_indirect = if cursor < chunk_count {
         let end = (cursor + ppb).min(chunk_count);
-        let ptr = write_pointer_list(cover, map, allocator, &data_chunk_ptrs[cursor..end])?;
+        let ptr = write_pointer_list(
+            cover,
+            map,
+            allocator,
+            dirty,
+            dedup,
+            &data_chunk_ptrs[cursor..end],
+        )?;
         cursor = end;
         ptr
     } else {
@@ -1051,6 +1084,8 @@ fn build_inode(
             cover,
             map,
             allocator,
+            dirty,
+            dedup,
             &data_chunk_ptrs[cursor..end],
             ppb,
         )?;
@@ -1066,6 +1101,8 @@ fn build_inode(
             cover,
             map,
             allocator,
+            dirty,
+            dedup,
             &data_chunk_ptrs[cursor..end],
             ppb,
         )?;
@@ -1089,13 +1126,15 @@ fn write_pointer_list(
     cover: &mut [u8],
     map: &TensorMap,
     allocator: &mut Allocator,
+    dirty: &mut DirtyBitmap,
+    dedup: &mut DedupIndex,
     pointers: &[Pointer],
 ) -> Result<Pointer, FsError> {
     let mut bytes = Vec::with_capacity(pointers.len() * Pointer::SIZE);
     for p in pointers {
         bytes.extend_from_slice(&p.encode());
     }
-    alloc_and_write(cover, map, allocator, &bytes)
+    dedup_or_write(cover, map, allocator, dirty, dedup, &bytes)
 }
 
 fn read_pointer_list(
@@ -1126,31 +1165,35 @@ fn build_double_indirect(
     cover: &mut [u8],
     map: &TensorMap,
     allocator: &mut Allocator,
+    dirty: &mut DirtyBitmap,
+    dedup: &mut DedupIndex,
     data_ptrs: &[Pointer],
     ppb: usize,
 ) -> Result<Pointer, FsError> {
     let mut single_indirect_ptrs = Vec::new();
     for group in data_ptrs.chunks(ppb) {
-        let sip = write_pointer_list(cover, map, allocator, group)?;
+        let sip = write_pointer_list(cover, map, allocator, dirty, dedup, group)?;
         single_indirect_ptrs.push(sip);
     }
-    write_pointer_list(cover, map, allocator, &single_indirect_ptrs)
+    write_pointer_list(cover, map, allocator, dirty, dedup, &single_indirect_ptrs)
 }
 
 fn build_triple_indirect(
     cover: &mut [u8],
     map: &TensorMap,
     allocator: &mut Allocator,
+    dirty: &mut DirtyBitmap,
+    dedup: &mut DedupIndex,
     data_ptrs: &[Pointer],
     ppb: usize,
 ) -> Result<Pointer, FsError> {
     let group_size = ppb * ppb;
     let mut double_indirect_ptrs = Vec::new();
     for group in data_ptrs.chunks(group_size) {
-        let dip = build_double_indirect(cover, map, allocator, group, ppb)?;
+        let dip = build_double_indirect(cover, map, allocator, dirty, dedup, group, ppb)?;
         double_indirect_ptrs.push(dip);
     }
-    write_pointer_list(cover, map, allocator, &double_indirect_ptrs)
+    write_pointer_list(cover, map, allocator, dirty, dedup, &double_indirect_ptrs)
 }
 
 /// Walk an inode's tree and collect every non-null data-chunk pointer
@@ -1215,14 +1258,21 @@ fn collect_data_pointers(
 }
 
 /// Persist an arbitrary byte stream as CDC-chunked data through a
-/// fresh inode and return the inode's chunk pointer. No dedup —
-/// used for internal V2 metadata (dirty bitmap, directory content)
-/// where content-hash lookups aren't worth the overhead.
+/// fresh inode and return the inode's chunk pointer. Every content
+/// chunk and every indirect block is routed through
+/// [`dedup_or_write`], so identical chunks across files, directories,
+/// the dirty bitmap, or within a single write all collapse to one
+/// physical allocation.
+///
+/// Only the inode chunk itself bypasses dedup: an inode's bytes are
+/// a length + 15 pointers, which differ by construction between files
+/// / directories / commits.
 fn persist_as_byte_stream(
     cover: &mut [u8],
     map: &TensorMap,
     allocator: &mut Allocator,
     dirty: &mut DirtyBitmap,
+    dedup: &mut DedupIndex,
     cdc_params: &FastCdcParams,
     data: &[u8],
 ) -> Result<Pointer, FsError> {
@@ -1239,14 +1289,7 @@ fn persist_as_byte_stream(
     let mut data_chunk_ptrs = Vec::with_capacity(ranges.len());
     for range in &ranges {
         let chunk = &data[range.clone()];
-        let bit_count = (chunk.len() * 8) as u32;
-        let ptr = allocator
-            .alloc_preferring_dirty(map, bit_count, dirty)
-            .ok_or(FsError::OutOfSpace {
-                requested_bits: bit_count,
-            })?;
-        write_chunk(cover, map, ptr, 0, chunk)?;
-        mark_pointer_dirty(dirty, map, ptr);
+        let ptr = dedup_or_write(cover, map, allocator, dirty, dedup, chunk)?;
         data_chunk_ptrs.push(ptr);
     }
 
@@ -1254,6 +1297,8 @@ fn persist_as_byte_stream(
         cover,
         map,
         allocator,
+        dirty,
+        dedup,
         cdc_params,
         data.len() as u64,
         &data_chunk_ptrs,
@@ -1426,45 +1471,72 @@ fn reclaim_abandoned_chunks(
     Ok(())
 }
 
-/// Rebuild the dedup index by walking every **file** in the tree
-/// rooted at `root_dir_inode_ptr` and inserting each data chunk's
-/// (hash, pointer) pair.
-fn build_dedup_index_for_tree(
+/// Rebuild the dedup index by walking every **content chunk**
+/// reachable from the root directory tree + the bitmap's inode
+/// tree. Content chunks are data leaves plus indirect-block chunks;
+/// inode chunks are skipped because routing a data chunk through an
+/// inode's hash would alias a 248-byte inode blob to whatever the
+/// caller thinks it's reading (even granting that CDC params keep
+/// data chunks larger than `INODE_BYTES`, skipping avoids the
+/// foot-gun).
+fn build_dedup_index(
     cover: &[u8],
     map: &TensorMap,
     root_dir_inode_ptr: Pointer,
+    bitmap_inode_ptr: Pointer,
 ) -> Result<DedupIndex, FsError> {
     let mut idx = DedupIndex::new();
-    walk_files(cover, map, root_dir_inode_ptr, &mut |file_inode_ptr| {
-        let file_inode = read_inode(cover, map, file_inode_ptr)?;
-        for dptr in collect_data_pointers(&file_inode, cover, map)? {
-            let chunk_bytes = byte_capacity(dptr) as usize;
-            let mut buf = vec![0u8; chunk_bytes];
-            read_chunk(cover, map, dptr, 0, &mut buf)?;
-            idx.insert(hash_chunk(&buf), dptr);
+    let mut hash_and_insert = |ptr: Pointer| -> Result<(), FsError> {
+        if ptr.is_null() {
+            return Ok(());
         }
+        let chunk_bytes = byte_capacity(ptr) as usize;
+        let mut buf = vec![0u8; chunk_bytes];
+        read_chunk(cover, map, ptr, 0, &mut buf)?;
+        idx.insert(hash_chunk(&buf), ptr);
         Ok(())
-    })?;
+    };
+
+    // Directory tree: every file / directory's content chunks.
+    walk_content_chunks(cover, map, root_dir_inode_ptr, &mut hash_and_insert)?;
+
+    // Bitmap tree: bitmap's data chunks + its indirect blocks.
+    if !bitmap_inode_ptr.is_null() {
+        let inode = read_inode(cover, map, bitmap_inode_ptr)?;
+        visit_inode_chunks(&inode, cover, map, &mut hash_and_insert)?;
+    }
+
     Ok(idx)
 }
 
-/// Recursively walk the directory tree rooted at `dir_inode_ptr`,
-/// calling `visit_file` once per file-kind entry encountered (with
-/// that file's inode pointer).
-fn walk_files<F>(
+/// Recursively walk the content chunks reachable from a directory
+/// tree — each directory's indirect blocks + content chunks, each
+/// file's indirect blocks + data chunks. Inode chunks themselves
+/// (dir inode, file inode) are **not** emitted.
+fn walk_content_chunks<F>(
     cover: &[u8],
     map: &TensorMap,
     dir_inode_ptr: Pointer,
-    visit_file: &mut F,
+    visit: &mut F,
 ) -> Result<(), FsError>
 where
     F: FnMut(Pointer) -> Result<(), FsError>,
 {
+    if dir_inode_ptr.is_null() {
+        return Ok(());
+    }
+    let inode = read_inode(cover, map, dir_inode_ptr)?;
+    visit_inode_chunks(&inode, cover, map, &mut *visit)?;
     let dir = read_directory(cover, map, dir_inode_ptr)?;
     for entry in dir.entries() {
         match entry.kind {
-            EntryKind::File => visit_file(entry.inode)?,
-            EntryKind::Directory => walk_files(cover, map, entry.inode, visit_file)?,
+            EntryKind::File => {
+                let finode = read_inode(cover, map, entry.inode)?;
+                visit_inode_chunks(&finode, cover, map, &mut *visit)?;
+            }
+            EntryKind::Directory => {
+                walk_content_chunks(cover, map, entry.inode, visit)?;
+            }
         }
     }
     Ok(())
