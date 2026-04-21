@@ -12,7 +12,7 @@ use std::collections::BinaryHeap;
 
 use crate::gguf::quant::GgufQuantType;
 use crate::stego::calibration::{WeightRef, stealable_bits_for};
-use crate::stego::packing::{float, q6_k};
+use crate::stego::packing::{float, q4_k, q5_k, q6_k};
 use crate::stego::tensor_map::{TensorMap, TensorSlot};
 
 /// Read the absolute value of a single weight from the mmap'd cover
@@ -26,14 +26,14 @@ pub fn read_weight_abs(mmap: &[u8], slot: &TensorSlot, weight_index: u64) -> f32
         GgufQuantType::F16 => read_f16_abs(mmap, slot.data_offset, weight_index),
         GgufQuantType::F32 => read_f32_abs(mmap, slot.data_offset, weight_index),
         GgufQuantType::Q8_0 => read_q8_0_abs(mmap, slot.data_offset, weight_index),
+        GgufQuantType::Q4K => read_q4_k_abs(mmap, slot.data_offset, weight_index),
+        GgufQuantType::Q5K => read_q5_k_abs(mmap, slot.data_offset, weight_index),
         GgufQuantType::Q6K => read_q6_k_abs(mmap, slot.data_offset, weight_index),
-        // TODO: real decoders for Q4_K, Q5_K, Q3_K (and the legacy
-        // Q4_0/Q4_1/Q5_0/Q5_1/Q8_1/Q2_K/Q8_K variants if a real cover
-        // ever needs them). Stubbed at 0.0 → ranked first (eligible
-        // before known-magnitude weights), which is incorrect.
+        // TODO: Q3_K and the legacy Q4_0 / Q4_1 / Q5_0 / Q5_1 /
+        // Q8_1 / Q2_K / Q8_K variants. Stubbed at 0.0 → ranked
+        // first, which is incorrect; covers using these quant types
+        // will silently mis-rank.
         GgufQuantType::Q3K
-        | GgufQuantType::Q4K
-        | GgufQuantType::Q5K
         | GgufQuantType::Q2K
         | GgufQuantType::Q4_0
         | GgufQuantType::Q4_1
@@ -42,6 +42,30 @@ pub fn read_weight_abs(mmap: &[u8], slot: &TensorSlot, weight_index: u64) -> f32
         | GgufQuantType::Q8_1
         | GgufQuantType::Q8K => 0.0,
     }
+}
+
+fn read_q4_k_abs(mmap: &[u8], data_offset: u64, weight_index: u64) -> f32 {
+    let block_weights = q4_k::WEIGHTS_PER_BLOCK as u64;
+    let block_bytes = q4_k::BLOCK_BYTES;
+    let block_idx = weight_index / block_weights;
+    let in_block = (weight_index % block_weights) as usize;
+    let block_start = data_offset as usize + block_idx as usize * block_bytes;
+    let block = &mmap[block_start..block_start + block_bytes];
+    q4_k::read_weight_value(block, in_block)
+        .expect("q4_k weight read invariant violated")
+        .abs()
+}
+
+fn read_q5_k_abs(mmap: &[u8], data_offset: u64, weight_index: u64) -> f32 {
+    let block_weights = q5_k::WEIGHTS_PER_BLOCK as u64;
+    let block_bytes = q5_k::BLOCK_BYTES;
+    let block_idx = weight_index / block_weights;
+    let in_block = (weight_index % block_weights) as usize;
+    let block_start = data_offset as usize + block_idx as usize * block_bytes;
+    let block = &mmap[block_start..block_start + block_bytes];
+    q5_k::read_weight_value(block, in_block)
+        .expect("q5_k weight read invariant violated")
+        .abs()
 }
 
 fn read_f16_abs(mmap: &[u8], data_offset: u64, weight_index: u64) -> f32 {
