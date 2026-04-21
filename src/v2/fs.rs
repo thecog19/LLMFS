@@ -47,7 +47,7 @@ use crate::v2::anchor::{self, AnchorError};
 use crate::v2::ceiling::CeilingSummary;
 use crate::v2::chunk::{ChunkError, byte_capacity, read_chunk, write_chunk};
 use crate::v2::inode::{INODE_BYTES, Inode, InodeError, NUM_DIRECT};
-use crate::v2::pointer::Pointer;
+use crate::v2::pointer::{Pointer, PointerError};
 use crate::v2::super_root::{SUPER_ROOT_BYTES, SuperRoot, SuperRootError};
 
 const DEFAULT_CHUNK_SIZE_BYTES: u32 = 4096;
@@ -90,6 +90,9 @@ pub enum FsError {
 
     #[error("super-root codec: {0}")]
     SuperRoot(#[from] SuperRootError),
+
+    #[error("pointer codec: {0}")]
+    Pointer(#[from] PointerError),
 
     #[error("out of space: could not allocate {requested_bits} bits")]
     OutOfSpace { requested_bits: u32 },
@@ -203,11 +206,12 @@ impl Filesystem {
         let root_inode = Inode::decode(&inode_bytes)?;
 
         reserve_pointer(&mut allocator, &map, root_inode_ptr)?;
-        for ptr in &root_inode.direct {
-            if !ptr.is_null() {
-                reserve_pointer(&mut allocator, &map, *ptr)?;
-            }
-        }
+        // Walk the full inode tree — direct + indirect blocks + the
+        // data chunks each indirect tier reaches — and reserve
+        // every chunk so subsequent allocs avoid live state.
+        visit_inode_chunks(&root_inode, &cover, &map, |ptr| {
+            reserve_pointer(&mut allocator, &map, ptr)
+        })?;
 
         Ok(Self {
             cover,
@@ -224,26 +228,36 @@ impl Filesystem {
     }
 
     /// Replace the single-file contents with `data`. Allocates fresh
-    /// chunks, builds a new inode + super-root, and commits via an
-    /// anchor-slot swap. Old chunks leak for this milestone.
+    /// chunks, builds a new inode + super-root (with indirect blocks
+    /// as needed), and commits via an anchor-slot swap. Old chunks
+    /// leak for this milestone.
     pub fn write(&mut self, data: &[u8]) -> Result<(), FsError> {
         let chunk_size = self.data_chunk_size_bytes as usize;
+        let ppb = ptrs_per_indirect_block(chunk_size);
         let chunk_count = if data.is_empty() {
             0
         } else {
             data.len().div_ceil(chunk_size.max(1))
         };
-        if chunk_count > NUM_DIRECT {
+
+        let ppb2 = ppb.saturating_mul(ppb);
+        let ppb3 = ppb2.saturating_mul(ppb);
+        let max_chunks = NUM_DIRECT
+            .saturating_add(ppb)
+            .saturating_add(ppb2)
+            .saturating_add(ppb3);
+        if chunk_count > max_chunks {
             return Err(FsError::FileTooLarge {
                 bytes: data.len(),
-                max_chunks: NUM_DIRECT,
+                max_chunks,
                 chunk_size: self.data_chunk_size_bytes,
             });
         }
 
-        let mut chunk_ptrs = [Pointer::NULL; NUM_DIRECT];
+        // Allocate + write every data chunk in order.
+        let mut data_chunk_ptrs = Vec::with_capacity(chunk_count);
         let mut offset = 0;
-        for chunk_ptr in chunk_ptrs.iter_mut().take(chunk_count) {
+        for _ in 0..chunk_count {
             let this_bytes = (data.len() - offset).min(chunk_size);
             let bit_count = (this_bytes * 8) as u32;
             let ptr = self
@@ -259,16 +273,69 @@ impl Filesystem {
                 0,
                 &data[offset..offset + this_bytes],
             )?;
-            *chunk_ptr = ptr;
+            data_chunk_ptrs.push(ptr);
             offset += this_bytes;
         }
 
+        // Thread data chunk pointers into direct + single/double/triple
+        // indirect blocks per the standard ext2-style layout.
+        let mut direct = [Pointer::NULL; NUM_DIRECT];
+        let direct_used = chunk_count.min(NUM_DIRECT);
+        direct[..direct_used].copy_from_slice(&data_chunk_ptrs[..direct_used]);
+
+        let mut cursor = direct_used;
+        let single_indirect = if cursor < chunk_count {
+            let end = (cursor + ppb).min(chunk_count);
+            let ptr = write_pointer_list(
+                &mut self.cover,
+                &self.map,
+                &mut self.alloc,
+                &data_chunk_ptrs[cursor..end],
+            )?;
+            cursor = end;
+            ptr
+        } else {
+            Pointer::NULL
+        };
+
+        let double_indirect = if cursor < chunk_count {
+            let end = (cursor + ppb * ppb).min(chunk_count);
+            let ptr = build_double_indirect(
+                &mut self.cover,
+                &self.map,
+                &mut self.alloc,
+                &data_chunk_ptrs[cursor..end],
+                ppb,
+            )?;
+            cursor = end;
+            ptr
+        } else {
+            Pointer::NULL
+        };
+
+        let triple_indirect = if cursor < chunk_count {
+            let end = chunk_count;
+            let ptr = build_triple_indirect(
+                &mut self.cover,
+                &self.map,
+                &mut self.alloc,
+                &data_chunk_ptrs[cursor..end],
+                ppb,
+            )?;
+            cursor = end;
+            ptr
+        } else {
+            Pointer::NULL
+        };
+
+        debug_assert_eq!(cursor, chunk_count);
+
         let new_inode = Inode {
             length: data.len() as u64,
-            direct: chunk_ptrs,
-            single_indirect: Pointer::NULL,
-            double_indirect: Pointer::NULL,
-            triple_indirect: Pointer::NULL,
+            direct,
+            single_indirect,
+            double_indirect,
+            triple_indirect,
         };
         let new_inode_ptr =
             alloc_and_write(&mut self.cover, &self.map, &mut self.alloc, &new_inode.encode())?;
@@ -304,18 +371,23 @@ impl Filesystem {
         Ok(())
     }
 
-    /// Read the single file's full byte contents.
+    /// Read the single file's full byte contents. Walks the inode's
+    /// direct + single / double / triple indirect chains to collect
+    /// every data chunk in order, concatenates their bytes, and
+    /// truncates to `inode.length`.
     pub fn read(&self) -> Result<Vec<u8>, FsError> {
         let length = self.root_inode.length as usize;
+        let data_ptrs = collect_data_pointers(&self.root_inode, &self.cover, &self.map)?;
+
         let mut out = Vec::with_capacity(length);
-        for ptr in &self.root_inode.direct {
-            if ptr.is_null() || out.len() >= length {
+        for ptr in data_ptrs {
+            if out.len() >= length {
                 break;
             }
-            let chunk_bytes = byte_capacity(*ptr) as usize;
+            let chunk_bytes = byte_capacity(ptr) as usize;
             let this_read = chunk_bytes.min(length - out.len());
             let mut buf = vec![0u8; this_read];
-            read_chunk(&self.cover, &self.map, *ptr, 0, &mut buf)?;
+            read_chunk(&self.cover, &self.map, ptr, 0, &mut buf)?;
             out.extend_from_slice(&buf);
         }
         out.truncate(length);
@@ -388,4 +460,226 @@ fn alloc_and_write(
         })?;
     write_chunk(cover, map, ptr, 0, data)?;
     Ok(ptr)
+}
+
+// ------------------------------------------------------------------
+// Indirect-block helpers
+// ------------------------------------------------------------------
+
+/// Max pointers a full indirect block can hold at the given data
+/// chunk size — the threshold for overflowing to the next indirect
+/// tier. A "full" indirect block is sized exactly like a data chunk.
+fn ptrs_per_indirect_block(data_chunk_size_bytes: usize) -> usize {
+    data_chunk_size_bytes / Pointer::SIZE
+}
+
+/// Allocate + write a pointer list as a chunk. Returns the chunk's
+/// pointer. The chunk is sized to hold exactly `pointers.len()`
+/// pointers — partial indirect blocks are not padded out to the
+/// full `ptrs_per_indirect_block` size.
+fn write_pointer_list(
+    cover: &mut [u8],
+    map: &TensorMap,
+    allocator: &mut Allocator,
+    pointers: &[Pointer],
+) -> Result<Pointer, FsError> {
+    let mut bytes = Vec::with_capacity(pointers.len() * Pointer::SIZE);
+    for p in pointers {
+        bytes.extend_from_slice(&p.encode());
+    }
+    alloc_and_write(cover, map, allocator, &bytes)
+}
+
+/// Read the pointer list out of an indirect block. The block's
+/// pointer count is derived from its byte capacity — `byte_capacity /
+/// 16` — so variable-size partial blocks decode correctly.
+fn read_pointer_list(
+    cover: &[u8],
+    map: &TensorMap,
+    block_ptr: Pointer,
+) -> Result<Vec<Pointer>, FsError> {
+    if block_ptr.is_null() {
+        return Ok(Vec::new());
+    }
+    let byte_count = byte_capacity(block_ptr) as usize;
+    debug_assert!(
+        byte_count.is_multiple_of(Pointer::SIZE),
+        "pointer block capacity {byte_count} not a multiple of Pointer::SIZE",
+    );
+    let pointer_count = byte_count / Pointer::SIZE;
+    let mut buf = vec![0u8; byte_count];
+    read_chunk(cover, map, block_ptr, 0, &mut buf)?;
+    let mut out = Vec::with_capacity(pointer_count);
+    for i in 0..pointer_count {
+        let start = i * Pointer::SIZE;
+        out.push(Pointer::decode(&buf[start..start + Pointer::SIZE])?);
+    }
+    Ok(out)
+}
+
+/// Build a double-indirect block: group `data_ptrs` into chunks of
+/// `ppb` data pointers each, write a single-indirect block per
+/// group, then write the list of single-indirect-block pointers as
+/// the double-indirect block. Returns the double-indirect block's
+/// pointer.
+fn build_double_indirect(
+    cover: &mut [u8],
+    map: &TensorMap,
+    allocator: &mut Allocator,
+    data_ptrs: &[Pointer],
+    ppb: usize,
+) -> Result<Pointer, FsError> {
+    let mut single_indirect_ptrs = Vec::new();
+    for group in data_ptrs.chunks(ppb) {
+        let sip = write_pointer_list(cover, map, allocator, group)?;
+        single_indirect_ptrs.push(sip);
+    }
+    write_pointer_list(cover, map, allocator, &single_indirect_ptrs)
+}
+
+/// Build a triple-indirect block: group `data_ptrs` into chunks of
+/// `ppb² data pointers each, each of which becomes a
+/// double-indirect block via [`build_double_indirect`]. Returns the
+/// triple-indirect block's pointer.
+fn build_triple_indirect(
+    cover: &mut [u8],
+    map: &TensorMap,
+    allocator: &mut Allocator,
+    data_ptrs: &[Pointer],
+    ppb: usize,
+) -> Result<Pointer, FsError> {
+    let group_size = ppb * ppb;
+    let mut double_indirect_ptrs = Vec::new();
+    for group in data_ptrs.chunks(group_size) {
+        let dip = build_double_indirect(cover, map, allocator, group, ppb)?;
+        double_indirect_ptrs.push(dip);
+    }
+    write_pointer_list(cover, map, allocator, &double_indirect_ptrs)
+}
+
+/// Walk the inode's direct + single / double / triple indirect tree
+/// and collect every non-null **data** chunk pointer in order. The
+/// indirect block pointers themselves are traversed but not
+/// included — callers asking "where's my file's bytes?" want leaves
+/// only.
+fn collect_data_pointers(
+    inode: &Inode,
+    cover: &[u8],
+    map: &TensorMap,
+) -> Result<Vec<Pointer>, FsError> {
+    let mut out = Vec::new();
+
+    for p in &inode.direct {
+        if p.is_null() {
+            break;
+        }
+        out.push(*p);
+    }
+
+    if !inode.single_indirect.is_null() {
+        for p in read_pointer_list(cover, map, inode.single_indirect)? {
+            if p.is_null() {
+                break;
+            }
+            out.push(p);
+        }
+    }
+
+    if !inode.double_indirect.is_null() {
+        for sip in read_pointer_list(cover, map, inode.double_indirect)? {
+            if sip.is_null() {
+                break;
+            }
+            for p in read_pointer_list(cover, map, sip)? {
+                if p.is_null() {
+                    break;
+                }
+                out.push(p);
+            }
+        }
+    }
+
+    if !inode.triple_indirect.is_null() {
+        for dip in read_pointer_list(cover, map, inode.triple_indirect)? {
+            if dip.is_null() {
+                break;
+            }
+            for sip in read_pointer_list(cover, map, dip)? {
+                if sip.is_null() {
+                    break;
+                }
+                for p in read_pointer_list(cover, map, sip)? {
+                    if p.is_null() {
+                        break;
+                    }
+                    out.push(p);
+                }
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+/// Visit every non-null pointer the inode transitively references —
+/// data chunks AND the indirect block chunks themselves. Used by
+/// mount to reserve all live chunks in the allocator.
+fn visit_inode_chunks(
+    inode: &Inode,
+    cover: &[u8],
+    map: &TensorMap,
+    mut visit: impl FnMut(Pointer) -> Result<(), FsError>,
+) -> Result<(), FsError> {
+    for p in &inode.direct {
+        if !p.is_null() {
+            visit(*p)?;
+        }
+    }
+
+    if !inode.single_indirect.is_null() {
+        visit(inode.single_indirect)?;
+        for p in read_pointer_list(cover, map, inode.single_indirect)? {
+            if !p.is_null() {
+                visit(p)?;
+            }
+        }
+    }
+
+    if !inode.double_indirect.is_null() {
+        visit(inode.double_indirect)?;
+        for sip in read_pointer_list(cover, map, inode.double_indirect)? {
+            if sip.is_null() {
+                continue;
+            }
+            visit(sip)?;
+            for p in read_pointer_list(cover, map, sip)? {
+                if !p.is_null() {
+                    visit(p)?;
+                }
+            }
+        }
+    }
+
+    if !inode.triple_indirect.is_null() {
+        visit(inode.triple_indirect)?;
+        for dip in read_pointer_list(cover, map, inode.triple_indirect)? {
+            if dip.is_null() {
+                continue;
+            }
+            visit(dip)?;
+            for sip in read_pointer_list(cover, map, dip)? {
+                if sip.is_null() {
+                    continue;
+                }
+                visit(sip)?;
+                for p in read_pointer_list(cover, map, sip)? {
+                    if !p.is_null() {
+                        visit(p)?;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
 }

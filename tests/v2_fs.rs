@@ -161,15 +161,16 @@ fn rewrite_replaces_file_contents() {
 }
 
 #[test]
-fn write_exceeding_direct_pointer_limit_errors() {
+fn write_beyond_direct_pointer_count_succeeds_with_indirect() {
+    // With indirect pointers (step 7), files larger than 12 chunks
+    // work — they spill into single / double / triple indirect
+    // blocks. Used to error FileTooLarge at > 12 chunks.
     let (cover, map) = make_cover(50_000);
     let mut fs = Filesystem::init_with_chunk_size(cover, map.clone(), 40).expect("init");
     // 13 × 40 = 520 bytes — one chunk past direct's 12-pointer limit.
     let data = vec![0xAA_u8; 13 * 40];
-    match fs.write(&data) {
-        Err(FsError::FileTooLarge { .. }) => {}
-        other => panic!("expected FileTooLarge, got {other:?}"),
-    }
+    fs.write(&data).expect("write beyond direct limit");
+    assert_eq!(fs.read().expect("read"), data);
 }
 
 #[test]
