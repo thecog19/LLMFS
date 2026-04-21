@@ -27,7 +27,7 @@ fn ranks_pristine_smollm2_f16_lowest_thousand() {
 
     let parsed = parse_path(PRISTINE).expect("parse pristine GGUF");
     let plan = build_allocation_plan(&parsed.tensors, AllocationMode::Standard);
-    let map = TensorMap::from_allocation_plan(&plan);
+    let map = TensorMap::from_allocation_plan_with_base(&plan, parsed.tensor_data_offset as u64);
 
     let file = File::open(PRISTINE).expect("open pristine");
     let mmap = unsafe { Mmap::map(&file).expect("mmap") };

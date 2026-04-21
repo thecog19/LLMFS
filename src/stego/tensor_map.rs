@@ -51,7 +51,22 @@ pub struct TensorMap {
 }
 
 impl TensorMap {
+    /// Build a map whose `TensorSlot::data_offset` values are still
+    /// relative to the GGUF tensor-data region. Used by code paths
+    /// (tests, benches, address-translation diagnostics) that don't
+    /// touch the real mmap and only care about logical→physical bit
+    /// arithmetic.
     pub fn from_allocation_plan(plan: &AllocationPlan) -> Self {
+        Self::from_allocation_plan_with_base(plan, 0)
+    }
+
+    /// Build a map whose `TensorSlot::data_offset` values are
+    /// **absolute** mmap offsets (i.e. each tensor's relative
+    /// `data_offset` plus the GGUF's `tensor_data_offset`).
+    /// Calibration and any other code that reads weight bytes from
+    /// the cover file must use this constructor — `data_offset`
+    /// otherwise points to the wrong bytes.
+    pub fn from_allocation_plan_with_base(plan: &AllocationPlan, base_offset: u64) -> Self {
         let mut slots = Vec::with_capacity(plan.tensors.len());
         let mut bit_cursor = 0_u64;
 
@@ -63,7 +78,7 @@ impl TensorMap {
                 name: tensor.name.clone(),
                 quant_type: tensor.quant_type,
                 tier: tensor.tier,
-                data_offset: tensor.data_offset,
+                data_offset: tensor.data_offset.saturating_add(base_offset),
                 weight_count: tensor.weight_count,
                 stealable_bits_per_weight: tensor.stealable_bits_per_weight,
                 capacity_bits: tensor.capacity_bits,
