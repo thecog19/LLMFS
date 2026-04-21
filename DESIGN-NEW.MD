@@ -47,17 +47,18 @@ before any user data is stored. For Q8_0 / K-quant cover files V1 is a
 dual-use on int-quantized covers is explicitly V2's job (sensitivity-
 aware allocation), not a V1 tuning fix.
 
-### V2 — Sensitivity-Ordered Embedding
+### V2 — Inode + CoW Storage
 
-- Implicit metadata addressing (magnitude-ranked; no fixed bootstrap pointer, no sidecar)
-- Reed-Solomon / LDPC redundancy over metadata for drift tolerance
-- Progressive calibration (AWQ fast path on init; Hessian refinement on demand)
-- Per-weight sensitivity-ordered placement (replaces V1's 4-tier planner)
-- Bit-level content-aware matching (skip writes where target already matches payload)
-- GPTQ-style error compensation (spreads residual delta across eligible row/column weights)
-- `zstd` / BPE payload compression (shrinks the damage surface proportionally)
-- Damage-accumulation remap (shadow-and-restore during init; lossless remap deferred)
-- Cross-model comparison reporting (already prototyped via the perplexity sweep in `benches/perplexity-results/`)
+- Ceiling-magnitude anchor at rule-derived positions (invariant under writes; replaces V1's magnitude-ranked bootstrap which drifted for Q8_0)
+- Unix-style inode substrate (per-file inodes with direct + single/double/triple-indirect pointers, replaces V1's block-indexed redirection table)
+- Hierarchical directories (directory-is-a-file, FUSE-native)
+- Variable-length chunks with content-defined chunking (FastCDC)
+- Allocation priority: content-match dedup (BLAKE3-128) → dirty-first → pristine by max-ceiling-magnitude
+- Copy-on-write writes with two-slot generational root; atomic commit via slot alternation (replaces V1's shadow-copy-via-redirection)
+- Multi-reader / single-writer concurrency
+- Progressive calibration (AWQ fast / Hessian full; Fisher deferred to V3)
+- GPTQ-style error compensation (future; layers on top of the inode substrate)
+- Damage-accumulation remap (lossless remap deferred to V3's VRAM shadow)
 
 ### V3 — GPU Acceleration + Lossless Remap
 
@@ -1141,7 +1142,7 @@ If the GGUF file is modified externally (fine-tuning, re-quantization, merging),
   becomes the top profile target; fix is per-quant-block batching
   as originally noted.
 
-## 15. V2 Architecture — Sensitivity-Ordered Embedding
+## 15. V2 Architecture — Inode + CoW Storage
 
 ### 15.1 Motivation
 
@@ -1162,62 +1163,161 @@ tensor as equally eligible for bit theft. Empirical measurement on
 
 V2's goal is to preserve F16's flat curve while lifting the Q8_0
 curve from "dead model" to "within a few PPL of pristine." The
-mechanism is a per-weight eligibility decision driven by
-calibration rather than a tensor-level tiering rule.
+V1 findability drama (see
+`tests/calibration_layer0_findability.rs` for the bug and
+`commit 60cd5f5` for the partial fix) showed that the way V1
+addresses metadata — magnitude-ranking recomputed at reopen —
+conflates two requirements that pull in opposite directions:
 
-### 15.2 Layer 0 — Implicit metadata addressing
+- **Finding old writes** demands an invariant rule: the ranking must
+  not shift when stealable bits change, or readers compute a
+  different location than writers used.
+- **Planning new writes** wants to use current weight state for
+  safety, which is exactly the quantity that shifts under writes.
 
-V1 places metadata at stego-block 0, which lands at the start of
-whichever tensor the 4-tier sort picks first. V2 replaces this with
-a rule that computes metadata location from static weight
-properties, with no pointer, no sidecar, and no calibration
-dependency:
+V2 separates them cleanly. A tiny bootstrap anchor uses an
+invariant rule; every other position is persisted. The persisted
+positions live in a **Unix-style inode substrate** with
+**copy-on-write** writes and **atomic root-pointer commits**.
 
-> Rank every eligible stealable-bit position by the absolute
-> magnitude of its containing weight, ascending. Metadata occupies
-> the N lowest-magnitude positions, where N is the metadata
-> footprint in bits.
+### 15.2 Layer 0 — Anchor placement
 
-**Properties:**
-- **Deterministic** — same cover file → same location, always.
-- **Calibration-free** — no forward pass needed; open-time cost is
-  O(n_weights · log N) partial sort.
-- **Findable on reopen** — recompute the rule, recover the location.
-- **Safer than random placement** — near-zero-magnitude weights
-  have provably bounded contribution to any forward activation.
-  Pure magnitude is a weaker salience estimator than AWQ/Hessian
-  (no activation awareness), but metadata is small (<1% of capacity)
-  so the marginal gain from calibrated metadata placement is dwarfed
-  by the cost of the chicken-and-egg resolution it would create.
+V1 places metadata at stego-block 0, which lands in whatever tensor
+the 4-tier sort picks first. V2 replaces this with a small **anchor
+region** at positions computable from the cover's structure, using
+a rule invariant under any stealable-bit write:
 
-**Determinism guardrail:** magnitude comparisons must use fixed-
-point or integer arithmetic — floating-point reductions aren't
-bit-exact across CPU architectures, and a cross-machine disagreement
-on the sort would move metadata off-location.
+> Rank every eligible stealable-bit position by the **ceiling
+> magnitude** of its containing weight — `|w|` computed assuming
+> the stealable bits are at their worst-case value — ascending. The
+> anchor occupies the N lowest-ceiling positions, sorted by
+> `(slot_index, weight_index)` for canonical order. N is the
+> anchor payload in bits (~1600, so a two-slot generational root
+> fits).
 
-### 15.3 Layer 1 — Self-describing metadata
+**Why ceiling magnitude, not real magnitude.** Real magnitude shifts
+under writes — a mantissa or low-nibble flip changes `|w|`, which
+reorders the ranking. Ceiling magnitude depends only on the
+*non-stealable* bits of each weight, so the ranking is invariant
+under any write V2 makes. The anchor is tiny (~200 bytes) so the
+safety trade — picking by worst-case `|w|` rather than current
+`|w|` — is negligible in absolute terms.
 
-The V1 superblock / integrity / redirection / file-table layout
-remains intact in structure. V2 extends the metadata region to
-also carry:
+Per-quant-type ceiling formulas: §15.10.
 
-- **Sensitivity table** — one salience score per eligible weight
-  (quantized to 8 bits; exact resolution TBD). Produced by Layer 2
-  calibration. Stored in metadata because reopen needs it and
-  re-running calibration on every open is expensive.
-- **Placement index** — compact representation of the sensitivity-
-  ordered ranking of positions. Derivable from the sensitivity
-  table but stored explicitly so reopen skips the sort.
-- **Calibration version marker** — "AWQ v1", "Hessian v1", etc.
-  Enables progressive refinement without breaking readability.
+**Anchor contents — two-slot generational root:**
+```
+slot0: [ generation u64 | super_root_pointer (16 B) | crc32 u32 ]
+slot1: [ generation u64 | super_root_pointer (16 B) | crc32 u32 ]
+magic + version header prefix the two slots.
+```
+Readers read both slots, verify CRC, and pick the slot with the
+higher valid generation. Writers always write the inactive slot;
+the write becomes the active state on the next mount or
+subsequent write. The slot alternation + generation counter is
+V2's atomic-commit primitive (§15.9).
 
-**Reed-Solomon redundancy.** Metadata is framed as `(k, n)` Reed-
-Solomon blocks (nominal parameters `k=20, n=28`; tunable per
-device). Any `k` of `n` positions decode; up to `n-k` positions
-can be corrupted (fine-tuning drift, numerical instability) before
-metadata is unrecoverable. Cost: 40% expansion on metadata region
-size. Acceptable given that metadata is a small fraction of stego
-capacity.
+**Mount.**
+- Both slots fail magic/CRC → `"no V2 filesystem found; run
+  llmdb init <cover>"`. Fresh-cover vs corrupted-cover distinction
+  is collapsed into "not a V2 filesystem" for the first cut; fsck
+  is V3 territory.
+- One slot valid → use it.
+- Both valid → use the higher generation.
+
+**Explicit init.** `llmdb init <cover>` creates the anchor and the
+initial super-root; mounts never auto-init. This keeps "I
+accidentally mounted the wrong file" from silently overwriting
+non-V2 state.
+
+### 15.3 Layer 1 — Inode substrate
+
+V2 replaces V1's block-indexed superblock / integrity /
+redirection / file-table layout with a Unix-style inode substrate.
+
+**Inode.** The fundamental unit. Represents a file, a directory, or
+any V2-internal metadata structure:
+```
+length               u64
+direct[12]           12 × Pointer
+single_indirect      Pointer    // → chunk of pointers
+double_indirect      Pointer    // → chunk of chunks of pointers
+triple_indirect      Pointer    // → chunk of chunks of chunks of pointers
+```
+Direct pointers cover the first 12 chunks of the file; indirect
+blocks extend the reach to any practical file size.
+
+**Pointer.** 16 bytes:
+```
+[ slot u16 | start_weight u32 | length_in_bits u32 | flags u16 | reserved u48 ]
+```
+`(slot, start_weight)` addresses the first stealable-bit position;
+`length_in_bits` gives the chunk's extent. Chunks are contiguous
+runs of stealable bits within a single slot.
+
+**Chunk.** A variable-length run of stealable bits in the cover —
+not a fixed 4 KB block. Chunk boundaries are picked by
+content-defined chunking (§15.6); a "chunk" is whatever run of
+bits a `Pointer` refers to.
+
+**Self-similar structure.** The same inode type holds:
+- User files (content = raw bytes of the file)
+- Directories (content = list of `(name, child_inode_pointer, kind)` entries)
+- The dedup hash index (content = BLAKE3-128-keyed map of chunk positions)
+- The dirty bitmap (content = one bit per potential chunk-start position)
+- The free-run state (content = serialized `BTreeMap` of free runs)
+- The ceiling-magnitude bucket summary (content = max-ceiling per 256-weight bucket)
+
+V2-internal structures are addressed by the super-root; user files
+are addressed through the root directory.
+
+**Super-root.** The inode referenced by the anchor's
+`super_root_pointer`. Contents:
+```
+magic u32
+version u8
+root_dir_inode       Pointer
+dedup_index_inode    Pointer
+dirty_bitmap_inode   Pointer
+free_run_state_inode Pointer
+ceiling_summary_inode Pointer
+generation u64  // mirrors anchor, for sanity-check
+```
+
+**Copy-on-write writes.** Every write allocates fresh chunks:
+1. Write new data into newly-allocated chunk(s).
+2. Write a fresh inode containing pointers to the new chunks.
+3. Walk up the containing-inode tree, rewriting each ancestor with
+   the updated child pointer.
+4. Rewrite the super-root with the updated metadata-inode
+   pointers.
+5. Write the super-root's new pointer into the anchor's inactive
+   slot; bump the generation. The slot flip is the commit point.
+
+Readers snapshot the active root-slot pointer at op-start and
+traverse from there; writers serialize on the commit. §15.9
+covers the crash-safety invariants; the concurrency model is at
+the end of this section.
+
+**Findability.** Every position beyond the anchor is persisted in
+an inode's `Pointer`. No ranking recomputation at reopen, no
+magnitude-based address derivation for anything larger than the
+anchor — all of that drama collapses into "read the super-root,
+read the inodes, follow the pointers." The anchor (rule-derived)
+is the only thing the invariance argument has to carry.
+
+**Reed-Solomon redundancy is removed.** V1's concern was "what if
+fine-tuning drift corrupts metadata?" V2's answer is CoW +
+two-slot root + CRC per chunk: corruption is detectable (CRC
+fails) and recoverable from the previous root generation. The 40%
+expansion cost of RS framing is avoided.
+
+**Concurrency.** V2 is multi-reader / single-writer. Readers
+traverse from a snapshot of the active root-slot taken at
+op-start; they're immune to concurrent writers because the CoW
+tree they see is immutable until the next commit. Writers
+serialize on the root-slot commit via a single `RwLock` at the
+`Filesystem` boundary.
 
 ### 15.4 Layer 2 — Progressive calibration
 
@@ -1261,48 +1361,79 @@ Option 3 is preferred. Decision deferred pending a PoC. This choice
 dominates V2's implementation timeline — everything else in V2 is
 weeks of engineering; calibration is the one multi-week commitment.
 
-### 15.5 Layer 3 — Sensitivity-ordered data placement
+### 15.5 Layer 3 — Allocation
 
-Given a sensitivity table, the placement rule is:
+V1's `src/stego/planner.rs` 4-tier ordering is replaced by a
+**per-allocation** decision. Every time the filesystem needs to
+place a new chunk, the allocator walks this priority:
 
-> Sort eligible weight positions by salience ascending. Flag the
-> top-`S` percent as ineligible (policy parameter; default 1%).
-> Logical block L maps to positions `[L·K, (L+1)·K)` in the
-> remaining sorted list, where K is bits per block.
+1. **Content-match.** Hash the desired chunk content (BLAKE3
+   truncated to 128 bits); look up in the dedup index. On hit,
+   share the existing pointer — zero new cover write.
+2. **Dirty-free chunk.** If no content match, pick a free chunk
+   whose position has been written before (tracked in the dirty
+   bitmap). Writes to already-perturbed weights cause less
+   incremental damage than writes to pristine weights.
+3. **Pristine free chunk.** As a last resort, pick a pristine free
+   chunk from a per-slot priority queue keyed by **max
+   ceiling-magnitude over the run's weights**, smallest first.
+   Lowest-max-ceiling minimizes worst-case inference damage.
 
-This replaces V1's `src/stego/planner.rs` 4-tier ordering. The
-allocator consults the placement index in metadata; blocks are
-addressed by their rank in the sorted list, not by tensor-role.
+**The protected-region-S% concept of §15.5-original is absorbed.**
+A weight with high ceiling magnitude (e.g., a Q8_0 int8 far from
+zero) is automatically deprioritized; it only gets used when no
+safer chunk is available. There's no hard cutoff — allocation
+degrades gracefully as the cover fills.
 
-**Protected region (`top-S%`) policy.** The `S%` most-salient
-weights are untouchable. This is what rescues Q8_0: the salient
-weights whose low-4-bit randomization would destroy the model are
-simply excluded from eligibility. Expected behavior under `S=1%`:
-Q8_0 post-init PPL should drop from the V1 ~34M regime into the
-low 10s, comparable to pristine. Validate with the perplexity
-sweep harness.
+**Per-slot free-run structure.**
+`BTreeMap<(max_ceiling, length, run_id), start_weight>`:
+- Keyed so "smallest max_ceiling with length ≥ L" is a range
+  query — O(log F) per alloc, F = free-run count.
+- Invariant: splitting a free run with `max = M` yields two
+  halves, each with `max ≤ M`. So splits only reduce max.
+- On merge (free adjacent): new max = `max(left.max, right.max)`.
 
-Trade-off: every percent of protected region reduces stego
-capacity by that percent. A 1% protection on SmolLM2-135M means
-~500 KB less stego capacity; negligible against the dual-use win.
+Alloc cost: O(log F + L) where L = run length (scan to compute
+exact max over the new range). Free cost: O(log F + adjacency
+merge).
 
-### 15.6 Layer 4 — Content-aware matching
+**Ceiling-magnitude bucket summary.** Max ceiling per **256-weight
+bucket**, persisted inside V2's filesystem as a regular inode.
+~5 MB for a 135M-weight cover, proportional to cover size. Bucket
+queries are slightly pessimistic (consider one bucket more than
+strictly needed) but precision-adequate for ranking. Computed
+once at `llmdb init`; read into memory at mount.
 
-When a payload bit `b` is targeted at position `p`:
+### 15.6 Layer 4 — Content-defined chunking + dedup
 
-- **Simple path:** read position's current bit. If equal to `b`,
-  no mantissa change occurs; the write is a no-op against the
-  cover's existing value. Implemented inside each packer.
-- **Advanced path (optional):** maintain a *pool* of candidate
-  positions for each logical bit. During placement, tiebreak
-  between same-salience candidates by preferring positions whose
-  current bit already equals the payload. Requires the on-disk
-  format to record *which* pool member held each bit.
+**Content-defined chunking (CDC).** Chunk boundaries are picked by
+a rolling hash over the data (FastCDC), not by fixed offset.
+Parameters: min 1 KB / avg 4 KB / max 16 KB. Benefit: inserting a
+byte at the start of a file doesn't shift all downstream chunks —
+most stay identical, keeping dedup effective for edited data.
 
-The simple path is cheap — a few lines per packer — and captures
-roughly half the damage reduction because random-payload vs
-random-target has 50% expected per-bit match rate. The advanced
-path stacks on top.
+**Content-hash dedup.** On chunk allocation, hash the desired
+content (BLAKE3 → 128-bit digest); look up in the dedup index. On
+hit, reuse the existing chunk's pointer — the new inode's pointer
+references the same chunk. On chunk free, hash the content and
+insert `(hash → position)` into the dedup index.
+
+Replaces §15.6-original's bit-match-pool idea: CDC + content-hash
+gives the same effect at chunk granularity, with a concrete
+persisted index.
+
+**Dedup + cover preservation.** A content-match costs zero cover
+writes — strictly better than dirty-preference. All-zero regions
+common in user data (file padding, sparse-file holes, uninit
+space) collapse to a single stored chunk, reducing cover
+perturbation for structured data significantly.
+
+**Pointer sharing and CoW.** A chunk with multiple inode
+references is shared. A write to one file's shared chunk triggers
+CoW at the chunk level: allocate a fresh chunk with the new
+content, update only the writing file's pointer, leave the other
+file pointing at the original. Standard dedup-filesystem
+semantics.
 
 ### 15.7 Layer 5 — Error compensation (GPTQ-style)
 
@@ -1337,66 +1468,139 @@ Compression composes multiplicatively with the upstream layers:
 fewer bits to store → fewer positions to touch → less work for
 matching, compensation, and placement.
 
-### 15.9 Layer 7 — Atomic remap
+### 15.9 Layer 7 — Atomic commit and remap
 
-**Triggers:**
-- Calibration upgrade (Stage A → Stage B)
-- User-requested recalibration (`llmdb calibrate`)
-- Detected cover drift (future: fine-tune event detector)
+V1 uses shadow-copy-then-swap via a block-level redirection table
+for atomic writes. V2's CoW substrate makes atomicity a property
+of every write, not a separate mechanism:
 
-**Mechanism (damage-accumulation version, shipping with V2):**
+**Every write is atomic.** CoW allocates fresh chunks, builds a
+fresh inode tree up to a fresh super-root, then atomically swaps
+the anchor's active generational slot to point at the new
+super-root. The slot-swap is the single commit point. Readers see
+either the pre-commit tree or the post-commit tree; no partial
+state is observable.
 
-1. Compute new placement from updated sensitivity table.
-2. Read all live data from old positions.
-3. Write live data to new positions.
-4. Write zeros (or pristine-best-guess values) at old positions
-   that are no longer referenced.
-5. Commit via the superblock's `generation` + `shadow_block`
-   intent mechanism already built in V1.
+**Slot alternation + generation counter.** Two anchor slots. Each
+carries `(generation, super_root_pointer, crc32)`. Reader picks
+the slot with higher valid generation. Writer always writes to
+the inactive slot (current gen + 1); the write becomes active on
+completion.
 
-**Damage accumulation.** Step 4 cannot perfectly restore the
-original weight bits because V2 doesn't maintain a shadow of
-pristine values. Each remap leaves perturbed bits at positions
-that were damaged once but are no longer used. Magnitude is
-bounded: on each remap the "newly-damaged" set is
-`new_positions \ old_positions`, typically small because
-sensitivity ranking is stable across calibration stages. Over
-many remaps the accumulated damage is capped by how different
-successive rankings can be.
+**Crash safety properties:**
+- Crash before slot write → both slots unchanged, reader sees
+  pre-commit state.
+- Crash mid-slot-write (partial pointer) → CRC fails on that
+  slot, reader falls back to the other valid slot.
+- Crash after slot write, before fsync of dependent chunk bytes →
+  super-root points at chunks that are partially written. Avoided
+  by write-barrier ordering: every dependent chunk (file bytes,
+  new inode, fresh super-root) is fsynced before the anchor's
+  slot-write; the anchor's slot-write is the last operation in
+  the commit sequence.
 
-**Lossless remap (restore pristine at abandoned positions) is
-deferred** pending a design decision on where to host the shadow
-store. See §16.4 for the V3 resolution.
+**Remap for calibration upgrades.** On Layer 2 calibration
+changes, sensitivity ordering shifts. A remap:
+1. Reads all live data from old chunk positions.
+2. Allocates fresh chunks via the new ranking + priority order
+   (dedup → dirty → pristine-by-new-max-ceiling).
+3. Writes data to new chunks, builds a fresh inode tree.
+4. Commits via the standard atomic slot swap.
+5. Abandoned positions are marked dirty in the bitmap, preferring
+   them for future writes — compensating for accumulated damage
+   at the abandoned sites.
+
+Damage accumulation bound: each remap's "newly-damaged" set is
+`new ∖ old`, typically small because sensitivity ranking is
+stable across calibration stages. Over many remaps the
+accumulated damage is capped by how different successive rankings
+can be.
+
+**Lossless remap (restore pristine values at abandoned positions)
+is deferred** pending a design decision on where to host the
+shadow store. See §16.4 for the V3 resolution.
 
 ### 15.10 Per-quant-type adaptations
 
-Every packer in `src/stego/packing/` gains per-weight eligibility
-plumbing: accept an eligibility bitmap alongside the payload;
-skipped weights stay pristine. This is mechanical but touches all
-seven packers.
+**Ceiling-magnitude formulas** — used by Layer 0 anchor placement
+and Layer 3 pristine allocation. Defined as
+`ceiling(w) = max over stealable-bit values of |w|`; invariant
+under writes by construction.
 
-- **F16 / F32:** eligibility gate is an optimization only —
-  non-damaging writes are fine. Useful for layer-5 compensation
-  (restrict compensation writes to eligible weights).
-- **Q8_0:** the dual-use-critical case. Per-weight eligibility is
-  load-bearing.
-- **K-quants (Q3_K..Q6_K):** per-block scale and super-scale
-  complicate the picture — the block scale itself may be one of
-  the highest-salience values in the block. Eligibility needs to
-  distinguish "this weight's mantissa bits" from "this block's
-  shared scale"; the scale should effectively always be protected.
+- **F16** (4 stealable = low mantissa nibble). Monotonic in
+  mantissa for fixed sign/exp; max when low nibble is all ones:
+  ```
+  ceiling = |decode_f16(sign, exp, high_6_mantissa | 0xF)|
+  ```
+- **F32** (8 stealable = low mantissa byte). Same reasoning:
+  ```
+  ceiling = |decode_f32(sign, exp, high_15_mantissa | 0xFF)|
+  ```
+- **Q8_0** (4 stealable = low int8 nibble). Two's complement
+  requires the two-argument max:
+  ```
+  H = sign_extend(int8 & 0xF0)       // high nibble as signed byte
+  ceiling = max(|H|, |H + 15|) * |scale|
+  ```
+  - `int8 = 0x08` (H=0): max(0, 15) = 15.
+  - `int8 = 0xFF` (H=-16): max(16, 1) = 16.
+  - `int8 = 0x80` (H=-128): max(128, 113) = 128.
+  - `int8 = 0x7F` (H=112): max(112, 127) = 127.
+- **Q3_K** (1 stealable = LSB of 2-bit qs; hmask bit is **not**
+  stealable):
+  ```
+  q_base = ((q_lo_msb << 1) | (hmask << 2)) - 4
+  ceiling = |d * scale| * max(|q_base|, |q_base + 1|)
+  ```
+- **Q4_K** (1 stealable = LSB of qs nibble):
+  ```
+  q_base = q_high_3 << 1
+  ceiling = max(|d*sc*q_base - dmin*m|, |d*sc*(q_base+1) - dmin*m|)
+  ```
+- **Q5_K** (1 stealable = LSB of qs nibble; qh bit is
+  non-stealable):
+  ```
+  q_base = (qh << 4) | (q_high_3 << 1)
+  ceiling = max(|d*sc*q_base - dmin*m|, |d*sc*(q_base+1) - dmin*m|)
+  ```
+- **Q6_K** (2 stealable = 2 LSBs of ql):
+  ```
+  q_base = (qh << 4) | (q_high_2 << 2)
+  ceiling = max over k ∈ {0,1,2,3} of |d * scale * (q_base + k)|
+  ```
+
+Implemented as `read_weight_ceiling_abs(mmap, slot, weight_index)`
+in `src/stego/calibration/magnitude.rs`, dispatching on the
+slot's quant type. Per-weight cost is O(1) (closed form for
+F16/F32/Q8_0; 2-4-value enumeration for K-quants).
+
+**Per-weight allocation plumbing.** Each packer's write path must
+respect the allocated-runs bitmap so two chunks never overlap. The
+bitmap is consulted at allocation; during a write, the packer
+touches only the bits inside its allocated run.
 
 ### 15.11 Migration from V1
 
-- **Format bump.** V2's metadata layout is not V1-compatible
-  (addressing, sensitivity table, RS framing). Superblock carries
-  a `version` byte; V2 uses `version = 2`.
-- **No auto-upgrade.** A V1 device cannot be opened as V2 without
-  `llmdb recalibrate --rebuild`, which re-inits the cover and
-  re-imports files.
-- **V2-shipping CLI:** `llmdb calibrate <model> [--full]`,
-  `llmdb recalibrate <model>`, `llmdb status` extended with a
-  "calibration: AWQ v1 / Hessian v1 / ..." line.
+**No auto-migration.** A V1 cover mounted as V2 will have no valid
+anchor (V1 metadata sits at the start of the first-FFN tensor
+whose positions aren't ceiling-magnitude-ranked). V2 refuses to
+mount such a cover with `"no V2 filesystem found"`. To preserve
+V1 data, copy it out via V1 tooling before running `llmdb init`
+on the cover.
+
+**Format identifier.** V2's super-root carries `version = 2`. The
+anchor's magic bytes distinguish V2 from any other (past or
+future) format attempting to live at the same rule-derived
+positions.
+
+**V2 CLI additions.**
+- `llmdb init <cover>` — creates the anchor and initial super-root.
+- `llmdb mount <cover> <mount_point>` — mounts via FUSE;
+  multi-reader / single-writer.
+- `llmdb status <cover>` — reports filesystem state (free space,
+  file count, dedup hit rate, calibration stage).
+- `llmdb calibrate <cover> [--full]` — runs Layer 2 calibration
+  (future; see §15.4).
 
 ### 15.12 Out of scope for V2
 
@@ -1438,12 +1642,13 @@ usable as a routine operation rather than a once-a-week chore.
 
 ### 16.3 Scatter map in VRAM
 
-V2 keeps the placement index on disk, read into RAM on open. V3
-moves this into VRAM, exploiting the typically-underutilized
-KV-cache slots allocated at model load. Stego block I/O becomes a
+V2 keeps the inode tree + free-run state + ceiling-magnitude
+bucket summary on disk, read into RAM on mount. V3 moves this
+working set into VRAM, exploiting the typically-underutilized
+KV-cache slots allocated at model load. Stego chunk I/O becomes a
 GPU kernel: a single gather/scatter operation dispatches thousands
 of stego-bit reads or writes in parallel. Expected 100× throughput
-improvement on block-intensive operations (ext4-style metadata
+improvement on chunk-intensive operations (ext4-style metadata
 bursts; large-file mount reads).
 
 ### 16.4 VRAM shadow store → lossless remap
