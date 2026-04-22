@@ -19,6 +19,7 @@ pub mod anchor;
 pub mod cdc;
 pub mod ceiling;
 pub mod chunk;
+pub mod cover;
 pub mod dedup;
 pub mod directory;
 pub mod dirty;

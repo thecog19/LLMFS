@@ -186,7 +186,7 @@ fn dedup_survives_remount() {
         .iter()
         .map(|p| (p.slot, p.start_weight))
         .collect();
-    let cover1 = fs.unmount();
+    let cover1 = fs.unmount().expect("unmount");
 
     let mut fs2 =
         Filesystem::mount_with_cdc_params(cover1, map, small_cdc()).expect("mount");

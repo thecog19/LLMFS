@@ -23,6 +23,7 @@ use llmdb::stego::tensor_map::{TensorMap, TensorSlot};
 use llmdb::v2::anchor;
 use llmdb::v2::cdc::FastCdcParams;
 use llmdb::v2::chunk::{read_chunk, write_chunk};
+use llmdb::v2::cover::CoverStorage;
 use llmdb::v2::fs::{Filesystem, FsError};
 use llmdb::v2::inode::{INODE_BYTES, Inode};
 use llmdb::v2::super_root::{SUPER_ROOT_BYTES, SuperRoot};
@@ -101,7 +102,7 @@ fn init_then_unmount_remount_sees_empty_root() {
     let (cover, map) = make_cover(20_000);
     let fs = Filesystem::init_with_cdc_params(cover, map.clone(), small_cdc()).expect("init");
     assert!(fs.readdir("/").expect("readdir").is_empty());
-    let cover_after = fs.unmount();
+    let cover_after = fs.unmount().expect("unmount");
 
     let fs2 = Filesystem::mount_with_cdc_params(cover_after, map, small_cdc()).expect("mount");
     assert!(fs2.readdir("/").expect("readdir on mount").is_empty());
@@ -116,7 +117,7 @@ fn single_chunk_file_round_trips_across_remount() {
     fs.create_file("/data", data).expect("create_file");
     assert_eq!(fs.read_file("/data").expect("read after write"), data);
 
-    let cover_after = fs.unmount();
+    let cover_after = fs.unmount().expect("unmount");
     let fs2 = Filesystem::mount_with_cdc_params(cover_after, map, small_cdc()).expect("mount");
     let readback = fs2.read_file("/data").expect("read after mount");
     assert_eq!(readback, data);
@@ -131,7 +132,7 @@ fn multi_chunk_file_round_trips() {
     fs.create_file("/data", &data).expect("create_file");
     assert_eq!(fs.read_file("/data").expect("read"), data);
 
-    let cover_after = fs.unmount();
+    let cover_after = fs.unmount().expect("unmount");
     let fs2 = Filesystem::mount_with_cdc_params(cover_after, map, small_cdc()).expect("mount");
     assert_eq!(fs2.read_file("/data").expect("read remount"), data);
 }
@@ -161,7 +162,7 @@ fn rewrite_replaces_file_contents() {
         b"second version is longer"
     );
 
-    let cover_after = fs.unmount();
+    let cover_after = fs.unmount().expect("unmount");
     let fs2 = Filesystem::mount_with_cdc_params(cover_after, map, small_cdc()).expect("mount");
     assert_eq!(
         fs2.read_file("/data").expect("read"),
@@ -208,7 +209,7 @@ fn init_rejects_invalid_cdc_params() {
 fn mount_rejects_invalid_cdc_params() {
     let (cover, map) = make_cover(20_000);
     let fs = Filesystem::init_with_cdc_params(cover, map.clone(), small_cdc()).expect("init");
-    let cover_after = fs.unmount();
+    let cover_after = fs.unmount().expect("unmount");
 
     let bad = FastCdcParams {
         min_size: 128,
@@ -230,22 +231,22 @@ fn mount_fails_cleanly_on_inode_pointer_with_invalid_slot() {
     let (cover, map) = make_cover(20_000);
     let mut fs = Filesystem::init_with_cdc_params(cover, map.clone(), small_cdc()).expect("init");
     fs.create_file("/data", b"hello").expect("write");
-    let mut cover_after = fs.unmount();
+    let mut cover_after = fs.unmount().expect("unmount");
 
-    let anchor_outcome = anchor::read_anchor(&cover_after, &map).expect("read anchor");
+    let anchor_outcome = anchor::read_anchor(cover_after.bytes(), &map).expect("read anchor");
     let super_root_ptr = anchor_outcome.active.super_root;
 
     let mut super_root_bytes = [0u8; SUPER_ROOT_BYTES];
-    read_chunk(&cover_after, &map, super_root_ptr, 0, &mut super_root_bytes)
+    read_chunk(cover_after.bytes(), &map, super_root_ptr, 0, &mut super_root_bytes)
         .expect("read super-root");
     let super_root = SuperRoot::decode(&super_root_bytes).expect("decode super-root");
 
     let root_inode_ptr = super_root.root_dir_inode;
     let mut inode_bytes = [0u8; INODE_BYTES];
-    read_chunk(&cover_after, &map, root_inode_ptr, 0, &mut inode_bytes).expect("read inode");
+    read_chunk(cover_after.bytes(), &map, root_inode_ptr, 0, &mut inode_bytes).expect("read inode");
     let mut inode = Inode::decode(&inode_bytes).expect("decode inode");
     inode.direct[0].slot = u16::MAX;
-    write_chunk(&mut cover_after, &map, root_inode_ptr, 0, &inode.encode()).expect("write inode");
+    write_chunk(cover_after.bytes_mut(), &map, root_inode_ptr, 0, &inode.encode()).expect("write inode");
 
     match Filesystem::mount_with_cdc_params(cover_after, map, small_cdc()) {
         Err(FsError::PointerSlotOutOfRange {
@@ -268,7 +269,7 @@ fn write_then_read_binary_data_round_trips() {
     fs.create_file("/data", &data).expect("write");
     assert_eq!(fs.read_file("/data").expect("read"), data);
 
-    let cover_after = fs.unmount();
+    let cover_after = fs.unmount().expect("unmount");
     let fs2 = Filesystem::mount_with_cdc_params(cover_after, map, small_cdc()).expect("mount");
     assert_eq!(fs2.read_file("/data").expect("read"), data);
 }
@@ -278,14 +279,14 @@ fn multiple_writes_across_multiple_sessions() {
     let (cover, map) = make_cover(30_000);
     let mut fs = Filesystem::init_with_cdc_params(cover, map.clone(), small_cdc()).expect("init");
     fs.create_file("/data", b"session-1 data").expect("write 1");
-    let cover1 = fs.unmount();
+    let cover1 = fs.unmount().expect("unmount");
 
     let mut fs2 = Filesystem::mount_with_cdc_params(cover1, map.clone(), small_cdc())
         .expect("mount 1");
     assert_eq!(fs2.read_file("/data").expect("read"), b"session-1 data");
     fs2.create_file("/data", b"session-2 replaces")
         .expect("write 2");
-    let cover2 = fs2.unmount();
+    let cover2 = fs2.unmount().expect("unmount");
 
     let fs3 = Filesystem::mount_with_cdc_params(cover2, map, small_cdc()).expect("mount 2");
     assert_eq!(

@@ -65,7 +65,7 @@ fn smollm2_135m_f16_round_trips_through_v2_filesystem() {
     // Round-trip across unmount + remount. This is the thing that
     // would have broken if ceiling-magnitude anchor placement didn't
     // survive on a real cover's magnitude distribution.
-    let cover_after = fs.unmount();
+    let cover_after = fs.unmount().expect("unmount");
     let mount_t = std::time::Instant::now();
     let fs2 = Filesystem::mount(cover_after, map).expect("V2 mount on written cover");
     eprintln!("mount: {:?}", mount_t.elapsed());

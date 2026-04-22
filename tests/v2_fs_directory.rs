@@ -18,6 +18,7 @@ use llmdb::gguf::quant::GgufQuantType;
 use llmdb::stego::planner::TensorTier;
 use llmdb::stego::tensor_map::{TensorMap, TensorSlot};
 use llmdb::v2::cdc::FastCdcParams;
+use llmdb::v2::cover::CoverStorage;
 use llmdb::v2::directory::EntryKind;
 use llmdb::v2::fs::{Filesystem, FsError};
 
@@ -152,7 +153,10 @@ fn failed_mkdir_is_a_noop() {
     assert_eq!(fs.allocator_free_weights(), free_before);
     assert_eq!(fs.generation(), generation_before);
     assert!(fs.readdir("/").unwrap().is_empty());
-    assert_eq!(fs.unmount(), baseline.unmount());
+    assert_eq!(
+        fs.unmount().expect("unmount").bytes(),
+        baseline.unmount().expect("unmount baseline").bytes()
+    );
 }
 
 #[test]
@@ -236,7 +240,10 @@ fn failed_create_file_is_a_noop() {
     assert_eq!(fs.allocator_free_weights(), free_before);
     assert_eq!(fs.generation(), generation_before);
     assert!(fs.readdir("/foo").unwrap().is_empty());
-    assert_eq!(fs.unmount(), baseline.unmount());
+    assert_eq!(
+        fs.unmount().expect("unmount").bytes(),
+        baseline.unmount().expect("unmount baseline").bytes()
+    );
 }
 
 #[test]
@@ -398,7 +405,7 @@ fn directory_tree_survives_remount() {
     fs.create_file("/a/b/file.txt", b"persistent").unwrap();
     fs.create_file("/top.txt", b"top-level").unwrap();
 
-    let cover_after = fs.unmount();
+    let cover_after = fs.unmount().expect("unmount");
     let fs2 = Filesystem::mount_with_cdc_params(cover_after, map, small_cdc())
         .expect("mount");
 

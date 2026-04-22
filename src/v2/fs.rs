@@ -53,6 +53,7 @@ use crate::v2::anchor::{self, AnchorError};
 use crate::v2::cdc::{FastCdcError, FastCdcParams, chunk_ranges};
 use crate::v2::ceiling::CeilingSummary;
 use crate::v2::chunk::{ChunkError, byte_capacity, read_chunk, write_chunk};
+use crate::v2::cover::CoverStorage;
 use crate::v2::dedup::{DedupIndex, hash_chunk};
 use crate::v2::directory::{DirEntry, Directory, DirectoryError, EntryKind, MAX_NAME_LEN};
 use crate::v2::dirty::{DirtyBitmap, DirtyBitmapError};
@@ -60,11 +61,13 @@ use crate::v2::inode::{INODE_BYTES, Inode, InodeError, NUM_DIRECT};
 use crate::v2::pointer::{Pointer, PointerError};
 use crate::v2::super_root::{SUPER_ROOT_BYTES, SuperRoot, SuperRootError};
 
-/// Top-level V2 filesystem. Owns the cover bytes for the lifetime of
-/// the mount; [`Self::unmount`] returns them for persistence.
+/// Top-level V2 filesystem. Owns the cover storage for the lifetime
+/// of the mount; [`Self::unmount`] flushes any pending writes (for
+/// file-backed `MmapMut` covers) and returns the storage for the
+/// caller to drop or re-mount.
 #[derive(Debug)]
 pub struct Filesystem {
-    cover: Vec<u8>,
+    cover: Box<dyn CoverStorage>,
     map: TensorMap,
     alloc: Allocator,
     anchor_placement: MetadataPlacement,
@@ -177,21 +180,24 @@ impl Filesystem {
 
     /// Initialise a fresh V2 filesystem on a cover that has no prior
     /// V2 state. Uses the default CDC params (1 KB / 4 KB / 16 KB).
-    pub fn init(cover: Vec<u8>, map: TensorMap) -> Result<Self, FsError> {
+    /// `cover` may be a `Vec<u8>` (in-memory; great for tests) or a
+    /// [`memmap2::MmapMut`] (file-backed; bounded RAM).
+    pub fn init<C: CoverStorage + 'static>(cover: C, map: TensorMap) -> Result<Self, FsError> {
         Self::init_with_cdc_params(cover, map, FastCdcParams::default())
     }
 
     /// As [`Self::init`] but with configurable CDC parameters.
-    pub fn init_with_cdc_params(
-        mut cover: Vec<u8>,
+    pub fn init_with_cdc_params<C: CoverStorage + 'static>(
+        cover: C,
         map: TensorMap,
         cdc_params: FastCdcParams,
     ) -> Result<Self, FsError> {
+        let mut cover: Box<dyn CoverStorage> = Box::new(cover);
         cdc_params.validate()?;
-        let ceiling = CeilingSummary::build(&cover, &map);
+        let ceiling = CeilingSummary::build(cover.bytes(), &map);
         let mut allocator = Allocator::new_for_map(&map, ceiling)?;
 
-        let anchor_placement = anchor::find_anchor_placement(&cover, &map);
+        let anchor_placement = anchor::find_anchor_placement(cover.bytes(), &map);
         allocator.reserve_weights(unique_weights(&anchor_placement))?;
 
         let mut dirty_bitmap = DirtyBitmap::new(&map);
@@ -200,7 +206,7 @@ impl Filesystem {
         // Fresh root directory → empty serialized entry list.
         let root_directory = Directory::new();
         let root_inode_ptr = write_directory_content(
-            &mut cover,
+            cover.bytes_mut(),
             &map,
             &mut allocator,
             &mut dirty_bitmap,
@@ -208,7 +214,7 @@ impl Filesystem {
             &cdc_params,
             &root_directory,
         )?;
-        let root_inode = read_inode(&cover, &map, root_inode_ptr)?;
+        let root_inode = read_inode(cover.bytes(), &map, root_inode_ptr)?;
 
         // Persist the dirty bitmap. At init it's all zeros —
         // every CDC chunk of the 17 MB blob hashes identically,
@@ -218,7 +224,7 @@ impl Filesystem {
         // cover size.
         let bitmap_bytes = dirty_bitmap.serialize();
         let bitmap_inode_ptr = persist_as_byte_stream(
-            &mut cover,
+            cover.bytes_mut(),
             &map,
             &mut allocator,
             &mut dirty_bitmap,
@@ -234,10 +240,10 @@ impl Filesystem {
             ..SuperRoot::EMPTY
         };
         let super_root_ptr =
-            alloc_and_write(&mut cover, &map, &mut allocator, &super_root.encode())?;
+            alloc_and_write(cover.bytes_mut(), &map, &mut allocator, &super_root.encode())?;
         mark_pointer_dirty(&mut dirty_bitmap, &map, super_root_ptr);
 
-        anchor::init_anchor(&mut cover, &map, super_root_ptr)?;
+        anchor::init_anchor(cover.bytes_mut(), &map, super_root_ptr)?;
 
         Ok(Self {
             cover,
@@ -257,30 +263,31 @@ impl Filesystem {
     }
 
     /// Mount an existing V2 filesystem from the cover.
-    pub fn mount(cover: Vec<u8>, map: TensorMap) -> Result<Self, FsError> {
+    pub fn mount<C: CoverStorage + 'static>(cover: C, map: TensorMap) -> Result<Self, FsError> {
         Self::mount_with_cdc_params(cover, map, FastCdcParams::default())
     }
 
     /// As [`Self::mount`] but with configurable CDC parameters. Must
     /// match the params used at init-time for subsequent writes to
     /// produce compatible chunking.
-    pub fn mount_with_cdc_params(
-        cover: Vec<u8>,
+    pub fn mount_with_cdc_params<C: CoverStorage + 'static>(
+        cover: C,
         map: TensorMap,
         cdc_params: FastCdcParams,
     ) -> Result<Self, FsError> {
+        let cover: Box<dyn CoverStorage> = Box::new(cover);
         cdc_params.validate()?;
-        let anchor_placement = anchor::find_anchor_placement(&cover, &map);
+        let anchor_placement = anchor::find_anchor_placement(cover.bytes(), &map);
         let anchor_outcome =
-            anchor::read_anchor_with_placement(&cover, &map, &anchor_placement)?;
+            anchor::read_anchor_with_placement(cover.bytes(), &map, &anchor_placement)?;
 
-        let ceiling = CeilingSummary::build(&cover, &map);
+        let ceiling = CeilingSummary::build(cover.bytes(), &map);
         let mut allocator = Allocator::new_for_map(&map, ceiling)?;
         allocator.reserve_weights(unique_weights(&anchor_placement))?;
 
         let super_root_ptr = anchor_outcome.active.super_root;
         let mut super_root_bytes = [0u8; SUPER_ROOT_BYTES];
-        read_chunk(&cover, &map, super_root_ptr, 0, &mut super_root_bytes)?;
+        read_chunk(cover.bytes(), &map, super_root_ptr, 0, &mut super_root_bytes)?;
         let super_root = SuperRoot::decode(&super_root_bytes)?;
 
         if super_root.generation != anchor_outcome.active.generation {
@@ -302,7 +309,7 @@ impl Filesystem {
             std::collections::HashSet::new();
         let mut tree_chunks: std::collections::HashSet<(u16, u32, u32)> =
             std::collections::HashSet::new();
-        walk_tree_pointers(&cover, &map, root_inode_ptr, &mut |ptr| {
+        walk_tree_pointers(cover.bytes(), &map, root_inode_ptr, &mut |ptr| {
             tree_chunks.insert((ptr.slot, ptr.start_weight, ptr.length_in_bits));
             if reserved.insert((ptr.slot, ptr.start_weight)) {
                 reserve_pointer(&mut allocator, &map, ptr)?;
@@ -310,18 +317,18 @@ impl Filesystem {
             Ok(())
         })?;
 
-        let root_inode = read_inode(&cover, &map, root_inode_ptr)?;
-        let root_directory = read_directory(&cover, &map, root_inode_ptr)?;
+        let root_inode = read_inode(cover.bytes(), &map, root_inode_ptr)?;
+        let root_directory = read_directory(cover.bytes(), &map, root_inode_ptr)?;
 
         // Load the persisted dirty bitmap and reserve its chunks.
         let mut dirty_bitmap = if super_root.dirty_bitmap_inode.is_null() {
             DirtyBitmap::new(&map)
         } else {
-            let bytes = load_byte_stream(&cover, &map, super_root.dirty_bitmap_inode)?;
+            let bytes = load_byte_stream(cover.bytes(), &map, super_root.dirty_bitmap_inode)?;
             DirtyBitmap::deserialize(&bytes, &map)?
         };
         if !super_root.dirty_bitmap_inode.is_null() {
-            let bitmap_chunks = inode_tree_chunks(&cover, &map, super_root.dirty_bitmap_inode)?;
+            let bitmap_chunks = inode_tree_chunks(cover.bytes(), &map, super_root.dirty_bitmap_inode)?;
             for (slot, start, len_bits) in bitmap_chunks {
                 if reserved.insert((slot, start)) {
                     let p = Pointer {
@@ -354,7 +361,7 @@ impl Filesystem {
         // the tree plus the bitmap's inode tree — writes consult
         // the same index for files, directories, and the bitmap.
         let dedup_index = build_dedup_index(
-            &cover,
+            cover.bytes(),
             &map,
             root_inode_ptr,
             super_root.dirty_bitmap_inode,
@@ -377,10 +384,14 @@ impl Filesystem {
         })
     }
 
-    /// Consume the filesystem and return the cover bytes for
-    /// persistence.
-    pub fn unmount(self) -> Vec<u8> {
-        self.cover
+    /// Consume the filesystem; flush any pending writes (msync for
+    /// file-backed storage) and return the cover for the caller to
+    /// drop or remount. Tests typically discard the returned value;
+    /// the CLI's mmap-backed cover relies on the flush before drop
+    /// to make changes durable.
+    pub fn unmount(mut self) -> std::io::Result<Box<dyn CoverStorage>> {
+        self.cover.flush()?;
+        Ok(self.cover)
     }
 
     // --------------------------------------------------------------
@@ -404,7 +415,7 @@ impl Filesystem {
         // and leaf availability before allocating the child directory.
         let empty = Directory::new();
         let child_inode = write_directory_content(
-            &mut self.cover,
+            self.cover.bytes_mut(),
             &self.map,
             &mut self.alloc,
             &mut self.dirty_bitmap,
@@ -443,7 +454,7 @@ impl Filesystem {
         if kind != EntryKind::Directory {
             return Err(FsError::NotADirectory(path.to_owned()));
         }
-        let target_dir = read_directory(&self.cover, &self.map, target_inode)?;
+        let target_dir = read_directory(self.cover.bytes(), &self.map, target_inode)?;
         if !target_dir.is_empty() {
             return Err(FsError::DirectoryNotEmpty(path.to_owned()));
         }
@@ -538,7 +549,7 @@ impl Filesystem {
         if kind == EntryKind::Directory {
             return Err(FsError::IsADirectory(path.to_owned()));
         }
-        load_byte_stream(&self.cover, &self.map, target_inode)
+        load_byte_stream(self.cover.bytes(), &self.map, target_inode)
     }
 
     /// List the entries in the directory at `path`. Entries are
@@ -553,7 +564,7 @@ impl Filesystem {
         if kind != EntryKind::Directory {
             return Err(FsError::NotADirectory(path.to_owned()));
         }
-        let dir = read_directory(&self.cover, &self.map, target_inode)?;
+        let dir = read_directory(self.cover.bytes(), &self.map, target_inode)?;
         Ok(dir.entries().to_vec())
     }
 
@@ -578,7 +589,7 @@ impl Filesystem {
             return Ok(self.root_inode);
         }
         let (target_inode, _) = self.lookup_leaf(&components)?;
-        read_inode(&self.cover, &self.map, target_inode)
+        read_inode(self.cover.bytes(), &self.map, target_inode)
     }
 
     // --------------------------------------------------------------
@@ -639,7 +650,7 @@ impl Filesystem {
             if entry.kind != EntryKind::Directory {
                 return Err(FsError::NotADirectory((*pn).to_owned()));
             }
-            cur = Some(read_directory(&self.cover, &self.map, entry.inode)?);
+            cur = Some(read_directory(self.cover.bytes(), &self.map, entry.inode)?);
         }
         let dir = cur.as_ref().unwrap_or(&self.root_directory);
         let entry = dir
@@ -665,7 +676,7 @@ impl Filesystem {
             if entry.kind != EntryKind::Directory {
                 return Err(FsError::NotADirectory((*pn).to_owned()));
             }
-            cur = Some(read_directory(&self.cover, &self.map, entry.inode)?);
+            cur = Some(read_directory(self.cover.bytes(), &self.map, entry.inode)?);
         }
         let parent = cur.unwrap_or_else(|| self.root_directory.clone());
         Ok((parent, *leaf))
@@ -696,7 +707,7 @@ impl Filesystem {
             if entry.kind != EntryKind::Directory {
                 return Err(FsError::NotADirectory((*pn).to_owned()));
             }
-            let child = read_directory(&self.cover, &self.map, entry.inode)?;
+            let child = read_directory(self.cover.bytes(), &self.map, entry.inode)?;
             dirs.push(child);
         }
 
@@ -706,7 +717,7 @@ impl Filesystem {
 
         // Write it and walk up, rewriting each ancestor.
         let mut new_child_ptr = write_directory_content(
-            &mut self.cover,
+            self.cover.bytes_mut(),
             &self.map,
             &mut self.alloc,
             &mut self.dirty_bitmap,
@@ -719,7 +730,7 @@ impl Filesystem {
             let mut parent = dirs.pop().unwrap();
             parent.replace(name, EntryKind::Directory, new_child_ptr);
             new_child_ptr = write_directory_content(
-                &mut self.cover,
+                self.cover.bytes_mut(),
                 &self.map,
                 &mut self.alloc,
                 &mut self.dirty_bitmap,
@@ -740,7 +751,7 @@ impl Filesystem {
         // Persist the in-memory dirty bitmap.
         let bitmap_bytes = self.dirty_bitmap.serialize();
         let new_bitmap_inode_ptr = persist_as_byte_stream(
-            &mut self.cover,
+            self.cover.bytes_mut(),
             &self.map,
             &mut self.alloc,
             &mut self.dirty_bitmap,
@@ -757,7 +768,7 @@ impl Filesystem {
             ..SuperRoot::EMPTY
         };
         let new_super_root_ptr = alloc_and_write(
-            &mut self.cover,
+            self.cover.bytes_mut(),
             &self.map,
             &mut self.alloc,
             &new_super_root.encode(),
@@ -765,7 +776,7 @@ impl Filesystem {
         mark_pointer_dirty(&mut self.dirty_bitmap, &self.map, new_super_root_ptr);
 
         let committed_gen = anchor::commit_anchor_with_placement(
-            &mut self.cover,
+            self.cover.bytes_mut(),
             &self.map,
             &self.anchor_placement,
             new_super_root_ptr,
@@ -778,7 +789,7 @@ impl Filesystem {
         reclaim_abandoned_chunks(
             &mut self.alloc,
             &self.map,
-            &self.cover,
+            self.cover.bytes(),
             TreeScope {
                 root_dir_inode_ptr: self.root_inode_ptr,
                 bitmap_inode_ptr: self.super_root.dirty_bitmap_inode,
@@ -796,14 +807,14 @@ impl Filesystem {
         self.super_root = new_super_root;
         self.super_root_ptr = new_super_root_ptr;
         self.root_inode_ptr = new_root_dir_inode;
-        self.root_inode = read_inode(&self.cover, &self.map, new_root_dir_inode)?;
-        self.root_directory = read_directory(&self.cover, &self.map, new_root_dir_inode)?;
+        self.root_inode = read_inode(self.cover.bytes(), &self.map, new_root_dir_inode)?;
+        self.root_directory = read_directory(self.cover.bytes(), &self.map, new_root_dir_inode)?;
 
         // Rebuild the dedup index across the new tree + new bitmap
         // tree. Next commit's writes (file, directory, or bitmap)
         // all consult this shared index.
         self.dedup_index = build_dedup_index(
-            &self.cover,
+            self.cover.bytes(),
             &self.map,
             new_root_dir_inode,
             new_bitmap_inode_ptr,
@@ -818,7 +829,7 @@ impl Filesystem {
     /// across any of them collapse to one physical allocation.
     fn write_file_content(&mut self, data: &[u8]) -> Result<Pointer, FsError> {
         persist_as_byte_stream(
-            &mut self.cover,
+            self.cover.bytes_mut(),
             &self.map,
             &mut self.alloc,
             &mut self.dirty_bitmap,

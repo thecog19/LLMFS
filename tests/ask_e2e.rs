@@ -27,6 +27,7 @@ use llmdb::ask::server::LlamaServer;
 use llmdb::gguf::parser::parse_path as parse_gguf;
 use llmdb::stego::planner::{AllocationMode, build_allocation_plan};
 use llmdb::stego::tensor_map::TensorMap;
+use llmdb::v2::cover::CoverStorage;
 use llmdb::v2::fs::Filesystem as V2Filesystem;
 
 fn gated() -> bool {
@@ -77,8 +78,8 @@ fn prepare_v2_fs(src: &Path) -> (tempfile::TempDir, PathBuf) {
         b"Ingredients:\n- 200g flour\n- 1 banana\n- 2 eggs\n",
     )
     .expect("create recipe.txt");
-    let cover_after = fs.unmount();
-    std::fs::write(&copy, &cover_after).expect("write cover back");
+    let cover_after = fs.unmount().expect("unmount");
+    std::fs::write(&copy, cover_after.bytes()).expect("write cover back");
 
     (dir, copy)
 }

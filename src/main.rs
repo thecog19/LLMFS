@@ -1,5 +1,6 @@
 use std::error::Error;
 use std::fmt;
+use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
@@ -9,6 +10,7 @@ use std::thread;
 use std::time::Duration;
 
 use clap::{ArgAction, CommandFactory, Parser, Subcommand};
+use memmap2::MmapMut;
 
 use llmdb::ask::AskError;
 use llmdb::ask::bridge::{AskSession, HttpChatClient};
@@ -172,24 +174,44 @@ fn build_tensor_map(model: &Path) -> Result<TensorMap, CliError> {
     ))
 }
 
-fn read_cover(model: &Path) -> Result<Vec<u8>, CliError> {
-    std::fs::read(model)
-        .map_err(|e| CliError::internal(format!("reading {}: {e}", model.display())))
-}
-
-fn write_cover(model: &Path, bytes: &[u8]) -> Result<(), CliError> {
-    std::fs::write(model, bytes)
-        .map_err(|e| CliError::internal(format!("writing {}: {e}", model.display())))
+/// Open the cover RW and memory-map it. Mutations to the resulting
+/// `MmapMut` go through the page cache; durability requires
+/// `flush()` (msync) before drop, which `Filesystem::unmount` handles.
+///
+/// The file handle is dropped after `map_mut` returns; the mapping
+/// keeps the underlying file open at the kernel level.
+///
+/// SAFETY of `MmapMut::map_mut`: the caller asserts no other process
+/// is writing to the same file concurrently. We rely on this — V2
+/// has no cross-process locking. Concurrent in-process access is
+/// gated by `Arc<RwLock<Filesystem>>` upstream.
+fn open_cover_mmap(model: &Path) -> Result<MmapMut, CliError> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(model)
+        .map_err(|e| CliError::user(format!("opening {}: {e}", model.display())))?;
+    unsafe { MmapMut::map_mut(&file) }
+        .map_err(|e| CliError::internal(format!("mmap {}: {e}", model.display())))
 }
 
 fn mount_v2(model: &Path) -> Result<V2Filesystem, CliError> {
     let map = build_tensor_map(model)?;
-    let cover = read_cover(model)?;
+    let cover = open_cover_mmap(model)?;
     V2Filesystem::mount(cover, map).map_err(|e| {
         CliError::user(format!(
             "V2 mount (no anchor? run `llmdb init` first): {e}"
         ))
     })
+}
+
+/// Consume `fs` and flush its mmap-backed cover to disk. Wraps the
+/// io::Error from msync into a `CliError::internal`.
+fn flush_and_close(model: &Path, fs: V2Filesystem) -> Result<(), CliError> {
+    let _cover = fs
+        .unmount()
+        .map_err(|e| CliError::internal(format!("flushing {}: {e}", model.display())))?;
+    Ok(())
 }
 
 fn fs_err(e: V2FsError) -> CliError {
@@ -214,14 +236,13 @@ fn cmd_init(model: &Path) -> Result<(), CliError> {
     let map = build_tensor_map(model)?;
     let total_slots = map.slots.len();
     let total_weights: u64 = map.slots.iter().map(|s| s.weight_count).sum();
-    let cover = read_cover(model)?;
+    let cover = open_cover_mmap(model)?;
     let cover_len = cover.len();
 
     let fs = V2Filesystem::init(cover, map)
         .map_err(|e| CliError::user(format!("V2 init failed: {e}")))?;
     let generation = fs.generation();
-    let cover_after = fs.unmount();
-    write_cover(model, &cover_after)?;
+    flush_and_close(model, fs)?;
 
     println!("initialized {}", model.display());
     println!("  cover size:       {cover_len} bytes");
@@ -233,7 +254,7 @@ fn cmd_init(model: &Path) -> Result<(), CliError> {
 
 fn cmd_status(model: &Path) -> Result<(), CliError> {
     let map = build_tensor_map(model)?;
-    let cover = read_cover(model)?;
+    let cover = open_cover_mmap(model)?;
     let fs = V2Filesystem::mount(cover, map.clone()).map_err(|e| {
         CliError::user(format!(
             "V2 mount (no anchor? run `llmdb init` first): {e}"
@@ -300,9 +321,8 @@ fn cmd_mount(model: &Path, mount_point: &Path, allow_other: bool) -> Result<(), 
     let fs = lock
         .into_inner()
         .map_err(|_| CliError::internal("V2 filesystem RwLock poisoned (a FUSE op panicked)".to_owned()))?;
-    let cover_after = fs.unmount();
-    write_cover(model, &cover_after)?;
-    println!("wrote {} bytes back to {}", cover_after.len(), model.display());
+    flush_and_close(model, fs)?;
+    println!("flushed cover to {}", model.display());
     println!("done");
     Ok(())
 }
@@ -368,8 +388,7 @@ fn cmd_store(model: &Path, host_path: &Path, stego_path: &str) -> Result<(), Cli
     let mut fs = mount_v2(model)?;
     ensure_parent_dirs(&mut fs, stego_path)?;
     fs.create_file(stego_path, &bytes).map_err(fs_err)?;
-    let cover_after = fs.unmount();
-    write_cover(model, &cover_after)?;
+    flush_and_close(model, fs)?;
 
     println!("stored {} ({} bytes)", stego_path, bytes.len());
     Ok(())
@@ -403,8 +422,7 @@ fn cmd_rm(model: &Path, stego_path: &str, yes: bool) -> Result<(), CliError> {
         Err(V2FsError::IsADirectory(_)) => fs.rmdir(stego_path).map_err(fs_err)?,
         Err(e) => return Err(fs_err(e)),
     }
-    let cover_after = fs.unmount();
-    write_cover(model, &cover_after)?;
+    flush_and_close(model, fs)?;
     println!("deleted {stego_path}");
     Ok(())
 }
@@ -457,8 +475,7 @@ fn cmd_ask(model: &Path) -> Result<(), CliError> {
     drop(session);
     drop(server);
 
-    let cover_after = fs.unmount();
-    write_cover(model, &cover_after)?;
+    flush_and_close(model, fs)?;
     Ok(())
 }
 

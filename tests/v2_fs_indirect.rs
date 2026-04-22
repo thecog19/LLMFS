@@ -118,7 +118,7 @@ fn small_file_round_trips() {
     assert!(inode.double_indirect.is_null());
     assert!(inode.triple_indirect.is_null());
 
-    let cover_after = fs.unmount();
+    let cover_after = fs.unmount().expect("unmount");
     let fs2 = Filesystem::mount_with_cdc_params(cover_after, map, small_cdc()).expect("mount");
     assert_eq!(fs2.read_file("/data").expect("read after remount"), data);
 }
@@ -141,7 +141,7 @@ fn medium_file_round_trips_using_indirect() {
         "2 KB must spill into at least one indirect tier; inode = {inode:?}",
     );
 
-    let cover_after = fs.unmount();
+    let cover_after = fs.unmount().expect("unmount");
     let fs2 = Filesystem::mount_with_cdc_params(cover_after, map, small_cdc()).expect("mount");
     assert_eq!(fs2.read_file("/data").expect("read after remount"), data);
 }
@@ -164,7 +164,7 @@ fn large_file_round_trips_deep_indirect() {
                 "8 KB at min=32 should need triple indirect; inode = {inode:?}",
             );
             assert_eq!(fs.read_file("/data").expect("read"), data);
-            let cover_after = fs.unmount();
+            let cover_after = fs.unmount().expect("unmount");
             let fs2 =
                 Filesystem::mount_with_cdc_params(cover_after, map, small_cdc()).expect("mount");
             assert_eq!(fs2.read_file("/data").expect("read after remount"), data);
@@ -233,7 +233,7 @@ fn rewrite_shrinks_large_to_small() {
         "200 B should fit in direct after shrink; inode = {inode:?}",
     );
 
-    let cover_after = fs.unmount();
+    let cover_after = fs.unmount().expect("unmount");
     let fs2 = Filesystem::mount_with_cdc_params(cover_after, map, small_cdc()).expect("mount");
     assert_eq!(fs2.read_file("/data").expect("read after remount"), small);
 }
@@ -260,7 +260,7 @@ fn rewrite_grows_small_to_large() {
         "2500 B after grow must spill into indirect; inode = {inode:?}",
     );
 
-    let cover_after = fs.unmount();
+    let cover_after = fs.unmount().expect("unmount");
     let fs2 = Filesystem::mount_with_cdc_params(cover_after, map, small_cdc()).expect("mount");
     assert_eq!(fs2.read_file("/data").expect("read after remount"), large);
 }

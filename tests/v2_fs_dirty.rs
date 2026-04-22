@@ -248,7 +248,7 @@ fn dirty_bits_survive_unmount_and_remount() {
         .flat_map(|p| pointer_weights(p, bpw))
         .collect();
 
-    let cover_after = fs.unmount();
+    let cover_after = fs.unmount().expect("unmount");
     let fs2 =
         Filesystem::mount_with_cdc_params(cover_after, map, small_cdc()).expect("mount");
 
