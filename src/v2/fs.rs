@@ -50,7 +50,7 @@ use crate::stego::calibration::placement::MetadataPlacement;
 use crate::stego::tensor_map::TensorMap;
 use crate::v2::alloc::{AllocError, Allocator};
 use crate::v2::anchor::{self, AnchorError};
-use crate::v2::cdc::{FastCdcError, FastCdcParams, chunk_ranges};
+use crate::v2::cdc::{FastCdcError, FastCdcParams, FastCdcStream, chunk_ranges};
 use crate::v2::ceiling::CeilingSummary;
 use crate::v2::chunk::{ChunkError, byte_capacity, read_chunk, write_chunk};
 use crate::v2::cover::CoverStorage;
@@ -216,21 +216,21 @@ impl Filesystem {
         )?;
         let root_inode = read_inode(cover.bytes(), &map, root_inode_ptr)?;
 
-        // Persist the dirty bitmap. At init it's all zeros —
-        // every CDC chunk of the 17 MB blob hashes identically,
-        // and the shared `dedup_index` collapses them to a single
+        // Persist the dirty bitmap via the streaming path. At init
+        // it's all zeros; every CDC chunk hashes identically and
+        // the shared `dedup_index` collapses them to a single
         // physical allocation (plus a handful of indirect blocks),
         // keeping init-time perturbation bounded regardless of
-        // cover size.
-        let bitmap_bytes = dirty_bitmap.serialize();
-        let bitmap_inode_ptr = persist_as_byte_stream(
+        // cover size. Streaming avoids materialising the dense
+        // `total_bytes()` Vec — for a 280 GB cover that's a 17.5 GB
+        // allocation we can't afford.
+        let bitmap_inode_ptr = persist_bitmap_streaming(
             cover.bytes_mut(),
             &map,
             &mut allocator,
             &mut dirty_bitmap,
             &mut dedup_index,
             &cdc_params,
-            &bitmap_bytes,
         )?;
 
         let super_root = SuperRoot {
@@ -320,13 +320,18 @@ impl Filesystem {
         let root_inode = read_inode(cover.bytes(), &map, root_inode_ptr)?;
         let root_directory = read_directory(cover.bytes(), &map, root_inode_ptr)?;
 
-        // Load the persisted dirty bitmap and reserve its chunks.
-        let mut dirty_bitmap = if super_root.dirty_bitmap_inode.is_null() {
-            DirtyBitmap::new(&map)
-        } else {
-            let bytes = load_byte_stream(cover.bytes(), &map, super_root.dirty_bitmap_inode)?;
-            DirtyBitmap::deserialize(&bytes, &map)?
-        };
+        // Load the persisted dirty bitmap into a sparse-page
+        // structure via the streaming helper — for a 280 GB cover
+        // we can't materialise the 17.5 GB dense byte form.
+        let mut dirty_bitmap = DirtyBitmap::new(&map);
+        if !super_root.dirty_bitmap_inode.is_null() {
+            load_bitmap_streaming(
+                cover.bytes(),
+                &map,
+                super_root.dirty_bitmap_inode,
+                &mut dirty_bitmap,
+            )?;
+        }
         if !super_root.dirty_bitmap_inode.is_null() {
             let bitmap_chunks = inode_tree_chunks(cover.bytes(), &map, super_root.dirty_bitmap_inode)?;
             for (slot, start, len_bits) in bitmap_chunks {
@@ -748,16 +753,16 @@ impl Filesystem {
     /// anchor slots, then reclaim the chunks the old tree used
     /// but the new tree doesn't.
     fn commit_with_new_root(&mut self, new_root_dir_inode: Pointer) -> Result<(), FsError> {
-        // Persist the in-memory dirty bitmap.
-        let bitmap_bytes = self.dirty_bitmap.serialize();
-        let new_bitmap_inode_ptr = persist_as_byte_stream(
+        // Persist the in-memory dirty bitmap via the streaming path
+        // (no transient dense-byte allocation; see
+        // `persist_bitmap_streaming`).
+        let new_bitmap_inode_ptr = persist_bitmap_streaming(
             self.cover.bytes_mut(),
             &self.map,
             &mut self.alloc,
             &mut self.dirty_bitmap,
             &mut self.dedup_index,
             &self.cdc_params,
-            &bitmap_bytes,
         )?;
 
         let new_generation = self.generation + 1;
@@ -1046,6 +1051,206 @@ fn dedup_or_write(
     mark_pointer_dirty(dirty, map, p);
     dedup.insert(hash, p);
     Ok(p)
+}
+
+/// Outcome reported by [`dedup_or_write_no_mark`] so callers know
+/// whether they need to mark the returned pointer dirty afterwards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteOutcome {
+    /// Chunk's hash matched the dedup index — no allocation, no
+    /// write. Returned pointer was already in the index.
+    Deduplicated,
+    /// Chunk was newly written to the cover at the returned pointer.
+    /// Caller must mark the pointer's weight range dirty.
+    Wrote,
+}
+
+/// Like [`dedup_or_write`] but takes `dirty` as an immutable
+/// reference (used for `alloc_preferring_dirty` decisions only) and
+/// **does not** mark the resulting pointer. Returned `WriteOutcome`
+/// tells the caller whether they need to mark.
+///
+/// Used exclusively by the bitmap streaming path: persisting the
+/// bitmap reads bytes from the bitmap itself, so we can't hold a
+/// `&mut DirtyBitmap` across the read+write cycle. Caller marks
+/// every `Wrote` pointer after the streaming pass completes.
+fn dedup_or_write_no_mark(
+    cover: &mut [u8],
+    map: &TensorMap,
+    allocator: &mut Allocator,
+    dirty: &DirtyBitmap,
+    dedup: &mut DedupIndex,
+    chunk: &[u8],
+) -> Result<(Pointer, WriteOutcome), FsError> {
+    let hash = hash_chunk(chunk);
+    if let Some(p) = dedup.lookup(&hash) {
+        return Ok((p, WriteOutcome::Deduplicated));
+    }
+    let bit_count = (chunk.len() * 8) as u32;
+    let p = allocator
+        .alloc_preferring_dirty(map, bit_count, dirty)
+        .ok_or(FsError::OutOfSpace {
+            requested_bits: bit_count,
+        })?;
+    write_chunk(cover, map, p, 0, chunk)?;
+    dedup.insert(hash, p);
+    Ok((p, WriteOutcome::Wrote))
+}
+
+/// Persist `bitmap` as a V2 byte stream, returning the inode
+/// pointer for [`super_root.dirty_bitmap_inode`]. The streaming
+/// path never allocates the dense `bitmap.total_bytes()` buffer —
+/// for a 280 GB cover that's a 17.5 GB Vec we'd otherwise need.
+///
+/// Walks the bitmap one page at a time (snapshotting via
+/// [`DirtyBitmap::page_at`] into a 4 KB stack-resident buffer),
+/// feeds bytes into [`FastCdcStream`], and routes each emitted
+/// chunk through [`dedup_or_write_no_mark`]. The dedup index
+/// collapses the long runs of zeros (typical bitmap content) to
+/// a single backing chunk; only non-zero regions allocate fresh
+/// storage.
+///
+/// Marking happens in two phases:
+///   1. During streaming, we can only hold an immutable borrow on
+///      `dirty` (we're reading from it); chunk pointers from
+///      `Wrote` outcomes get queued.
+///   2. After streaming, we mutably borrow `dirty` and mark every
+///      queued pointer plus the inode chunks themselves. The
+///      persisted bitmap therefore lags the in-memory bitmap by
+///      one commit's worth of marks — the same one-commit lag the
+///      previous Vec-based path had.
+fn persist_bitmap_streaming(
+    cover: &mut [u8],
+    map: &TensorMap,
+    allocator: &mut Allocator,
+    dirty: &mut DirtyBitmap,
+    dedup: &mut DedupIndex,
+    cdc_params: &FastCdcParams,
+) -> Result<Pointer, FsError> {
+    cdc_params.validate()?;
+    let max_chunks = max_chunks_for(cdc_params);
+
+    let mut chunker = FastCdcStream::new(*cdc_params);
+    let mut all_ptrs: Vec<Pointer> = Vec::new();
+    let mut written_ptrs: Vec<Pointer> = Vec::new();
+    let mut total_emitted: u64 = 0;
+
+    let total_bytes = dirty.total_bytes();
+    let mut byte_offset: u64 = 0;
+    let mut page_buf = [0u8; crate::v2::dirty::PAGE_BYTES];
+    while byte_offset < total_bytes {
+        let page_idx = (byte_offset / crate::v2::dirty::PAGE_BYTES as u64) as u32;
+        let in_page = (byte_offset % crate::v2::dirty::PAGE_BYTES as u64) as usize;
+        let bytes_left = total_bytes - byte_offset;
+        let bytes_this_step =
+            ((crate::v2::dirty::PAGE_BYTES - in_page) as u64).min(bytes_left) as usize;
+
+        // Snapshot one page (or zeros if missing). The borrow on
+        // `dirty` is scoped to this match — released before the
+        // inner feed loop calls `dedup_or_write_no_mark`.
+        match dirty.page_at(page_idx) {
+            Some(p) => {
+                page_buf[..bytes_this_step]
+                    .copy_from_slice(&p[in_page..in_page + bytes_this_step]);
+            }
+            None => page_buf[..bytes_this_step].fill(0),
+        }
+
+        for &byte in &page_buf[..bytes_this_step] {
+            if let Some(chunk) = chunker.feed(byte) {
+                if all_ptrs.len() >= max_chunks {
+                    return Err(FsError::FileTooLarge {
+                        bytes: total_bytes as usize,
+                        chunk_count: all_ptrs.len() + 1,
+                        max_chunks,
+                    });
+                }
+                total_emitted += chunk.len() as u64;
+                let (p, outcome) =
+                    dedup_or_write_no_mark(cover, map, allocator, dirty, dedup, &chunk)?;
+                all_ptrs.push(p);
+                if matches!(outcome, WriteOutcome::Wrote) {
+                    written_ptrs.push(p);
+                }
+            }
+        }
+
+        byte_offset += bytes_this_step as u64;
+    }
+    if let Some(chunk) = chunker.flush() {
+        if all_ptrs.len() >= max_chunks {
+            return Err(FsError::FileTooLarge {
+                bytes: total_bytes as usize,
+                chunk_count: all_ptrs.len() + 1,
+                max_chunks,
+            });
+        }
+        total_emitted += chunk.len() as u64;
+        let (p, outcome) = dedup_or_write_no_mark(cover, map, allocator, dirty, dedup, &chunk)?;
+        all_ptrs.push(p);
+        if matches!(outcome, WriteOutcome::Wrote) {
+            written_ptrs.push(p);
+        }
+    }
+
+    debug_assert_eq!(total_emitted, total_bytes);
+
+    // Phase 2: mark every newly-written chunk.
+    for p in &written_ptrs {
+        mark_pointer_dirty(dirty, map, *p);
+    }
+
+    // Phase 3: build the inode (also writes indirect blocks via the
+    // standard `dedup_or_write`, which marks dirty inline).
+    let inode = build_inode(
+        cover,
+        map,
+        allocator,
+        dirty,
+        dedup,
+        cdc_params,
+        total_emitted,
+        &all_ptrs,
+    )?;
+    let inode_ptr = alloc_and_write(cover, map, allocator, &inode.encode())?;
+    mark_pointer_dirty(dirty, map, inode_ptr);
+    Ok(inode_ptr)
+}
+
+/// Stream-load a persisted dirty bitmap from the V2 inode at
+/// `inode_ptr` into `bitmap`. Walks the inode's data chunks and
+/// feeds bytes into [`DirtyBitmap::write_bytes_at`] one chunk at
+/// a time — sparse pages allocate only for non-zero content.
+fn load_bitmap_streaming(
+    cover: &[u8],
+    map: &TensorMap,
+    inode_ptr: Pointer,
+    bitmap: &mut DirtyBitmap,
+) -> Result<(), FsError> {
+    let inode = read_inode(cover, map, inode_ptr)?;
+    let length = inode.length;
+    let data_ptrs = collect_data_pointers(&inode, cover, map)?;
+    let mut offset: u64 = 0;
+    let mut buf = vec![0u8; 16 * 1024];
+    for ptr in data_ptrs {
+        if offset >= length {
+            break;
+        }
+        let chunk_capacity = byte_capacity(ptr) as usize;
+        let take = chunk_capacity.min((length - offset) as usize);
+        if buf.len() < take {
+            buf.resize(take, 0);
+        }
+        read_chunk(cover, map, ptr, 0, &mut buf[..take])?;
+        bitmap.write_bytes_at(offset, &buf[..take]);
+        offset += take as u64;
+    }
+    if offset != length {
+        return Err(FsError::OutOfSpace {
+            requested_bits: ((length - offset) * 8) as u32,
+        });
+    }
+    Ok(())
 }
 
 /// Thread `data_chunk_ptrs` through direct + indirect blocks and

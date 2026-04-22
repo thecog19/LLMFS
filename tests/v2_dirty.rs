@@ -1,14 +1,20 @@
-//! V2 DirtyBitmap unit tests.
+//! V2 sparse-page DirtyBitmap integration tests.
 //!
 //! Tracks which weights have ever been written to (one bit per
 //! eligible weight, packed). Allocator priority 2 (per DESIGN-NEW
 //! §15.5) consults this to prefer already-perturbed positions over
 //! pristine ones — writing over dirty bits adds less cover damage.
+//!
+//! The bitmap stores its bits in a sparse `BTreeMap` of 4 KB pages;
+//! pages allocate lazily on first `mark` (or first non-zero byte
+//! written via `write_bytes_at`). These tests cover the
+//! sparse-allocation invariants alongside the original behavioural
+//! contract from the dense V1.
 
 use llmdb::gguf::quant::GgufQuantType;
 use llmdb::stego::planner::TensorTier;
 use llmdb::stego::tensor_map::{TensorMap, TensorSlot};
-use llmdb::v2::dirty::DirtyBitmap;
+use llmdb::v2::dirty::{DirtyBitmap, PAGE_BYTES};
 
 fn f16_slot(weight_count: u64, name: &str) -> TensorSlot {
     TensorSlot {
@@ -45,6 +51,14 @@ fn new_bitmap_is_all_clean() {
             assert!(!bm.is_dirty(slot, w), "fresh bitmap must be all-clean");
         }
     }
+}
+
+#[test]
+fn new_bitmap_allocates_no_pages() {
+    let map = two_slot_map();
+    let bm = DirtyBitmap::new(&map);
+    assert_eq!(bm.allocated_page_count(), 0);
+    assert_eq!(bm.set_count(), 0);
 }
 
 #[test]
@@ -115,10 +129,11 @@ fn mark_is_idempotent() {
     bm.mark(0, 42);
     bm.mark(0, 42);
     assert!(bm.is_dirty(0, 42));
+    assert_eq!(bm.set_count(), 1);
 }
 
 #[test]
-fn serialize_deserialize_round_trips() {
+fn write_to_then_write_bytes_at_round_trips() {
     let map = two_slot_map();
     let mut bm = DirtyBitmap::new(&map);
     bm.mark(0, 3);
@@ -126,24 +141,106 @@ fn serialize_deserialize_round_trips() {
     bm.mark(1, 0);
     bm.mark(1, 49);
 
-    let bytes = bm.serialize();
-    let restored = DirtyBitmap::deserialize(&bytes, &map).expect("deserialize");
-    assert_eq!(bm, restored);
+    let mut buf = Vec::new();
+    bm.write_to(&mut buf).expect("write_to");
+    assert_eq!(buf.len(), bm.total_bytes() as usize);
 
-    // Bits preserved.
-    assert!(restored.is_dirty(0, 3));
-    assert!(restored.is_dirty(0, 99));
-    assert!(restored.is_dirty(1, 0));
-    assert!(restored.is_dirty(1, 49));
-    assert!(!restored.is_dirty(0, 4));
+    let mut restored = DirtyBitmap::new(&map);
+    restored.write_bytes_at(0, &buf);
+
+    for w in 0_u32..100 {
+        assert_eq!(bm.is_dirty(0, w), restored.is_dirty(0, w), "slot 0 bit {w}");
+    }
+    for w in 0_u32..50 {
+        assert_eq!(bm.is_dirty(1, w), restored.is_dirty(1, w), "slot 1 bit {w}");
+    }
+    assert_eq!(bm.set_count(), restored.set_count());
 }
 
 #[test]
-fn deserialize_rejects_wrong_byte_count() {
+fn write_to_emits_total_bytes_even_when_sparse() {
     let map = two_slot_map();
-    // Expected bytes = ceil((100 + 50) / 8) = 19 bytes.
-    let short = vec![0u8; 10];
-    let long = vec![0u8; 30];
-    assert!(DirtyBitmap::deserialize(&short, &map).is_err());
-    assert!(DirtyBitmap::deserialize(&long, &map).is_err());
+    let bm = DirtyBitmap::new(&map);
+    let mut buf = Vec::new();
+    bm.write_to(&mut buf).expect("write_to");
+    assert_eq!(buf.len() as u64, bm.total_bytes());
+    assert!(buf.iter().all(|&b| b == 0), "no marks → all zeros");
+}
+
+#[test]
+fn marks_within_one_page_share_a_page() {
+    // PAGE_BYTES * 8 weights fit in a single page.
+    let weights_per_page = (PAGE_BYTES * 8) as u64;
+    let big = TensorMap {
+        slots: vec![f16_slot(weights_per_page * 4, "big")],
+        total_capacity_bits: weights_per_page * 4,
+        total_capacity_bytes: weights_per_page * 4 / 8,
+    };
+    let mut bm = DirtyBitmap::new(&big);
+    for i in 0..100 {
+        bm.mark(0, i);
+    }
+    assert_eq!(
+        bm.allocated_page_count(),
+        1,
+        "100 marks within one page should share a page"
+    );
+    assert_eq!(bm.set_count(), 100);
+}
+
+#[test]
+fn distant_marks_use_separate_pages() {
+    let weights_per_page = (PAGE_BYTES * 8) as u64;
+    let big = TensorMap {
+        slots: vec![f16_slot(weights_per_page * 4, "big")],
+        total_capacity_bits: weights_per_page * 4,
+        total_capacity_bytes: weights_per_page * 4 / 8,
+    };
+    let mut bm = DirtyBitmap::new(&big);
+    bm.mark(0, 0);
+    bm.mark(0, weights_per_page as u32 + 1); // page 1
+    bm.mark(0, weights_per_page as u32 * 3 + 1); // page 3
+    assert_eq!(bm.allocated_page_count(), 3);
+    assert_eq!(bm.set_count(), 3);
+}
+
+#[test]
+fn write_bytes_at_zero_bytes_does_not_allocate() {
+    let weights_per_page = (PAGE_BYTES * 8) as u64;
+    let big = TensorMap {
+        slots: vec![f16_slot(weights_per_page * 4, "big")],
+        total_capacity_bits: weights_per_page * 4,
+        total_capacity_bytes: weights_per_page * 4 / 8,
+    };
+    let mut bm = DirtyBitmap::new(&big);
+    let zeros = vec![0u8; bm.total_bytes() as usize];
+    bm.write_bytes_at(0, &zeros);
+    assert_eq!(
+        bm.allocated_page_count(),
+        0,
+        "writing all-zero bytes must allocate nothing"
+    );
+    assert_eq!(bm.set_count(), 0);
+}
+
+#[test]
+fn write_bytes_at_partial_page_only_allocates_when_nonzero() {
+    let weights_per_page = (PAGE_BYTES * 8) as u64;
+    let big = TensorMap {
+        slots: vec![f16_slot(weights_per_page * 4, "big")],
+        total_capacity_bits: weights_per_page * 4,
+        total_capacity_bytes: weights_per_page * 4 / 8,
+    };
+    let mut bm = DirtyBitmap::new(&big);
+
+    // Page 0 stays zero. Page 1 gets a single non-zero byte. Page 2
+    // and 3 stay zero.
+    let mut bytes = vec![0u8; bm.total_bytes() as usize];
+    bytes[PAGE_BYTES] = 0x80; // first byte of page 1
+    bm.write_bytes_at(0, &bytes);
+    assert_eq!(bm.allocated_page_count(), 1, "only page 1 should allocate");
+    // Bit position: byte PAGE_BYTES, shift 7 (LSB-first) means bit
+    // (PAGE_BYTES * 8) + 7.
+    assert!(bm.is_dirty(0, (PAGE_BYTES * 8) as u32 + 7));
+    assert!(!bm.is_dirty(0, 0));
 }

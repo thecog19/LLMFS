@@ -155,6 +155,105 @@ fn next_boundary(data: &[u8], params: &FastCdcParams) -> usize {
     cap
 }
 
+// ------------------------------------------------------------------
+// Streaming chunker — same boundaries as `chunk_ranges`, byte-at-a-time
+// ------------------------------------------------------------------
+
+/// State machine version of [`chunk_ranges`]. Feed bytes one at a time
+/// via [`Self::feed`]; receive chunks (as owned `Vec<u8>`) at content-
+/// defined boundaries. Call [`Self::flush`] at end-of-stream to emit
+/// the final partial chunk.
+///
+/// Used for the dirty-bitmap persist path, where the input is too
+/// large to materialise as a single `&[u8]` (a 280 GB cover gives
+/// a 17 GB bitmap). Allocates at most one in-flight chunk buffer
+/// (≤ `max_size` bytes).
+///
+/// Boundary equivalence with [`chunk_ranges`] is enforced by the
+/// `streaming_matches_slice` property test below.
+#[derive(Debug)]
+pub struct FastCdcStream {
+    params: FastCdcParams,
+    pending: Vec<u8>,
+    hash: u64,
+    mask_s: u64,
+    mask_l: u64,
+}
+
+impl FastCdcStream {
+    /// Create a stream with the given parameters. Caller is
+    /// responsible for having validated the params via
+    /// [`FastCdcParams::validate`] — invalid params will silently
+    /// produce wrong boundaries (or panic).
+    pub fn new(params: FastCdcParams) -> Self {
+        let bits = params.avg_size.trailing_zeros();
+        Self {
+            params,
+            pending: Vec::with_capacity(params.max_size),
+            hash: 0,
+            mask_s: (1u64 << (bits + 1)) - 1,
+            mask_l: (1u64 << (bits - 1)) - 1,
+        }
+    }
+
+    /// Feed one byte. Returns `Some(chunk)` if a boundary closes
+    /// here; the byte is either *included* in the returned chunk
+    /// (forced max-size cut) or *deferred* into the next chunk
+    /// (content-defined cut).
+    pub fn feed(&mut self, byte: u8) -> Option<Vec<u8>> {
+        // `pos` is the index this byte would occupy in the current
+        // chunk. Matches `i` in `next_boundary`.
+        let pos = self.pending.len();
+
+        // Boundary check window: positions [min_size, max_size).
+        // Mirrors the loop bounds in `next_boundary`.
+        if pos >= self.params.min_size && pos < self.params.max_size {
+            self.hash = self
+                .hash
+                .wrapping_shl(1)
+                .wrapping_add(GEAR[byte as usize]);
+            let mask = if pos < self.params.avg_size {
+                self.mask_s
+            } else {
+                self.mask_l
+            };
+            if self.hash & mask == 0 {
+                // Content-defined cut: byte starts the next chunk.
+                let chunk = self.take_pending();
+                self.pending.push(byte);
+                return Some(chunk);
+            }
+        }
+
+        self.pending.push(byte);
+
+        // Forced cut at max_size: byte is included in this chunk.
+        // (`next_boundary` returns `cap = max_size` when the loop
+        // exits without a content cut, so the chunk is `data[..cap]`
+        // — i.e. exactly `max_size` bytes including position
+        // `max_size - 1`.)
+        if self.pending.len() == self.params.max_size {
+            return Some(self.take_pending());
+        }
+        None
+    }
+
+    /// Emit the trailing partial chunk if any. After this returns
+    /// `None`, the stream is fully drained.
+    pub fn flush(&mut self) -> Option<Vec<u8>> {
+        if self.pending.is_empty() {
+            None
+        } else {
+            Some(self.take_pending())
+        }
+    }
+
+    fn take_pending(&mut self) -> Vec<u8> {
+        self.hash = 0;
+        std::mem::replace(&mut self.pending, Vec::with_capacity(self.params.max_size))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,5 +270,70 @@ mod tests {
     #[test]
     fn default_params_validate() {
         FastCdcParams::default().validate().unwrap();
+    }
+
+    /// Stream the whole input through `FastCdcStream`, concatenate the
+    /// emitted chunks, and assert the boundaries match what
+    /// `chunk_ranges` would have produced. The streaming path is
+    /// behavioural equivalent — same GEAR rolling hash, same masks,
+    /// same min/max-size handling — just byte-at-a-time.
+    fn stream_chunks(data: &[u8], params: &FastCdcParams) -> Vec<Vec<u8>> {
+        let mut s = FastCdcStream::new(*params);
+        let mut out = Vec::new();
+        for &b in data {
+            if let Some(c) = s.feed(b) {
+                out.push(c);
+            }
+        }
+        if let Some(c) = s.flush() {
+            out.push(c);
+        }
+        out
+    }
+
+    fn slice_chunks(data: &[u8], params: &FastCdcParams) -> Vec<Vec<u8>> {
+        chunk_ranges(data, params)
+            .into_iter()
+            .map(|r| data[r].to_vec())
+            .collect()
+    }
+
+    #[test]
+    fn streaming_matches_slice_on_zeros() {
+        let data = vec![0u8; 64 * 1024];
+        let params = FastCdcParams::default();
+        assert_eq!(stream_chunks(&data, &params), slice_chunks(&data, &params));
+    }
+
+    #[test]
+    fn streaming_matches_slice_on_ascending() {
+        let data: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
+        let params = FastCdcParams::default();
+        assert_eq!(stream_chunks(&data, &params), slice_chunks(&data, &params));
+    }
+
+    #[test]
+    fn streaming_matches_slice_short_inputs() {
+        let params = FastCdcParams::default();
+        for len in [0_usize, 1, 100, 1023, 1024, 1025, 4095, 4096, 4097, 16383, 16384, 16385] {
+            let data: Vec<u8> = (0..len).map(|i| (i * 13 + 7) as u8).collect();
+            assert_eq!(
+                stream_chunks(&data, &params),
+                slice_chunks(&data, &params),
+                "mismatch at len={len}"
+            );
+        }
+    }
+
+    #[test]
+    fn streaming_matches_slice_small_params() {
+        let params = FastCdcParams {
+            min_size: 32,
+            avg_size: 64,
+            max_size: 128,
+        };
+        params.validate().unwrap();
+        let data: Vec<u8> = (0..2048).map(|i| ((i * 31) ^ (i >> 3)) as u8).collect();
+        assert_eq!(stream_chunks(&data, &params), slice_chunks(&data, &params));
     }
 }
