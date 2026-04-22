@@ -2,16 +2,20 @@
 //! sensitivity-ordered allocator (DESIGN-NEW §15). Three estimator
 //! tiers are envisioned:
 //!
-//! - **Tier 0 — magnitude-only.** Calibration-corpus-free: salience
-//!   = `|w|`. Used by Layer 0 (implicit metadata addressing) and as
-//!   the fallback when a richer estimator isn't available. This
-//!   module currently implements only Tier 0.
+//! - **Tier 0 — magnitude-only** (this module). Calibration-corpus-
+//!   free: salience = `|w|`, derivable from the cover alone. Used by
+//!   Layer 0 (anchor placement) and by Layer 3's pristine-run
+//!   ordering when no richer estimator is present.
 //! - **Tier 1 — AWQ.** Single forward pass; per-channel salience
-//!   `mean(|x|) * |w|`. Activation-aware. Requires the wgpu/dzn
-//!   forward-pass infrastructure described in `docs/gpu-dev-env.md`.
+//!   `mean(|x|) * |w|`. Activation-aware. Lives in
+//!   [`crate::forward`] — a hand-rolled CPU transformer forward
+//!   pass. The earlier design revision expected a wgpu/dzn GPU path;
+//!   see `DESIGN-NEW.MD §15.4` for the hand-rolled-Rust decision,
+//!   and the V2-progressive-calibration plan for the build-out.
 //! - **Tier 2 — Hessian (GPTQ).** Accumulated `X^T X` over a
 //!   calibration corpus, per-column diagonal as salience. Most
-//!   accurate; needed for Layer 5 (error compensation).
+//!   accurate; needed for Layer 5 (error compensation). Builds on
+//!   Tier 1's forward-pass infrastructure.
 
 pub mod bit_io;
 pub mod byte_io;
