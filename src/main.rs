@@ -291,15 +291,15 @@ fn cmd_mount(model: &Path, mount_point: &Path, allow_other: bool) -> Result<(), 
 
     // Recover the filesystem, write the cover bytes back. `try_unwrap`
     // succeeds because the BackgroundSession's Arc was dropped above.
-    let mutex = std::sync::Arc::try_unwrap(shared).map_err(|_| {
+    let lock = std::sync::Arc::try_unwrap(shared).map_err(|_| {
         CliError::internal(
             "could not recover V2 filesystem after unmount — a background handle is still alive"
                 .to_owned(),
         )
     })?;
-    let fs = mutex
+    let fs = lock
         .into_inner()
-        .map_err(|_| CliError::internal("V2 filesystem mutex poisoned (a FUSE op panicked)".to_owned()))?;
+        .map_err(|_| CliError::internal("V2 filesystem RwLock poisoned (a FUSE op panicked)".to_owned()))?;
     let cover_after = fs.unmount();
     write_cover(model, &cover_after)?;
     println!("wrote {} bytes back to {}", cover_after.len(), model.display());

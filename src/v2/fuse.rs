@@ -2,14 +2,27 @@
 //!
 //! # Op model
 //!
-//! Dispatch is single-threaded by design: [`Filesystem`] methods take
-//! `&mut self`, and even read-paths traverse in-memory caches. Threaded
-//! dispatch would force a global lock that serialises everything anyway.
+//! fuser 0.15's dispatch loop reads one kernel request at a time and
+//! invokes our trait method synchronously. The driver works *with*
+//! that single-threaded loop by handing each request's actual work to
+//! a freshly spawned worker thread — every FUSE method is a tiny
+//! wrapper that clones the shared state, captures the `Reply*`
+//! object, spawns, and returns. The dispatch loop is then free to
+//! pick up the next request while previous work is still in flight.
 //!
-//! The driver's only persistent state is the V2 filesystem plus a
-//! per-session [`InodeMap`] — the kernel hands us `u64` inodes across
-//! ops and we translate them to V2 paths (absolute, starting with `/`).
-//! The map is rebuilt from scratch at mount time (same as tmpfs).
+//! Concurrency model:
+//! - Many readers may run in parallel against [`Filesystem`]'s
+//!   `&self` methods (`read_file`, `readdir`, `inode_at`, `exists`).
+//! - A writer (`mkdir` / `rmdir` / `create_file` / `unlink`) takes
+//!   the exclusive [`RwLock`] on the filesystem; readers wait until
+//!   it commits. V2's CoW commit semantics already require this.
+//! - The [`InodeMap`] and the per-inode write buffer map have their
+//!   own locks; concurrent reads and concurrent writes to *different*
+//!   inodes don't serialize on each other.
+//!
+//! Lock acquisition order, when a method needs more than one:
+//! `inodes` → `buffers` → `fs`. Document any new method that holds
+//! more than one lock at a time, or it's easy to introduce a deadlock.
 //!
 //! # Buffered writes
 //!
@@ -26,7 +39,7 @@
 //! defaults + the session's mount time). `setattr` on mode/size is
 //! partially honoured — mode is stored only in the write buffer
 //! (lost on release if contents aren't dirty); size truncates the
-//! buffer. Richer metadata is an orthogonal V2 follow-up.
+//! buffer.
 //!
 //! # Mounting
 //!
@@ -37,9 +50,10 @@
 //! lifetime explicitly.
 
 use std::collections::HashMap;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
+use std::thread;
 use std::time::{Duration, SystemTime};
 
 use fuser::{
@@ -55,7 +69,16 @@ use crate::v2::fs::{Filesystem, FsError};
 /// CLI can [`share`](LlmdbV2Fs::share) a handle before consuming the
 /// driver in `spawn_background`, and recover the filesystem + cover
 /// bytes once the mount releases.
-pub type SharedFilesystem = Arc<Mutex<Filesystem>>;
+pub type SharedFilesystem = Arc<RwLock<Filesystem>>;
+
+/// Shared inode-map handle. Reads (`path_of`, `ino_for_path`) take
+/// the read lock; mutations (`intern`, `forget`) take the write lock.
+type SharedInodes = Arc<RwLock<InodeMap>>;
+
+/// Per-inode write-buffer map. The outer `RwLock` guards the map's
+/// structure; each buffer lives behind its own `Mutex` so concurrent
+/// writes to *different* inodes don't serialize on each other.
+type BufferMap = Arc<RwLock<HashMap<u64, Arc<Mutex<WriteBuffer>>>>>;
 
 /// The kernel reserves inode 1 for the root directory.
 pub const ROOT_INO: u64 = 1;
@@ -75,9 +98,7 @@ const DEFAULT_FILE_MODE: u16 = 0o644;
 /// Default directory mode when V2 has no stored mode.
 const DEFAULT_DIR_MODE: u16 = 0o755;
 
-/// Block size used for `stat.st_blksize` / `statvfs.f_bsize`. Doesn't
-/// have to match the underlying storage — just has to be a sensible
-/// unit for userspace tools.
+/// Block size used for `stat.st_blksize` / `statvfs.f_bsize`.
 const BLOCK_SIZE: u32 = 4096;
 
 /// Reported max filename length. V2's `MAX_NAME_LEN` is 255.
@@ -129,6 +150,10 @@ impl InodeMap {
         self.ino_to_path.get(&ino).map(String::as_str)
     }
 
+    fn ino_for_path(&self, path: &str) -> Option<u64> {
+        self.path_to_ino.get(path).copied()
+    }
+
     fn forget(&mut self, ino: u64) {
         if let Some(path) = self.ino_to_path.remove(&ino) {
             self.path_to_ino.remove(&path);
@@ -164,11 +189,11 @@ struct WriteBuffer {
 
 pub struct LlmdbV2Fs {
     fs: SharedFilesystem,
-    inodes: InodeMap,
+    inodes: SharedInodes,
     /// Per-inode pending write buffer. Offset writes stage here;
     /// `release` / `flush` / `fsync` commits via
     /// [`Filesystem::create_file`].
-    buffers: HashMap<u64, WriteBuffer>,
+    buffers: BufferMap,
     /// Session start — used as a fabricated timestamp for every
     /// attribute reply until V2 starts tracking real mtime/ctime.
     mount_time: SystemTime,
@@ -176,10 +201,10 @@ pub struct LlmdbV2Fs {
 
 impl LlmdbV2Fs {
     /// Wrap a V2 [`Filesystem`] for FUSE dispatch. The filesystem is
-    /// moved behind an `Arc<Mutex<_>>` so the adapter can co-exist
+    /// moved behind an `Arc<RwLock<_>>` so the adapter can co-exist
     /// with an out-of-band CLI handle — see [`Self::share`].
     pub fn new(fs: Filesystem) -> Self {
-        Self::with_shared(Arc::new(Mutex::new(fs)))
+        Self::with_shared(Arc::new(RwLock::new(fs)))
     }
 
     /// Build a driver around an already-shared filesystem handle.
@@ -190,8 +215,8 @@ impl LlmdbV2Fs {
     pub fn with_shared(fs: SharedFilesystem) -> Self {
         Self {
             fs,
-            inodes: InodeMap::default(),
-            buffers: HashMap::new(),
+            inodes: Arc::new(RwLock::new(InodeMap::default())),
+            buffers: Arc::new(RwLock::new(HashMap::new())),
             mount_time: SystemTime::now(),
         }
     }
@@ -207,50 +232,42 @@ impl LlmdbV2Fs {
     /// callers using [`Self::share`] should drop their handle (or
     /// the [`BackgroundSession`]) first.
     pub fn into_inner(self) -> Filesystem {
-        let mutex = Arc::try_unwrap(self.fs)
-            .expect("into_inner called while another Arc<Mutex<Filesystem>> is alive");
-        mutex.into_inner().expect("filesystem mutex poisoned")
+        let lock = Arc::try_unwrap(self.fs)
+            .expect("into_inner called while another Arc<RwLock<Filesystem>> is alive");
+        lock.into_inner().expect("filesystem RwLock poisoned")
     }
 
-    fn path_for_child(&self, parent: u64, name: &OsStr) -> Option<String> {
-        let parent_path = self.inodes.path_of(parent)?.to_owned();
-        let name = name.to_str()?;
-        Some(join_path(&parent_path, name))
+    /// Take a snapshot of the shared state needed to dispatch a
+    /// request on a worker thread. Cheap — clones three Arcs and one
+    /// SystemTime.
+    fn ctx(&self) -> Ctx {
+        Ctx {
+            fs: Arc::clone(&self.fs),
+            inodes: Arc::clone(&self.inodes),
+            buffers: Arc::clone(&self.buffers),
+            mount_time: self.mount_time,
+        }
+    }
+}
+
+/// Per-request execution context. Cloned into a worker thread for
+/// each FUSE call; outlives the synchronous trait method.
+#[derive(Clone)]
+struct Ctx {
+    fs: SharedFilesystem,
+    inodes: SharedInodes,
+    buffers: BufferMap,
+    mount_time: SystemTime,
+}
+
+impl Ctx {
+    /// Get a clone of the per-inode write buffer Arc, if one exists.
+    /// Releases the outer map's read lock immediately.
+    fn buffer(&self, ino: u64) -> Option<Arc<Mutex<WriteBuffer>>> {
+        self.buffers.read().unwrap().get(&ino).cloned()
     }
 
-    fn file_attr(&self, req: &Request<'_>, ino: u64, path: &str) -> Option<FileAttr> {
-        let inode = self.fs.lock().unwrap().inode_at(path).ok()?;
-        let size = self
-            .buffers
-            .get(&ino)
-            .filter(|b| b.dirty)
-            .map(|b| b.contents.len() as u64)
-            .unwrap_or(inode.length);
-        let mode = self
-            .buffers
-            .get(&ino)
-            .map(|b| b.mode)
-            .unwrap_or(DEFAULT_FILE_MODE);
-        Some(FileAttr {
-            ino,
-            size,
-            blocks: size.div_ceil(BLOCK_SIZE as u64),
-            atime: self.mount_time,
-            mtime: self.mount_time,
-            ctime: self.mount_time,
-            crtime: self.mount_time,
-            kind: FileType::RegularFile,
-            perm: mode,
-            nlink: 1,
-            uid: req.uid(),
-            gid: req.gid(),
-            rdev: 0,
-            blksize: BLOCK_SIZE,
-            flags: 0,
-        })
-    }
-
-    fn dir_attr(&self, req: &Request<'_>, ino: u64) -> FileAttr {
+    fn dir_attr(&self, ino: u64, uid: u32, gid: u32) -> FileAttr {
         FileAttr {
             ino,
             size: 0,
@@ -262,37 +279,75 @@ impl LlmdbV2Fs {
             kind: FileType::Directory,
             perm: DEFAULT_DIR_MODE,
             nlink: 2,
-            uid: req.uid(),
-            gid: req.gid(),
+            uid,
+            gid,
             rdev: 0,
             blksize: BLOCK_SIZE,
             flags: 0,
         }
     }
 
-    /// Look the current on-disk bytes for `path` — merged with a
-    /// dirty write buffer if one exists (otherwise readers see stale
-    /// on-disk bytes for a just-written file).
-    fn read_contents(&self, ino: u64, path: &str) -> Result<Vec<u8>, FsError> {
-        if let Some(buf) = self.buffers.get(&ino) {
-            return Ok(buf.contents.clone());
-        }
-        self.fs.lock().unwrap().read_file(path)
+    /// Build a file attr. Reads the inode under `fs` read lock and
+    /// merges with the buffer (if present) for size and mode.
+    fn file_attr(&self, ino: u64, path: &str, uid: u32, gid: u32) -> Option<FileAttr> {
+        let inode = self.fs.read().unwrap().inode_at(path).ok()?;
+        let (buf_size, buf_mode) = match self.buffer(ino) {
+            Some(b) => {
+                let b = b.lock().unwrap();
+                let size = b.dirty.then_some(b.contents.len() as u64);
+                (size, Some(b.mode))
+            }
+            None => (None, None),
+        };
+        let size = buf_size.unwrap_or(inode.length);
+        let mode = buf_mode.unwrap_or(DEFAULT_FILE_MODE);
+        Some(FileAttr {
+            ino,
+            size,
+            blocks: size.div_ceil(BLOCK_SIZE as u64),
+            atime: self.mount_time,
+            mtime: self.mount_time,
+            ctime: self.mount_time,
+            crtime: self.mount_time,
+            kind: FileType::RegularFile,
+            perm: mode,
+            nlink: 1,
+            uid,
+            gid,
+            rdev: 0,
+            blksize: BLOCK_SIZE,
+            flags: 0,
+        })
     }
 
-    fn flush_buffer(&mut self, ino: u64) -> Result<(), FsError> {
-        let Some(buf) = self.buffers.get(&ino) else {
-            return Ok(());
+    /// Read the live contents for `ino`/`path` — buffer if present,
+    /// otherwise the on-disk file via the V2 fs read lock.
+    fn read_contents(&self, ino: u64, path: &str) -> Result<Vec<u8>, FsError> {
+        if let Some(buf) = self.buffer(ino) {
+            let b = buf.lock().unwrap();
+            return Ok(b.contents.clone());
+        }
+        self.fs.read().unwrap().read_file(path)
+    }
+
+    /// Commit `ino`'s pending write buffer to V2. No-op if no buffer
+    /// exists or it's clean. Holds the V2 write lock during the
+    /// commit; per-buffer Mutex is held only to snapshot contents.
+    fn flush_buffer(&self, ino: u64) -> Result<(), FsError> {
+        let buf = match self.buffer(ino) {
+            Some(b) => b,
+            None => return Ok(()),
         };
-        if !buf.dirty {
-            return Ok(());
-        }
-        let path = buf.path.clone();
-        let contents = buf.contents.clone();
-        self.fs.lock().unwrap().create_file(&path, &contents)?;
-        if let Some(buf) = self.buffers.get_mut(&ino) {
-            buf.dirty = false;
-        }
+        let (path, contents) = {
+            let b = buf.lock().unwrap();
+            if !b.dirty {
+                return Ok(());
+            }
+            (b.path.clone(), b.contents.clone())
+        };
+        self.fs.write().unwrap().create_file(&path, &contents)?;
+        let mut b = buf.lock().unwrap();
+        b.dirty = false;
         Ok(())
     }
 }
@@ -317,108 +372,28 @@ fn fs_err_to_errno(err: &FsError) -> i32 {
 }
 
 // ==================================================================
-// fuser::Filesystem impl
+// fuser::Filesystem impl — every method spawns its work
 // ==================================================================
 
 impl FuserFilesystem for LlmdbV2Fs {
     fn lookup(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        let Some(path) = self.path_for_child(parent, name) else {
-            reply.error(libc::ENOENT);
-            return;
-        };
-        let Ok(entries) = self.fs.lock().unwrap().readdir(
-            self.inodes
-                .path_of(parent)
-                .unwrap_or("/")
-                .to_owned()
-                .as_str(),
-        ) else {
-            reply.error(libc::ENOENT);
-            return;
-        };
-        let Some(name_str) = name.to_str() else {
-            reply.error(libc::EINVAL);
-            return;
-        };
-        let Some(entry) = entries.iter().find(|e| e.name == name_str) else {
-            reply.error(libc::ENOENT);
-            return;
-        };
-        let ino = self.inodes.intern(&path);
-        let attr = match entry.kind {
-            EntryKind::Directory => self.dir_attr(req, ino),
-            EntryKind::File => {
-                let Some(attr) = self.file_attr(req, ino, &path) else {
-                    reply.error(libc::EIO);
-                    return;
-                };
-                attr
-            }
-        };
-        reply.entry(&TTL, &attr, GENERATION);
+        let ctx = self.ctx();
+        let uid = req.uid();
+        let gid = req.gid();
+        let name = name.to_owned();
+        thread::spawn(move || do_lookup(ctx, parent, name, uid, gid, reply));
     }
 
     fn forget(&mut self, _req: &Request<'_>, ino: u64, _nlookup: u64) {
-        self.inodes.forget(ino);
+        // Trivial map-pop — no reply, no need to spawn.
+        self.inodes.write().unwrap().forget(ino);
     }
 
     fn getattr(&mut self, req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
-        if ino == ROOT_INO {
-            let attr = self.dir_attr(req, ino);
-            reply.attr(&TTL, &attr);
-            return;
-        }
-        let Some(path) = self.inodes.path_of(ino).map(str::to_owned) else {
-            reply.error(libc::ENOENT);
-            return;
-        };
-        if !self.fs.lock().unwrap().exists(&path) {
-            reply.error(libc::ENOENT);
-            return;
-        }
-        // Ask V2 about the inode to discriminate file vs. directory
-        // without re-scanning the parent.
-        let Ok(inode) = self.fs.lock().unwrap().inode_at(&path) else {
-            reply.error(libc::ENOENT);
-            return;
-        };
-        // Directories are the ones whose serialized content
-        // deserializes to a Directory. Rather than re-parse, we
-        // heuristic: try readdir; if it succeeds, it's a directory.
-        if self.fs.lock().unwrap().readdir(&path).is_ok() {
-            let attr = self.dir_attr(req, ino);
-            reply.attr(&TTL, &attr);
-            return;
-        }
-        let size = self
-            .buffers
-            .get(&ino)
-            .filter(|b| b.dirty)
-            .map(|b| b.contents.len() as u64)
-            .unwrap_or(inode.length);
-        let mode = self
-            .buffers
-            .get(&ino)
-            .map(|b| b.mode)
-            .unwrap_or(DEFAULT_FILE_MODE);
-        let attr = FileAttr {
-            ino,
-            size,
-            blocks: size.div_ceil(BLOCK_SIZE as u64),
-            atime: self.mount_time,
-            mtime: self.mount_time,
-            ctime: self.mount_time,
-            crtime: self.mount_time,
-            kind: FileType::RegularFile,
-            perm: mode,
-            nlink: 1,
-            uid: req.uid(),
-            gid: req.gid(),
-            rdev: 0,
-            blksize: BLOCK_SIZE,
-            flags: 0,
-        };
-        reply.attr(&TTL, &attr);
+        let ctx = self.ctx();
+        let uid = req.uid();
+        let gid = req.gid();
+        thread::spawn(move || do_getattr(ctx, ino, uid, gid, reply));
     }
 
     fn opendir(&mut self, _req: &Request<'_>, _ino: u64, _flags: i32, reply: ReplyOpen) {
@@ -431,59 +406,21 @@ impl FuserFilesystem for LlmdbV2Fs {
         ino: u64,
         _fh: u64,
         offset: i64,
-        mut reply: ReplyDirectory,
+        reply: ReplyDirectory,
     ) {
-        let Some(dir_path) = self.inodes.path_of(ino).map(str::to_owned) else {
-            reply.error(libc::ENOENT);
-            return;
-        };
-        let entries = match self.fs.lock().unwrap().readdir(&dir_path) {
-            Ok(e) => e,
-            Err(err) => {
-                reply.error(fs_err_to_errno(&err));
-                return;
-            }
-        };
-
-        let dot: [(&str, FileType); 2] =
-            [(".", FileType::Directory), ("..", FileType::Directory)];
-
-        let mut idx = 0_i64;
-        let mut next_offset = 1_i64;
-        for (name, kind) in dot.iter() {
-            if idx >= offset && reply.add(ino, next_offset, *kind, *name) {
-                reply.ok();
-                return;
-            }
-            idx += 1;
-            next_offset += 1;
-        }
-        for entry in &entries {
-            if idx < offset {
-                idx += 1;
-                next_offset += 1;
-                continue;
-            }
-            let child_path = join_path(&dir_path, &entry.name);
-            let child_ino = self.inodes.intern(&child_path);
-            let kind = match entry.kind {
-                EntryKind::File => FileType::RegularFile,
-                EntryKind::Directory => FileType::Directory,
-            };
-            if reply.add(child_ino, next_offset, kind, &entry.name) {
-                break;
-            }
-            next_offset += 1;
-        }
-        reply.ok();
+        let ctx = self.ctx();
+        thread::spawn(move || do_readdir(ctx, ino, offset, reply));
     }
 
     fn open(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
-        if self.inodes.path_of(ino).is_none() {
-            reply.error(libc::ENOENT);
-            return;
-        }
-        reply.opened(0, 0);
+        let ctx = self.ctx();
+        thread::spawn(move || {
+            if ctx.inodes.read().unwrap().path_of(ino).is_none() {
+                reply.error(libc::ENOENT);
+            } else {
+                reply.opened(0, 0);
+            }
+        });
     }
 
     fn read(
@@ -497,24 +434,8 @@ impl FuserFilesystem for LlmdbV2Fs {
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
-        let Some(path) = self.inodes.path_of(ino).map(str::to_owned) else {
-            reply.error(libc::ENOENT);
-            return;
-        };
-        let contents = match self.read_contents(ino, &path) {
-            Ok(c) => c,
-            Err(err) => {
-                reply.error(fs_err_to_errno(&err));
-                return;
-            }
-        };
-        let start = offset.max(0) as usize;
-        if start >= contents.len() {
-            reply.data(&[]);
-            return;
-        }
-        let end = start.saturating_add(size as usize).min(contents.len());
-        reply.data(&contents[start..end]);
+        let ctx = self.ctx();
+        thread::spawn(move || do_read(ctx, ino, offset, size, reply));
     }
 
     fn write(
@@ -529,34 +450,9 @@ impl FuserFilesystem for LlmdbV2Fs {
         _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
-        let Some(path) = self.inodes.path_of(ino).map(str::to_owned) else {
-            reply.error(libc::ENOENT);
-            return;
-        };
-        let start = offset.max(0) as usize;
-
-        // Seed the buffer from on-disk contents on first write.
-        if !self.buffers.contains_key(&ino) {
-            let existing = self.fs.lock().unwrap().read_file(&path).unwrap_or_default();
-            self.buffers.insert(
-                ino,
-                WriteBuffer {
-                    path: path.clone(),
-                    mode: DEFAULT_FILE_MODE,
-                    contents: existing,
-                    dirty: false,
-                },
-            );
-        }
-
-        let buf = self.buffers.get_mut(&ino).unwrap();
-        let end = start + data.len();
-        if buf.contents.len() < end {
-            buf.contents.resize(end, 0);
-        }
-        buf.contents[start..end].copy_from_slice(data);
-        buf.dirty = true;
-        reply.written(data.len() as u32);
+        let ctx = self.ctx();
+        let data = data.to_vec();
+        thread::spawn(move || do_write(ctx, ino, offset, data, reply));
     }
 
     fn flush(
@@ -567,10 +463,11 @@ impl FuserFilesystem for LlmdbV2Fs {
         _lock_owner: u64,
         reply: ReplyEmpty,
     ) {
-        match self.flush_buffer(ino) {
+        let ctx = self.ctx();
+        thread::spawn(move || match ctx.flush_buffer(ino) {
             Ok(()) => reply.ok(),
             Err(err) => reply.error(fs_err_to_errno(&err)),
-        }
+        });
     }
 
     fn fsync(
@@ -581,10 +478,11 @@ impl FuserFilesystem for LlmdbV2Fs {
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
-        match self.flush_buffer(ino) {
+        let ctx = self.ctx();
+        thread::spawn(move || match ctx.flush_buffer(ino) {
             Ok(()) => reply.ok(),
             Err(err) => reply.error(fs_err_to_errno(&err)),
-        }
+        });
     }
 
     fn release(
@@ -597,12 +495,15 @@ impl FuserFilesystem for LlmdbV2Fs {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        if let Err(err) = self.flush_buffer(ino) {
-            reply.error(fs_err_to_errno(&err));
-            return;
-        }
-        self.buffers.remove(&ino);
-        reply.ok();
+        let ctx = self.ctx();
+        thread::spawn(move || {
+            if let Err(err) = ctx.flush_buffer(ino) {
+                reply.error(fs_err_to_errno(&err));
+                return;
+            }
+            ctx.buffers.write().unwrap().remove(&ino);
+            reply.ok();
+        });
     }
 
     fn create(
@@ -615,70 +516,17 @@ impl FuserFilesystem for LlmdbV2Fs {
         _flags: i32,
         reply: ReplyCreate,
     ) {
-        let Some(path) = self.path_for_child(parent, name) else {
-            reply.error(libc::EINVAL);
-            return;
-        };
-        if self.fs.lock().unwrap().exists(&path) {
-            reply.error(libc::EEXIST);
-            return;
-        }
-        // Create an empty file on disk so lookup / getattr see it
-        // immediately — otherwise a `touch foo` followed by `stat
-        // foo` without a write in between would ENOENT.
-        if let Err(err) = self.fs.lock().unwrap().create_file(&path, &[]) {
-            reply.error(fs_err_to_errno(&err));
-            return;
-        }
-        let ino = self.inodes.intern(&path);
-        let buf_mode = (mode & 0o7777) as u16;
-        self.buffers.insert(
-            ino,
-            WriteBuffer {
-                path: path.clone(),
-                mode: buf_mode,
-                contents: Vec::new(),
-                dirty: false,
-            },
-        );
-        let attr = FileAttr {
-            ino,
-            size: 0,
-            blocks: 0,
-            atime: self.mount_time,
-            mtime: self.mount_time,
-            ctime: self.mount_time,
-            crtime: self.mount_time,
-            kind: FileType::RegularFile,
-            perm: buf_mode,
-            nlink: 1,
-            uid: req.uid(),
-            gid: req.gid(),
-            rdev: 0,
-            blksize: BLOCK_SIZE,
-            flags: 0,
-        };
-        reply.created(&TTL, &attr, GENERATION, 0, 0);
+        let ctx = self.ctx();
+        let uid = req.uid();
+        let gid = req.gid();
+        let name = name.to_owned();
+        thread::spawn(move || do_create(ctx, parent, name, mode, uid, gid, reply));
     }
 
     fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        let Some(path) = self.path_for_child(parent, name) else {
-            reply.error(libc::ENOENT);
-            return;
-        };
-        if let Some(ino) = self
-            .inodes
-            .path_to_ino
-            .get(&path)
-            .copied()
-        {
-            self.buffers.remove(&ino);
-            self.inodes.forget(ino);
-        }
-        match self.fs.lock().unwrap().unlink(&path) {
-            Ok(()) => reply.ok(),
-            Err(err) => reply.error(fs_err_to_errno(&err)),
-        }
+        let ctx = self.ctx();
+        let name = name.to_owned();
+        thread::spawn(move || do_unlink(ctx, parent, name, reply));
     }
 
     fn mkdir(
@@ -690,33 +538,17 @@ impl FuserFilesystem for LlmdbV2Fs {
         _umask: u32,
         reply: ReplyEntry,
     ) {
-        let Some(path) = self.path_for_child(parent, name) else {
-            reply.error(libc::EINVAL);
-            return;
-        };
-        if let Err(err) = self.fs.lock().unwrap().mkdir(&path) {
-            reply.error(fs_err_to_errno(&err));
-            return;
-        }
-        let ino = self.inodes.intern(&path);
-        let attr = self.dir_attr(req, ino);
-        reply.entry(&TTL, &attr, GENERATION);
+        let ctx = self.ctx();
+        let uid = req.uid();
+        let gid = req.gid();
+        let name = name.to_owned();
+        thread::spawn(move || do_mkdir(ctx, parent, name, uid, gid, reply));
     }
 
     fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        let Some(path) = self.path_for_child(parent, name) else {
-            reply.error(libc::ENOENT);
-            return;
-        };
-        match self.fs.lock().unwrap().rmdir(&path) {
-            Ok(()) => {
-                if let Some(ino) = self.inodes.path_to_ino.get(&path).copied() {
-                    self.inodes.forget(ino);
-                }
-                reply.ok();
-            }
-            Err(err) => reply.error(fs_err_to_errno(&err)),
-        }
+        let ctx = self.ctx();
+        let name = name.to_owned();
+        thread::spawn(move || do_rmdir(ctx, parent, name, reply));
     }
 
     fn setattr(
@@ -737,69 +569,461 @@ impl FuserFilesystem for LlmdbV2Fs {
         _flags: Option<u32>,
         reply: ReplyAttr,
     ) {
-        let Some(path) = self.inodes.path_of(ino).map(str::to_owned) else {
-            reply.error(libc::ENOENT);
-            return;
-        };
-
-        if size.is_some() || mode.is_some() {
-            // Both truncate and chmod stage through the write buffer.
-            // Seed the buffer with disk contents if we don't have one.
-            if !self.buffers.contains_key(&ino) {
-                let existing = self.fs.lock().unwrap().read_file(&path).unwrap_or_default();
-                self.buffers.insert(
-                    ino,
-                    WriteBuffer {
-                        path: path.clone(),
-                        mode: DEFAULT_FILE_MODE,
-                        contents: existing,
-                        dirty: false,
-                    },
-                );
-            }
-            if let Some(new_size) = size
-                && let Some(buf) = self.buffers.get_mut(&ino)
-            {
-                buf.contents.resize(new_size as usize, 0);
-                buf.dirty = true;
-            }
-            if let Some(new_mode) = mode
-                && let Some(buf) = self.buffers.get_mut(&ino)
-            {
-                buf.mode = (new_mode & 0o7777) as u16;
-                buf.dirty = true;
-            }
-        }
-
-        if let Some(attr) = self.file_attr(req, ino, &path) {
-            reply.attr(&TTL, &attr);
-        } else if self.fs.lock().unwrap().readdir(&path).is_ok() {
-            reply.attr(&TTL, &self.dir_attr(req, ino));
-        } else {
-            reply.error(libc::ENOENT);
-        }
+        let ctx = self.ctx();
+        let uid = req.uid();
+        let gid = req.gid();
+        thread::spawn(move || do_setattr(ctx, ino, mode, size, uid, gid, reply));
     }
 
     fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: ReplyStatfs) {
-        // V2 doesn't expose a total-block count; report free space
-        // in stealable-bit weights scaled to blocks so userspace
-        // tooling shows something reasonable.
-        let free_weights = self.fs.lock().unwrap().allocator_free_weights();
-        let free_blocks = free_weights.saturating_div(BLOCK_SIZE as u64);
-        reply.statfs(
-            free_blocks.saturating_mul(2),
-            free_blocks,
-            free_blocks,
-            0,
-            0,
-            BLOCK_SIZE,
-            MAX_FILENAME_BYTES,
-            BLOCK_SIZE,
-        );
+        let ctx = self.ctx();
+        thread::spawn(move || {
+            let free_weights = ctx.fs.read().unwrap().allocator_free_weights();
+            let free_blocks = free_weights.saturating_div(BLOCK_SIZE as u64);
+            reply.statfs(
+                free_blocks.saturating_mul(2),
+                free_blocks,
+                free_blocks,
+                0,
+                0,
+                BLOCK_SIZE,
+                MAX_FILENAME_BYTES,
+                BLOCK_SIZE,
+            );
+        });
     }
 
     fn access(&mut self, _req: &Request<'_>, _ino: u64, _mask: i32, reply: ReplyEmpty) {
         reply.ok();
+    }
+}
+
+// ==================================================================
+// Per-method work bodies (run on worker threads)
+// ==================================================================
+
+fn do_lookup(
+    ctx: Ctx,
+    parent: u64,
+    name: OsString,
+    uid: u32,
+    gid: u32,
+    reply: ReplyEntry,
+) {
+    let parent_path = match ctx.inodes.read().unwrap().path_of(parent).map(str::to_owned) {
+        Some(p) => p,
+        None => {
+            reply.error(libc::ENOENT);
+            return;
+        }
+    };
+    let Some(name_str) = name.to_str() else {
+        reply.error(libc::EINVAL);
+        return;
+    };
+    let path = join_path(&parent_path, name_str);
+
+    let entries = match ctx.fs.read().unwrap().readdir(&parent_path) {
+        Ok(e) => e,
+        Err(_) => {
+            reply.error(libc::ENOENT);
+            return;
+        }
+    };
+    let Some(entry) = entries.iter().find(|e| e.name == name_str) else {
+        reply.error(libc::ENOENT);
+        return;
+    };
+    let kind = entry.kind;
+
+    let ino = ctx.inodes.write().unwrap().intern(&path);
+    let attr = match kind {
+        EntryKind::Directory => ctx.dir_attr(ino, uid, gid),
+        EntryKind::File => match ctx.file_attr(ino, &path, uid, gid) {
+            Some(a) => a,
+            None => {
+                reply.error(libc::EIO);
+                return;
+            }
+        },
+    };
+    reply.entry(&TTL, &attr, GENERATION);
+}
+
+fn do_getattr(ctx: Ctx, ino: u64, uid: u32, gid: u32, reply: ReplyAttr) {
+    if ino == ROOT_INO {
+        let attr = ctx.dir_attr(ino, uid, gid);
+        reply.attr(&TTL, &attr);
+        return;
+    }
+    let path = match ctx.inodes.read().unwrap().path_of(ino).map(str::to_owned) {
+        Some(p) => p,
+        None => {
+            reply.error(libc::ENOENT);
+            return;
+        }
+    };
+    let fs = ctx.fs.read().unwrap();
+    if !fs.exists(&path) {
+        reply.error(libc::ENOENT);
+        return;
+    }
+    let inode = match fs.inode_at(&path) {
+        Ok(i) => i,
+        Err(_) => {
+            reply.error(libc::ENOENT);
+            return;
+        }
+    };
+    // Heuristic: try readdir; if it succeeds, it's a directory.
+    if fs.readdir(&path).is_ok() {
+        drop(fs);
+        let attr = ctx.dir_attr(ino, uid, gid);
+        reply.attr(&TTL, &attr);
+        return;
+    }
+    drop(fs);
+
+    let (buf_size, buf_mode) = match ctx.buffer(ino) {
+        Some(b) => {
+            let b = b.lock().unwrap();
+            (b.dirty.then_some(b.contents.len() as u64), Some(b.mode))
+        }
+        None => (None, None),
+    };
+    let size = buf_size.unwrap_or(inode.length);
+    let mode = buf_mode.unwrap_or(DEFAULT_FILE_MODE);
+    let attr = FileAttr {
+        ino,
+        size,
+        blocks: size.div_ceil(BLOCK_SIZE as u64),
+        atime: ctx.mount_time,
+        mtime: ctx.mount_time,
+        ctime: ctx.mount_time,
+        crtime: ctx.mount_time,
+        kind: FileType::RegularFile,
+        perm: mode,
+        nlink: 1,
+        uid,
+        gid,
+        rdev: 0,
+        blksize: BLOCK_SIZE,
+        flags: 0,
+    };
+    reply.attr(&TTL, &attr);
+}
+
+fn do_readdir(ctx: Ctx, ino: u64, offset: i64, mut reply: ReplyDirectory) {
+    let dir_path = match ctx.inodes.read().unwrap().path_of(ino).map(str::to_owned) {
+        Some(p) => p,
+        None => {
+            reply.error(libc::ENOENT);
+            return;
+        }
+    };
+    let entries = match ctx.fs.read().unwrap().readdir(&dir_path) {
+        Ok(e) => e,
+        Err(err) => {
+            reply.error(fs_err_to_errno(&err));
+            return;
+        }
+    };
+
+    let dot: [(&str, FileType); 2] = [(".", FileType::Directory), ("..", FileType::Directory)];
+
+    let mut idx = 0_i64;
+    let mut next_offset = 1_i64;
+    for (name, kind) in dot.iter() {
+        if idx >= offset && reply.add(ino, next_offset, *kind, *name) {
+            reply.ok();
+            return;
+        }
+        idx += 1;
+        next_offset += 1;
+    }
+    for entry in &entries {
+        if idx < offset {
+            idx += 1;
+            next_offset += 1;
+            continue;
+        }
+        let child_path = join_path(&dir_path, &entry.name);
+        let child_ino = ctx.inodes.write().unwrap().intern(&child_path);
+        let kind = match entry.kind {
+            EntryKind::File => FileType::RegularFile,
+            EntryKind::Directory => FileType::Directory,
+        };
+        if reply.add(child_ino, next_offset, kind, &entry.name) {
+            break;
+        }
+        next_offset += 1;
+    }
+    reply.ok();
+}
+
+fn do_read(ctx: Ctx, ino: u64, offset: i64, size: u32, reply: ReplyData) {
+    let path = match ctx.inodes.read().unwrap().path_of(ino).map(str::to_owned) {
+        Some(p) => p,
+        None => {
+            reply.error(libc::ENOENT);
+            return;
+        }
+    };
+    let contents = match ctx.read_contents(ino, &path) {
+        Ok(c) => c,
+        Err(err) => {
+            reply.error(fs_err_to_errno(&err));
+            return;
+        }
+    };
+    let start = offset.max(0) as usize;
+    if start >= contents.len() {
+        reply.data(&[]);
+        return;
+    }
+    let end = start.saturating_add(size as usize).min(contents.len());
+    reply.data(&contents[start..end]);
+}
+
+fn do_write(ctx: Ctx, ino: u64, offset: i64, data: Vec<u8>, reply: ReplyWrite) {
+    let path = match ctx.inodes.read().unwrap().path_of(ino).map(str::to_owned) {
+        Some(p) => p,
+        None => {
+            reply.error(libc::ENOENT);
+            return;
+        }
+    };
+    let start = offset.max(0) as usize;
+
+    // Get-or-insert the buffer. We acquire the write lock briefly to
+    // insert; per-buffer Mutex handles the rest.
+    let buf = {
+        let mut map = ctx.buffers.write().unwrap();
+        if let Some(b) = map.get(&ino) {
+            Arc::clone(b)
+        } else {
+            // Seed the new buffer from on-disk contents (read fs lock).
+            let existing = ctx.fs.read().unwrap().read_file(&path).unwrap_or_default();
+            let buf = Arc::new(Mutex::new(WriteBuffer {
+                path: path.clone(),
+                mode: DEFAULT_FILE_MODE,
+                contents: existing,
+                dirty: false,
+            }));
+            map.insert(ino, Arc::clone(&buf));
+            buf
+        }
+    };
+
+    let mut b = buf.lock().unwrap();
+    let end = start + data.len();
+    if b.contents.len() < end {
+        b.contents.resize(end, 0);
+    }
+    b.contents[start..end].copy_from_slice(&data);
+    b.dirty = true;
+    reply.written(data.len() as u32);
+}
+
+fn do_create(
+    ctx: Ctx,
+    parent: u64,
+    name: OsString,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    reply: ReplyCreate,
+) {
+    let parent_path = match ctx.inodes.read().unwrap().path_of(parent).map(str::to_owned) {
+        Some(p) => p,
+        None => {
+            reply.error(libc::EINVAL);
+            return;
+        }
+    };
+    let Some(name_str) = name.to_str() else {
+        reply.error(libc::EINVAL);
+        return;
+    };
+    let path = join_path(&parent_path, name_str);
+
+    {
+        let fs = ctx.fs.read().unwrap();
+        if fs.exists(&path) {
+            reply.error(libc::EEXIST);
+            return;
+        }
+    }
+
+    if let Err(err) = ctx.fs.write().unwrap().create_file(&path, &[]) {
+        reply.error(fs_err_to_errno(&err));
+        return;
+    }
+
+    let ino = ctx.inodes.write().unwrap().intern(&path);
+    let buf_mode = (mode & 0o7777) as u16;
+    ctx.buffers.write().unwrap().insert(
+        ino,
+        Arc::new(Mutex::new(WriteBuffer {
+            path: path.clone(),
+            mode: buf_mode,
+            contents: Vec::new(),
+            dirty: false,
+        })),
+    );
+    let attr = FileAttr {
+        ino,
+        size: 0,
+        blocks: 0,
+        atime: ctx.mount_time,
+        mtime: ctx.mount_time,
+        ctime: ctx.mount_time,
+        crtime: ctx.mount_time,
+        kind: FileType::RegularFile,
+        perm: buf_mode,
+        nlink: 1,
+        uid,
+        gid,
+        rdev: 0,
+        blksize: BLOCK_SIZE,
+        flags: 0,
+    };
+    reply.created(&TTL, &attr, GENERATION, 0, 0);
+}
+
+fn do_unlink(ctx: Ctx, parent: u64, name: OsString, reply: ReplyEmpty) {
+    let parent_path = match ctx.inodes.read().unwrap().path_of(parent).map(str::to_owned) {
+        Some(p) => p,
+        None => {
+            reply.error(libc::ENOENT);
+            return;
+        }
+    };
+    let Some(name_str) = name.to_str() else {
+        reply.error(libc::ENOENT);
+        return;
+    };
+    let path = join_path(&parent_path, name_str);
+
+    let ino_opt = ctx.inodes.read().unwrap().ino_for_path(&path);
+    if let Some(ino) = ino_opt {
+        ctx.buffers.write().unwrap().remove(&ino);
+        ctx.inodes.write().unwrap().forget(ino);
+    }
+    match ctx.fs.write().unwrap().unlink(&path) {
+        Ok(()) => reply.ok(),
+        Err(err) => reply.error(fs_err_to_errno(&err)),
+    }
+}
+
+fn do_mkdir(
+    ctx: Ctx,
+    parent: u64,
+    name: OsString,
+    uid: u32,
+    gid: u32,
+    reply: ReplyEntry,
+) {
+    let parent_path = match ctx.inodes.read().unwrap().path_of(parent).map(str::to_owned) {
+        Some(p) => p,
+        None => {
+            reply.error(libc::EINVAL);
+            return;
+        }
+    };
+    let Some(name_str) = name.to_str() else {
+        reply.error(libc::EINVAL);
+        return;
+    };
+    let path = join_path(&parent_path, name_str);
+
+    if let Err(err) = ctx.fs.write().unwrap().mkdir(&path) {
+        reply.error(fs_err_to_errno(&err));
+        return;
+    }
+    let ino = ctx.inodes.write().unwrap().intern(&path);
+    let attr = ctx.dir_attr(ino, uid, gid);
+    reply.entry(&TTL, &attr, GENERATION);
+}
+
+fn do_rmdir(ctx: Ctx, parent: u64, name: OsString, reply: ReplyEmpty) {
+    let parent_path = match ctx.inodes.read().unwrap().path_of(parent).map(str::to_owned) {
+        Some(p) => p,
+        None => {
+            reply.error(libc::ENOENT);
+            return;
+        }
+    };
+    let Some(name_str) = name.to_str() else {
+        reply.error(libc::ENOENT);
+        return;
+    };
+    let path = join_path(&parent_path, name_str);
+
+    match ctx.fs.write().unwrap().rmdir(&path) {
+        Ok(()) => {
+            let ino_opt = ctx.inodes.read().unwrap().ino_for_path(&path);
+            if let Some(ino) = ino_opt {
+                ctx.inodes.write().unwrap().forget(ino);
+            }
+            reply.ok();
+        }
+        Err(err) => reply.error(fs_err_to_errno(&err)),
+    }
+}
+
+fn do_setattr(
+    ctx: Ctx,
+    ino: u64,
+    mode: Option<u32>,
+    size: Option<u64>,
+    uid: u32,
+    gid: u32,
+    reply: ReplyAttr,
+) {
+    let path = match ctx.inodes.read().unwrap().path_of(ino).map(str::to_owned) {
+        Some(p) => p,
+        None => {
+            reply.error(libc::ENOENT);
+            return;
+        }
+    };
+
+    if size.is_some() || mode.is_some() {
+        // Get-or-insert the buffer (seeded from disk if absent).
+        let buf = {
+            let mut map = ctx.buffers.write().unwrap();
+            if let Some(b) = map.get(&ino) {
+                Arc::clone(b)
+            } else {
+                let existing = ctx.fs.read().unwrap().read_file(&path).unwrap_or_default();
+                let buf = Arc::new(Mutex::new(WriteBuffer {
+                    path: path.clone(),
+                    mode: DEFAULT_FILE_MODE,
+                    contents: existing,
+                    dirty: false,
+                }));
+                map.insert(ino, Arc::clone(&buf));
+                buf
+            }
+        };
+        let mut b = buf.lock().unwrap();
+        if let Some(new_size) = size {
+            b.contents.resize(new_size as usize, 0);
+            b.dirty = true;
+        }
+        if let Some(new_mode) = mode {
+            b.mode = (new_mode & 0o7777) as u16;
+            b.dirty = true;
+        }
+    }
+
+    if let Some(attr) = ctx.file_attr(ino, &path, uid, gid) {
+        reply.attr(&TTL, &attr);
+    } else if ctx.fs.read().unwrap().readdir(&path).is_ok() {
+        reply.attr(&TTL, &ctx.dir_attr(ino, uid, gid));
+    } else {
+        reply.error(libc::ENOENT);
     }
 }
 
@@ -887,6 +1111,14 @@ mod tests {
         map.forget(ino);
         assert!(map.path_of(ino).is_none());
         assert!(!map.path_to_ino.contains_key("/victim"));
+    }
+
+    #[test]
+    fn ino_for_path_round_trip() {
+        let mut map = InodeMap::default();
+        let ino = map.intern("/a/b");
+        assert_eq!(map.ino_for_path("/a/b"), Some(ino));
+        assert_eq!(map.ino_for_path("/missing"), None);
     }
 
     #[test]
