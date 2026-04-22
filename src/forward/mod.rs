@@ -17,7 +17,9 @@
 //! for the phased build.
 
 pub mod block;
+pub mod config;
 pub mod dequant;
 pub mod ops;
 pub mod pre_tokenize;
 pub mod tokenizer;
+pub mod weights;
