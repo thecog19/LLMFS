@@ -2,19 +2,6 @@ use crate::gguf::quant::GgufQuantType;
 use crate::stego::planner::{AllocationPlan, TensorTier};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TensorMapBootstrap {
-    pub logical_block_size: usize,
-}
-
-impl Default for TensorMapBootstrap {
-    fn default() -> Self {
-        Self {
-            logical_block_size: crate::BLOCK_SIZE,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TensorSlot {
     pub name: String,
     pub quant_type: GgufQuantType,
