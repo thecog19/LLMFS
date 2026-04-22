@@ -362,6 +362,26 @@ impl Filesystem {
             }
         }
 
+        // Salience inode tree (B1): same reservation pass as the
+        // bitmap. Without this, subsequent commits would reclaim
+        // live salience chunks on the first commit after mount.
+        if !super_root.salience_inode.is_null() {
+            let salience_chunks =
+                inode_tree_chunks(cover.bytes(), &map, super_root.salience_inode)?;
+            for (slot, start, len_bits) in salience_chunks {
+                if reserved.insert((slot, start)) {
+                    let p = Pointer {
+                        slot,
+                        start_weight: start,
+                        length_in_bits: len_bits,
+                        flags: 0,
+                        reserved: 0,
+                    };
+                    reserve_pointer(&mut allocator, &map, p)?;
+                }
+            }
+        }
+
         // In-memory bitmap must reflect every live V2 metadata
         // chunk; the persisted snapshot may lag by one commit.
         mark_pointer_dirty(&mut dirty_bitmap, &map, super_root_ptr);
@@ -377,13 +397,15 @@ impl Filesystem {
         }
 
         // Rebuild the dedup index across every content chunk in
-        // the tree plus the bitmap's inode tree — writes consult
-        // the same index for files, directories, and the bitmap.
+        // the tree plus the bitmap's inode tree plus the salience
+        // inode tree — writes consult the same index for files,
+        // directories, the bitmap, and (post-calibration) salience.
         let dedup_index = build_dedup_index(
             cover.bytes(),
             &map,
             root_inode_ptr,
             super_root.dirty_bitmap_inode,
+            super_root.salience_inode,
         )?;
 
         Ok(Self {
@@ -762,11 +784,58 @@ impl Filesystem {
         Ok(new_child_ptr)
     }
 
-    /// Finalise a CoW mutation: persist the dirty bitmap, write a
-    /// new super-root that points at `new_root_dir_inode`, swap
-    /// anchor slots, then reclaim the chunks the old tree used
-    /// but the new tree doesn't.
+    /// Finalise a CoW mutation with a new root directory, carrying
+    /// the existing salience inode forward.
     fn commit_with_new_root(&mut self, new_root_dir_inode: Pointer) -> Result<(), FsError> {
+        let salience = self.super_root.salience_inode;
+        self.commit_snapshot(new_root_dir_inode, salience)
+    }
+
+    /// Persist `data` as a new salience inode and commit a super-root
+    /// that points at it. The directory tree is unchanged; only the
+    /// salience slot moves. Returns the new salience inode pointer.
+    ///
+    /// Minimal shape for Phase B3: the caller supplies a plain byte
+    /// blob — the Phase B4 allocator consumer will wrap this with
+    /// a typed `SalienceTable` codec.
+    pub fn commit_salience(&mut self, data: &[u8]) -> Result<Pointer, FsError> {
+        let new_salience_inode = persist_as_byte_stream(
+            self.cover.bytes_mut(),
+            &self.map,
+            &mut self.alloc,
+            &mut self.dirty_bitmap,
+            &mut self.dedup_index,
+            &self.cdc_params,
+            data,
+        )?;
+        let root = self.root_inode_ptr;
+        self.commit_snapshot(root, new_salience_inode)?;
+        Ok(new_salience_inode)
+    }
+
+    /// Load the serialized salience bytes from the salience inode.
+    /// Returns `None` when the cover hasn't been calibrated yet.
+    pub fn load_salience(&self) -> Result<Option<Vec<u8>>, FsError> {
+        if self.super_root.salience_inode.is_null() {
+            return Ok(None);
+        }
+        let bytes = load_byte_stream(
+            self.cover.bytes(),
+            &self.map,
+            self.super_root.salience_inode,
+        )?;
+        Ok(Some(bytes))
+    }
+
+    /// Shared commit pipeline: persist bitmap, write super-root,
+    /// swap anchor slots, reclaim unreachable chunks, rebuild the
+    /// dedup index. Callers choose which of the two new inode
+    /// pointers to change.
+    fn commit_snapshot(
+        &mut self,
+        new_root_dir_inode: Pointer,
+        new_salience_inode: Pointer,
+    ) -> Result<(), FsError> {
         // Persist the in-memory dirty bitmap via the streaming path
         // (no transient dense-byte allocation; see
         // `persist_bitmap_streaming`).
@@ -783,6 +852,7 @@ impl Filesystem {
         let new_super_root = SuperRoot {
             root_dir_inode: new_root_dir_inode,
             dirty_bitmap_inode: new_bitmap_inode_ptr,
+            salience_inode: new_salience_inode,
             generation: new_generation,
             ..SuperRoot::EMPTY
         };
@@ -812,11 +882,13 @@ impl Filesystem {
             TreeScope {
                 root_dir_inode_ptr: self.root_inode_ptr,
                 bitmap_inode_ptr: self.super_root.dirty_bitmap_inode,
+                salience_inode_ptr: self.super_root.salience_inode,
                 super_root_ptr: self.super_root_ptr,
             },
             TreeScope {
                 root_dir_inode_ptr: new_root_dir_inode,
                 bitmap_inode_ptr: new_bitmap_inode_ptr,
+                salience_inode_ptr: new_super_root.salience_inode,
                 super_root_ptr: new_super_root_ptr,
             },
         )?;
@@ -830,13 +902,15 @@ impl Filesystem {
         self.root_directory = read_directory(self.cover.bytes(), &self.map, new_root_dir_inode)?;
 
         // Rebuild the dedup index across the new tree + new bitmap
-        // tree. Next commit's writes (file, directory, or bitmap)
-        // all consult this shared index.
+        // tree + salience tree. Next commit's writes (file,
+        // directory, bitmap, or salience) all consult this shared
+        // index.
         self.dedup_index = build_dedup_index(
             self.cover.bytes(),
             &self.map,
             new_root_dir_inode,
             new_bitmap_inode_ptr,
+            new_super_root.salience_inode,
         )?;
         Ok(())
     }
@@ -1651,10 +1725,15 @@ fn collect_tree_chunks(
 }
 
 /// A snapshot of "what's reachable from this commit": the root
-/// directory tree, the bitmap inode tree, and the super-root chunk.
+/// directory tree, the bitmap inode tree, the salience inode tree
+/// (post-B1), and the super-root chunk.
 struct TreeScope {
     root_dir_inode_ptr: Pointer,
     bitmap_inode_ptr: Pointer,
+    /// Calibration salience; `Pointer::NULL` on un-calibrated covers.
+    /// Null-tolerant so every call site can populate it
+    /// unconditionally from the current `SuperRoot`.
+    salience_inode_ptr: Pointer,
     super_root_ptr: Pointer,
 }
 
@@ -1666,6 +1745,11 @@ fn collect_scope_chunks(
     let mut set = collect_tree_chunks(cover, map, scope.root_dir_inode_ptr)?;
     for e in inode_tree_chunks(cover, map, scope.bitmap_inode_ptr)? {
         set.insert(e);
+    }
+    if !scope.salience_inode_ptr.is_null() {
+        for e in inode_tree_chunks(cover, map, scope.salience_inode_ptr)? {
+            set.insert(e);
+        }
     }
     if !scope.super_root_ptr.is_null() {
         set.insert((
@@ -1715,6 +1799,7 @@ fn build_dedup_index(
     map: &TensorMap,
     root_dir_inode_ptr: Pointer,
     bitmap_inode_ptr: Pointer,
+    salience_inode_ptr: Pointer,
 ) -> Result<DedupIndex, FsError> {
     let mut idx = DedupIndex::new();
     let mut hash_and_insert = |ptr: Pointer| -> Result<(), FsError> {
@@ -1734,6 +1819,16 @@ fn build_dedup_index(
     // Bitmap tree: bitmap's data chunks + its indirect blocks.
     if !bitmap_inode_ptr.is_null() {
         let inode = read_inode(cover, map, bitmap_inode_ptr)?;
+        visit_inode_chunks(&inode, cover, map, &mut hash_and_insert)?;
+    }
+
+    // Salience tree (B1): same shape as the bitmap — a metadata
+    // inode with its own content chunks + indirects. Indexing it
+    // lets two calibration runs with overlapping salience
+    // distributions share physical storage, and collapses all-zero
+    // regions (uncalibrated layers) to a single chunk.
+    if !salience_inode_ptr.is_null() {
+        let inode = read_inode(cover, map, salience_inode_ptr)?;
         visit_inode_chunks(&inode, cover, map, &mut hash_and_insert)?;
     }
 
