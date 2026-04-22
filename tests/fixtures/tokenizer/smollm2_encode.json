@@ -1,0 +1,317 @@
+[
+  {
+    "label": "empty",
+    "input": "",
+    "ids": []
+  },
+  {
+    "label": "single_letter",
+    "input": "a",
+    "ids": [
+      81
+    ]
+  },
+  {
+    "label": "single_digit",
+    "input": "5",
+    "ids": [
+      37
+    ]
+  },
+  {
+    "label": "single_space",
+    "input": " ",
+    "ids": [
+      216
+    ]
+  },
+  {
+    "label": "single_period",
+    "input": ".",
+    "ids": [
+      30
+    ]
+  },
+  {
+    "label": "hello_world_punct",
+    "input": "Hello, world!",
+    "ids": [
+      19556,
+      28,
+      905,
+      17
+    ]
+  },
+  {
+    "label": "digit_isolation",
+    "input": "abc123def",
+    "ids": [
+      25276,
+      33,
+      34,
+      35,
+      1604
+    ]
+  },
+  {
+    "label": "contraction_dont",
+    "input": "don't worry",
+    "ids": [
+      12420,
+      982,
+      5321
+    ]
+  },
+  {
+    "label": "mixed_stress",
+    "input": "It's 3:14pm",
+    "ids": [
+      1589,
+      506,
+      216,
+      35,
+      42,
+      33,
+      36,
+      11043
+    ]
+  },
+  {
+    "label": "multi_space",
+    "input": "hello   world",
+    "ids": [
+      28120,
+      256,
+      905
+    ]
+  },
+  {
+    "label": "long_digit_run",
+    "input": "1234567890",
+    "ids": [
+      33,
+      34,
+      35,
+      36,
+      37,
+      38,
+      39,
+      40,
+      41,
+      32
+    ]
+  },
+  {
+    "label": "all_caps",
+    "input": "HELLO WORLD",
+    "ids": [
+      56,
+      4210,
+      6426,
+      35612,
+      16284
+    ]
+  },
+  {
+    "label": "camel_case",
+    "input": "camelCaseIsCool",
+    "ids": [
+      12744,
+      299,
+      10802,
+      4182,
+      41979
+    ]
+  },
+  {
+    "label": "snake_case",
+    "input": "snake_case_variable",
+    "ids": [
+      48284,
+      79,
+      7544,
+      79,
+      18025
+    ]
+  },
+  {
+    "label": "kebab_case",
+    "input": "kebab-case-too",
+    "ids": [
+      396,
+      82,
+      369,
+      29,
+      7544,
+      29,
+      23034
+    ]
+  },
+  {
+    "label": "accented_latin",
+    "input": "Résumé",
+    "ids": [
+      66,
+      2756,
+      5422,
+      2756
+    ]
+  },
+  {
+    "label": "accented_small",
+    "input": "café",
+    "ids": [
+      83,
+      1939,
+      2756
+    ]
+  },
+  {
+    "label": "tab_char",
+    "input": "a\tb",
+    "ids": [
+      81,
+      197,
+      82
+    ]
+  },
+  {
+    "label": "newline",
+    "input": "a\nb",
+    "ids": [
+      81,
+      198,
+      82
+    ]
+  },
+  {
+    "label": "multi_line",
+    "input": "first line\nsecond line",
+    "ids": [
+      7298,
+      1761,
+      198,
+      12247,
+      1761
+    ]
+  },
+  {
+    "label": "long_sentence",
+    "input": "The quick brown fox jumps over the lazy dog",
+    "ids": [
+      504,
+      2365,
+      6354,
+      16438,
+      27003,
+      690,
+      260,
+      23790,
+      2767
+    ]
+  },
+  {
+    "label": "double_quotes",
+    "input": "She said, \"hello\".",
+    "ids": [
+      8113,
+      1137,
+      28,
+      476,
+      28120,
+      2227
+    ]
+  },
+  {
+    "label": "code_let",
+    "input": "let x = 42;",
+    "ids": [
+      2016,
+      1792,
+      446,
+      216,
+      36,
+      34,
+      43
+    ]
+  },
+  {
+    "label": "url_http",
+    "input": "https://example.com",
+    "ids": [
+      4687,
+      1742,
+      7434,
+      30,
+      824
+    ]
+  },
+  {
+    "label": "decimal_pi",
+    "input": "3.14159",
+    "ids": [
+      35,
+      30,
+      33,
+      36,
+      33,
+      37,
+      41
+    ]
+  },
+  {
+    "label": "negative_int",
+    "input": "-42",
+    "ids": [
+      29,
+      36,
+      34
+    ]
+  },
+  {
+    "label": "scientific",
+    "input": "1.2e-10",
+    "ids": [
+      33,
+      30,
+      34,
+      85,
+      29,
+      33,
+      32
+    ]
+  },
+  {
+    "label": "brackets",
+    "input": "(a) [b] {c}",
+    "ids": [
+      24,
+      81,
+      25,
+      933,
+      82,
+      77,
+      1662,
+      83,
+      109
+    ]
+  },
+  {
+    "label": "markdown_heading",
+    "input": "# heading",
+    "ids": [
+      19,
+      14927
+    ]
+  },
+  {
+    "label": "a1b2",
+    "input": "a1 b2",
+    "ids": [
+      81,
+      33,
+      278,
+      34
+    ]
+  }
+]

@@ -224,40 +224,6 @@ fn smollm2_decode_multi_token_string() {
     assert_eq!(decoded, "Hello, world!");
 }
 
-// ─── A2c: encode parity with llama-tokenize on a known set ────────────────
-
-/// Expected tokenizations captured from `llama-tokenize -m
-/// smollm2-135m-f16.gguf --log-disable -p <input>`. Each row is
-/// (input, expected_ids). When this table changes, regen by
-/// running `llama-tokenize` and updating the constants.
-///
-/// Coverage:
-///   - classic "Hello, world!" with punctuation + leading-space word;
-///   - digit isolation ("abc123def");
-///   - multi-word letter runs + contractions + mixed punctuation;
-///   - multi-space collapses ("hello   world").
-const SMOLLM2_ENCODE_FIXTURES: &[(&str, &[u32])] = &[
-    ("Hello, world!", &[19556, 28, 905, 17]),
-    ("abc123def", &[25276, 33, 34, 35, 1604]),
-    ("The quick brown fox", &[504, 2365, 6354, 16438]),
-    ("hello   world", &[28120, 256, 905]),
-    ("don't worry", &[12420, 982, 5321]),
-    ("It's 3:14pm", &[1589, 506, 216, 35, 42, 33, 36, 11043]),
-    ("a1 b2", &[81, 33, 278, 34]),
-];
-
-#[test]
-fn smollm2_encode_matches_llama_tokenize() {
-    let Some(t) = tokenizer_or_skip(SMOLLM2) else {
-        return;
-    };
-    for (input, expected) in SMOLLM2_ENCODE_FIXTURES {
-        let got = t.encode(input).unwrap_or_else(|e| {
-            panic!("encode {input:?}: {e}");
-        });
-        assert_eq!(
-            got, *expected,
-            "\nencode({input:?})\n   got: {got:?}\n  want: {expected:?}",
-        );
-    }
-}
+// encode parity is exercised in depth by the 30-input fixture
+// in `tests/forward_tokenizer_encode_parity.rs`; we don't duplicate
+// it here.
