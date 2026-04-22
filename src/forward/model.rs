@@ -34,13 +34,17 @@ pub struct ForwardModel {
 }
 
 /// Reusable scratch for one forward call. One `BlockScratch` plus
-/// the `[seq, hidden]` activation buffer and a single-row
-/// post-norm + logits buffer.
+/// the `[seq, hidden]` activation buffer, a post-norm buffer sized
+/// for either the last position only (`forward`) or every position
+/// (`forward_all_logits`), and the logits buffer.
 pub struct ModelScratch {
-    pub x: Vec<f32>,            // [seq, hidden]
-    pub last_norm: Vec<f32>,    // [hidden]
-    pub logits: Vec<f32>,       // [vocab_size]
+    pub x: Vec<f32>,           // [batch, hidden]
+    pub norm: Vec<f32>,        // [batch, hidden] — per-position final norm
+    pub logits: Vec<f32>,      // [batch, vocab_size]
     pub block_scratch: BlockScratch,
+    batch: usize,
+    vocab_size: usize,
+    hidden_dim: usize,
 }
 
 impl ModelScratch {
@@ -57,9 +61,12 @@ impl ModelScratch {
         };
         Self {
             x: vec![0.0; batch * cfg.hidden_dim],
-            last_norm: vec![0.0; cfg.hidden_dim],
-            logits: vec![0.0; cfg.vocab_size],
+            norm: vec![0.0; batch * cfg.hidden_dim],
+            logits: vec![0.0; batch * cfg.vocab_size],
             block_scratch: BlockScratch::new(&block_cfg, batch, max_ctx),
+            batch,
+            vocab_size: cfg.vocab_size,
+            hidden_dim: cfg.hidden_dim,
         }
     }
 }
@@ -107,27 +114,94 @@ impl ForwardModel {
         cache: &mut KvCache,
         scratch: &'a mut ModelScratch,
     ) -> &'a [f32] {
+        let seq_len = self.forward_common(tokens, cache, scratch);
+        let hidden = self.config.hidden_dim;
+
+        // Final RMSNorm on the LAST position only.
+        let last_row_start = (seq_len - 1) * hidden;
+        let dst = &mut scratch.norm[..hidden];
+        dst.copy_from_slice(&scratch.x[last_row_start..last_row_start + hidden]);
+        rmsnorm(dst, &self.weights.final_norm, self.config.norm_eps);
+
+        // LM-head projection: logits = last_norm @ lm_head.T.
+        matmul(
+            &scratch.norm[..hidden],
+            &self.weights.lm_head,
+            &mut scratch.logits[..self.config.vocab_size],
+            1,
+            hidden,
+            self.config.vocab_size,
+        );
+
+        &scratch.logits[..self.config.vocab_size]
+    }
+
+    /// Same forward, but returns logits for *every* position in the
+    /// batch: `[seq_len, vocab_size]` row-major. Used by the
+    /// perplexity harness (A8) — next-token decoding only needs
+    /// [`Self::forward`]'s last-position output.
+    pub fn forward_all_logits<'a>(
+        &self,
+        tokens: &[u32],
+        cache: &mut KvCache,
+        scratch: &'a mut ModelScratch,
+    ) -> &'a [f32] {
+        let seq_len = self.forward_common(tokens, cache, scratch);
+        let hidden = self.config.hidden_dim;
+        let vocab = self.config.vocab_size;
+
+        // Final RMSNorm on every row.
+        for i in 0..seq_len {
+            let src = &scratch.x[i * hidden..(i + 1) * hidden];
+            let dst = &mut scratch.norm[i * hidden..(i + 1) * hidden];
+            dst.copy_from_slice(src);
+            rmsnorm(dst, &self.weights.final_norm, self.config.norm_eps);
+        }
+
+        // LM-head: logits[i, :] = norm[i, :] @ lm_head.T, for all i.
+        matmul(
+            &scratch.norm[..seq_len * hidden],
+            &self.weights.lm_head,
+            &mut scratch.logits[..seq_len * vocab],
+            seq_len,
+            hidden,
+            vocab,
+        );
+        &scratch.logits[..seq_len * vocab]
+    }
+
+    /// Embedding + N blocks. Common prefix of `forward` and
+    /// `forward_all_logits`. Returns `seq_len` for the caller.
+    fn forward_common(
+        &self,
+        tokens: &[u32],
+        cache: &mut KvCache,
+        scratch: &mut ModelScratch,
+    ) -> usize {
         let seq_len = tokens.len();
         assert!(seq_len > 0, "forward called with empty token batch");
+        assert!(
+            seq_len <= scratch.batch,
+            "forward: seq_len {} > scratch batch {}",
+            seq_len,
+            scratch.batch,
+        );
         assert_eq!(
             cache.layers.len(),
             self.config.n_layers,
             "cache layer count mismatch",
         );
+        assert_eq!(scratch.vocab_size, self.config.vocab_size);
+        assert_eq!(scratch.hidden_dim, self.config.hidden_dim);
         let hidden = self.config.hidden_dim;
-        assert!(
-            scratch.x.len() >= seq_len * hidden,
-            "scratch.x too small for batch of {seq_len}",
-        );
-        assert_eq!(scratch.logits.len(), self.config.vocab_size);
 
-        // 1. Embedding lookup.
+        // Embedding lookup.
         for (i, &tok) in tokens.iter().enumerate() {
             let row = &mut scratch.x[i * hidden..(i + 1) * hidden];
             embed(tok, &self.weights.embedding, hidden, row);
         }
 
-        // 2. Transformer blocks.
+        // Transformer blocks.
         let x_slice = &mut scratch.x[..seq_len * hidden];
         for (layer_idx, block) in self.weights.blocks.iter().enumerate() {
             let weights: BlockWeights = block.view();
@@ -141,29 +215,7 @@ impl ForwardModel {
             );
         }
 
-        // 3. Final RMSNorm on the LAST position only (that's the
-        //    token we'll project to logits).
-        let last_row_start = (seq_len - 1) * hidden;
-        scratch
-            .last_norm
-            .copy_from_slice(&scratch.x[last_row_start..last_row_start + hidden]);
-        rmsnorm(
-            &mut scratch.last_norm,
-            &self.weights.final_norm,
-            self.config.norm_eps,
-        );
-
-        // 4. LM-head projection: logits = last_norm @ lm_head.T.
-        matmul(
-            &scratch.last_norm,
-            &self.weights.lm_head,
-            &mut scratch.logits,
-            1,
-            hidden,
-            self.config.vocab_size,
-        );
-
-        &scratch.logits
+        seq_len
     }
 }
 

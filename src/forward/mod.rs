@@ -22,6 +22,7 @@ pub mod dequant;
 pub mod kv_cache;
 pub mod model;
 pub mod ops;
+pub mod perplexity;
 pub mod pre_tokenize;
 pub mod tokenizer;
 pub mod weights;
