@@ -8,6 +8,12 @@ blake3 = "1.5"
 clap = { version = "4.5.38", features = ["derive"] }
 crc32fast = "1.4.2"
 ctrlc = "3.4"
+# Unicode-aware regex with lookaround, used by the forward-pass
+# tokenizer's pre-tokenizer (gpt2-family splits use `(?!\S)` which
+# std-crate `regex` doesn't support). Small focused dep — chosen
+# over hand-rolling a unicode regex engine, which llama.cpp does
+# in ~1000 lines of C++ and which isn't scope for this project.
+fancy-regex = { version = "0.16", default-features = false, features = ["std"] }
 fuser = { version = "0.15", default-features = false }
 libc = "0.2"
 memmap2 = "0.9.5"

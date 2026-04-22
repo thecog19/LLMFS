@@ -24,9 +24,95 @@
 //! tokenizer.ggml.add_eos_token    bool
 //! ```
 
+use std::collections::HashMap;
+
 use thiserror::Error;
 
 use crate::gguf::parser::{GgufFile, GgufMetadataValue};
+
+// ─── GPT-2 byte ↔ unicode mapping (A2a) ───────────────────────────────────
+//
+// Byte-level BPE needs to turn arbitrary bytes into characters a BPE
+// merges table can key on. GPT-2's trick: reserve the printable-ASCII
+// and Latin-1 ranges for themselves, and remap the "awkward" bytes
+// (control chars, space, DEL, NBSP, etc.) to unused codepoints in the
+// 256.. range. Deterministic, reversible, documented in the original
+// OpenAI BPE code.
+//
+// Mapping rules:
+//   bytes 33..=126 (printable ASCII minus space) → char == byte
+//   bytes 161..=172                              → char == byte
+//   bytes 174..=255                              → char == byte
+//   all other bytes (0..=32, 127, 128..=160, 173) → char == 256 + offset,
+//     where offset counts the remaining bytes in ascending order.
+
+const fn byte_is_self_mapped(byte: u8) -> bool {
+    (byte >= 33 && byte <= 126) || (byte >= 161 && byte <= 172) || (byte >= 174)
+}
+
+/// The 68 "awkward" bytes that don't map to themselves.
+const REMAPPED_BYTES: [u8; 68] = {
+    let mut out = [0u8; 68];
+    let mut i = 0usize;
+    let mut b = 0u16;
+    while b < 256 {
+        let byte = b as u8;
+        if !byte_is_self_mapped(byte) {
+            out[i] = byte;
+            i += 1;
+        }
+        b += 1;
+    }
+    assert!(i == 68);
+    out
+};
+
+/// Map `byte → char` (u32 codepoint) as a compile-time table.
+const BYTE_TO_CHAR: [u32; 256] = {
+    let mut table = [0u32; 256];
+    let mut b = 0usize;
+    while b < 256 {
+        let byte = b as u8;
+        if byte_is_self_mapped(byte) {
+            table[b] = byte as u32;
+        } else {
+            // Find this byte's index in REMAPPED_BYTES and map to 256+idx.
+            let mut i = 0usize;
+            while i < REMAPPED_BYTES.len() {
+                if REMAPPED_BYTES[i] == byte {
+                    table[b] = 256 + i as u32;
+                    break;
+                }
+                i += 1;
+            }
+        }
+        b += 1;
+    }
+    table
+};
+
+/// Encode one byte as a single `char` per the GPT-2 mapping.
+/// Currently exercised only by unit tests; the encoder in A2c
+/// will be the first production caller.
+#[allow(dead_code)]
+pub(crate) fn byte_to_char(b: u8) -> char {
+    // SAFETY: all values in `BYTE_TO_CHAR` are valid Unicode scalars
+    // (< 0x110000 and not surrogates). Constructed at const time from
+    // a deterministic table; checked in `byte_to_char_round_trip`.
+    char::from_u32(BYTE_TO_CHAR[b as usize]).expect("BYTE_TO_CHAR invariant")
+}
+
+/// Inverse map: `char codepoint → byte`. Returns `None` when the
+/// codepoint isn't one of the 256 we emit.
+pub(crate) fn char_to_byte(c: char) -> Option<u8> {
+    let cp = c as u32;
+    for (b, mapped) in BYTE_TO_CHAR.iter().enumerate() {
+        if *mapped == cp {
+            return Some(b as u8);
+        }
+    }
+    None
+}
 
 /// Tokenizer family declared by `tokenizer.ggml.model`. Maps
 /// directly to the vocab-building + encode algorithm Milestone A2
@@ -185,6 +271,150 @@ pub enum TokenizerError {
         "malformed merge entry: expected two parts separated by a single ASCII space, got {0:?}"
     )]
     MalformedMerge(String),
+
+    #[error(
+        "unsupported tokenizer model `{0:?}` — Milestone A implements gpt2 only"
+    )]
+    UnsupportedModel(TokenizerModel),
+}
+
+// ─── Tokenizer (encode / decode handle) ───────────────────────────────────
+
+/// A configured tokenizer ready to `encode` / `decode`.
+///
+/// Wraps [`TokenizerConfig`] with the precomputed lookup tables
+/// encoders/decoders need (vocab-string → id, merge → priority rank).
+/// Build once per model load; reuse across calls.
+///
+/// Milestone A targets gpt2-family (byte-level BPE) tokenizers
+/// exclusively. Calling `Tokenizer::from_gguf` on a Llama /
+/// SentencePiece GGUF fails with `UnsupportedModel` — a future
+/// milestone handles that family.
+#[derive(Debug)]
+pub struct Tokenizer {
+    config: TokenizerConfig,
+    /// `vocab_map[token_str] = token_id`. Built from
+    /// `config.tokens` at load time. Owns its keys.
+    vocab_map: HashMap<String, u32>,
+    /// Merge rank: `merge_ranks[(left, right)] = position in the
+    /// merges list`. Lower rank = higher priority (applied first
+    /// in BPE). Unused in A2a; populated here so A2c doesn't have
+    /// to revisit load logic.
+    #[allow(dead_code)]
+    merge_ranks: HashMap<(String, String), u32>,
+}
+
+impl Tokenizer {
+    /// Build a Tokenizer from a GGUF file. Equivalent to
+    /// `Tokenizer::from_config(TokenizerConfig::from_gguf(gguf)?)`.
+    pub fn from_gguf(gguf: &GgufFile) -> Result<Self, TokenizerError> {
+        Self::from_config(TokenizerConfig::from_gguf(gguf)?)
+    }
+
+    /// Build a Tokenizer from an already-parsed config. Lets tests
+    /// drive the encoder/decoder with hand-crafted configs.
+    pub fn from_config(config: TokenizerConfig) -> Result<Self, TokenizerError> {
+        if config.model != TokenizerModel::Gpt2 {
+            return Err(TokenizerError::UnsupportedModel(config.model.clone()));
+        }
+
+        let mut vocab_map = HashMap::with_capacity(config.tokens.len());
+        for (id, token) in config.tokens.iter().enumerate() {
+            // If the vocab has duplicate tokens (shouldn't happen
+            // in practice), the lower id wins — matches llama.cpp.
+            vocab_map.entry(token.clone()).or_insert(id as u32);
+        }
+
+        let merge_ranks: HashMap<(String, String), u32> = config
+            .merges
+            .iter()
+            .enumerate()
+            .map(|(rank, (l, r))| ((l.clone(), r.clone()), rank as u32))
+            .collect();
+
+        Ok(Self {
+            config,
+            vocab_map,
+            merge_ranks,
+        })
+    }
+
+    /// The underlying config (for callers that need tokenizer
+    /// metadata — vocab size, special token IDs, etc.).
+    pub fn config(&self) -> &TokenizerConfig {
+        &self.config
+    }
+
+    /// Look up a token id by its surface form. Useful for tests
+    /// and for special-token dispatch.
+    pub fn token_id(&self, s: &str) -> Option<u32> {
+        self.vocab_map.get(s).copied()
+    }
+
+    /// Encode a string to a sequence of token ids.
+    ///
+    /// **A2a stub.** Returns `EncodeError::Unimplemented` for any
+    /// non-trivial input; wired through so the API shape is stable
+    /// while A2b (pre-tokenization) and A2c (BPE merges) fill in
+    /// the algorithm.
+    pub fn encode(&self, _text: &str) -> Result<Vec<u32>, EncodeError> {
+        Err(EncodeError::Unimplemented)
+    }
+
+    /// Decode a sequence of token ids back to a UTF-8 string.
+    ///
+    /// Walks the ids, looks up each token's surface form in the
+    /// vocab, concatenates the characters, maps each character
+    /// back to its source byte via the GPT-2 byte↔unicode table,
+    /// and decodes the resulting byte sequence as UTF-8.
+    pub fn decode(&self, ids: &[u32]) -> Result<String, DecodeError> {
+        let mut bytes = Vec::with_capacity(ids.len() * 2);
+        for &id in ids {
+            let idx = id as usize;
+            let token = self
+                .config
+                .tokens
+                .get(idx)
+                .ok_or(DecodeError::OutOfVocabulary(id))?;
+            for c in token.chars() {
+                let b = char_to_byte(c).ok_or(DecodeError::InvalidTokenChar {
+                    id,
+                    char: c,
+                })?;
+                bytes.push(b);
+            }
+        }
+        String::from_utf8(bytes).map_err(|e| DecodeError::InvalidUtf8 {
+            valid_up_to: e.utf8_error().valid_up_to(),
+        })
+    }
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum EncodeError {
+    #[error("encode is not yet implemented — pre-tokenizer and BPE merges land in A2b/A2c")]
+    Unimplemented,
+
+    /// A byte-level BPE encoder may see a pre-token whose
+    /// fully-merged form isn't in the vocabulary. Shouldn't
+    /// happen for well-formed vocabs (byte fallback guarantees
+    /// coverage) but surfaced explicitly for debuggability.
+    #[error("token sequence {merged:?} not in vocabulary")]
+    UnknownMerged { merged: String },
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum DecodeError {
+    #[error("token id {0} is past the end of the vocabulary")]
+    OutOfVocabulary(u32),
+
+    #[error(
+        "token {id} contains char {char:?} that isn't part of the GPT-2 byte↔unicode alphabet"
+    )]
+    InvalidTokenChar { id: u32, char: char },
+
+    #[error("decoded byte sequence is not valid UTF-8 (stopped at byte {valid_up_to})")]
+    InvalidUtf8 { valid_up_to: usize },
 }
 
 fn parse_merge(raw: &str) -> Result<(String, String), TokenizerError> {
@@ -315,5 +545,129 @@ mod tests {
             TokenizerModel::from_str("rwkv"),
             TokenizerModel::Other("rwkv".to_owned())
         );
+    }
+
+    // ─── A2a byte↔unicode table ────────────────────────────────────────
+
+    #[test]
+    fn remapped_bytes_has_68_entries_strictly_ascending() {
+        assert_eq!(REMAPPED_BYTES.len(), 68);
+        for w in REMAPPED_BYTES.windows(2) {
+            assert!(w[0] < w[1], "REMAPPED_BYTES must be strictly ascending");
+        }
+    }
+
+    #[test]
+    fn byte_to_char_self_mapped_ranges_are_identity() {
+        for b in 33u8..=126 {
+            assert_eq!(byte_to_char(b) as u32, b as u32);
+        }
+        for b in 161u8..=172 {
+            assert_eq!(byte_to_char(b) as u32, b as u32);
+        }
+        for b in 174u8..=255 {
+            assert_eq!(byte_to_char(b) as u32, b as u32);
+        }
+    }
+
+    #[test]
+    fn byte_to_char_remapped_bytes_land_in_256_range() {
+        // The 68 remapped bytes get codepoints 256..=323 in
+        // ascending order.
+        for (i, &b) in REMAPPED_BYTES.iter().enumerate() {
+            assert_eq!(byte_to_char(b) as u32, 256 + i as u32);
+        }
+    }
+
+    #[test]
+    fn byte_to_char_round_trip_covers_every_byte() {
+        for b in 0u8..=255 {
+            let c = byte_to_char(b);
+            assert_eq!(char_to_byte(c), Some(b), "byte {b} failed round-trip");
+        }
+    }
+
+    #[test]
+    fn byte_to_char_is_injective() {
+        // 256 distinct bytes → 256 distinct codepoints.
+        let mut seen = std::collections::HashSet::new();
+        for b in 0u8..=255 {
+            assert!(seen.insert(byte_to_char(b) as u32), "duplicate byte→char at {b}");
+        }
+    }
+
+    #[test]
+    fn char_to_byte_rejects_codepoints_outside_the_table() {
+        // Codepoints not in the table should return None.
+        assert_eq!(char_to_byte('\u{1F600}'), None); // emoji, not in table
+        assert_eq!(char_to_byte('\u{0020}'), None); // space itself (it's remapped to 256..)
+        assert_eq!(char_to_byte('\u{0080}'), None); // first high-control char (remapped)
+    }
+
+    // ─── A2a Tokenizer build + decode + encode stub ────────────────────
+
+    fn synth_gpt2_config() -> TokenizerConfig {
+        // Mini vocab: two single-byte tokens ("a", "!") and one
+        // merged pair ("a!"). Enough to exercise build + decode.
+        let tokens = vec!["a".to_owned(), "!".to_owned(), "a!".to_owned()];
+        TokenizerConfig {
+            model: TokenizerModel::Gpt2,
+            pre_tokenizer: Some("gpt2".to_owned()),
+            tokens,
+            scores: None,
+            token_types: vec![1, 1, 1],
+            merges: vec![("a".to_owned(), "!".to_owned())],
+            special: SpecialTokens::default(),
+        }
+    }
+
+    #[test]
+    fn tokenizer_build_rejects_non_gpt2() {
+        let mut cfg = synth_gpt2_config();
+        cfg.model = TokenizerModel::Llama;
+        let err = Tokenizer::from_config(cfg).unwrap_err();
+        assert!(matches!(err, TokenizerError::UnsupportedModel(_)));
+    }
+
+    #[test]
+    fn tokenizer_build_populates_vocab_map() {
+        let t = Tokenizer::from_config(synth_gpt2_config()).unwrap();
+        assert_eq!(t.token_id("a"), Some(0));
+        assert_eq!(t.token_id("!"), Some(1));
+        assert_eq!(t.token_id("a!"), Some(2));
+        assert_eq!(t.token_id("missing"), None);
+    }
+
+    #[test]
+    fn decode_single_tokens_round_trips_bytes() {
+        let t = Tokenizer::from_config(synth_gpt2_config()).unwrap();
+        assert_eq!(t.decode(&[0]).unwrap(), "a");
+        assert_eq!(t.decode(&[1]).unwrap(), "!");
+        assert_eq!(t.decode(&[2]).unwrap(), "a!");
+        assert_eq!(t.decode(&[0, 1]).unwrap(), "a!");
+    }
+
+    #[test]
+    fn decode_rejects_out_of_vocab_id() {
+        let t = Tokenizer::from_config(synth_gpt2_config()).unwrap();
+        assert_eq!(t.decode(&[999]), Err(DecodeError::OutOfVocabulary(999)));
+    }
+
+    #[test]
+    fn decode_rejects_token_with_char_outside_byte_alphabet() {
+        // Inject an emoji into a vocab — not a valid byte-level
+        // BPE token. Decoder must report which token + char.
+        let mut cfg = synth_gpt2_config();
+        cfg.tokens.push("🤖".to_owned());
+        cfg.token_types.push(1);
+        let t = Tokenizer::from_config(cfg).unwrap();
+        let err = t.decode(&[3]).unwrap_err();
+        assert!(matches!(err, DecodeError::InvalidTokenChar { id: 3, .. }));
+    }
+
+    #[test]
+    fn encode_is_stubbed_in_a2a() {
+        let t = Tokenizer::from_config(synth_gpt2_config()).unwrap();
+        assert_eq!(t.encode("anything"), Err(EncodeError::Unimplemented));
     }
 }
