@@ -16,6 +16,7 @@
 //! See `/home/suero/.claude/plans/lets-do-4-tool-harmonic-glade.md`
 //! for the phased build.
 
+pub mod block;
 pub mod dequant;
 pub mod ops;
 pub mod pre_tokenize;
