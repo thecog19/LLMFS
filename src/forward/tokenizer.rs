@@ -28,6 +28,7 @@ use std::collections::HashMap;
 
 use thiserror::Error;
 
+use crate::forward::pre_tokenize::{PreTokenizer, PreTokenizerError};
 use crate::gguf::parser::{GgufFile, GgufMetadataValue};
 
 // ─── GPT-2 byte ↔ unicode mapping (A2a) ───────────────────────────────────
@@ -112,6 +113,84 @@ pub(crate) fn char_to_byte(c: char) -> Option<u8> {
         }
     }
     None
+}
+
+/// Byte-level encode a pre-token into a sequence of single-char
+/// `String` pieces. Each byte of the input maps to one `char` via
+/// [`byte_to_char`]; each char is stored as its own `String` so
+/// subsequent BPE merges can concatenate them.
+///
+/// Pushes into `out` (caller-provided so callers can reuse the
+/// buffer across pre-tokens). The byte count of `text` equals
+/// `text.len()` in UTF-8 terms, which is what this iterates over.
+fn byte_level_encode_into(text: &str, out: &mut Vec<String>) {
+    out.reserve(text.len());
+    for byte in text.as_bytes() {
+        let c = byte_to_char(*byte);
+        let mut s = String::with_capacity(c.len_utf8());
+        s.push(c);
+        out.push(s);
+    }
+}
+
+/// GPT-2-style BPE merge: given a sequence of strings (initially
+/// single chars), repeatedly find the adjacent pair with the
+/// lowest merge rank in `ranks`, then merge every left-to-right
+/// occurrence of that exact pair in one pass. Stops when no
+/// adjacent pair has a known rank.
+///
+/// Mutates `tokens` in place. Result length is `≤ input length`.
+fn bpe_merge_inplace(tokens: &mut Vec<String>, ranks: &HashMap<(String, String), u32>) {
+    if tokens.len() < 2 {
+        return;
+    }
+
+    loop {
+        // Find the pair with the lowest merge rank across the
+        // current sequence. Ties are broken by leftmost occurrence
+        // (matches GPT-2 reference behavior).
+        let mut best_rank = u32::MAX;
+        let mut best_pair: Option<(String, String)> = None;
+        for i in 0..tokens.len() - 1 {
+            // HashMap keyed on (String, String) can't be queried
+            // with &str pairs without allocating a tuple; this
+            // lookup clones both pieces. For calibration the
+            // total cost is small (pre-tokens are short, merge
+            // runs are few), and a faster map shape (e.g.
+            // pre-interning into u32 ids with a HashMap<u64, u32>)
+            // is an optimization we don't need for correctness.
+            let key = (tokens[i].clone(), tokens[i + 1].clone());
+            if let Some(&r) = ranks.get(&key)
+                && r < best_rank
+            {
+                best_rank = r;
+                best_pair = Some(key);
+            }
+        }
+
+        let Some(pair) = best_pair else {
+            return;
+        };
+
+        // Merge every left-to-right occurrence of `pair` in a
+        // single pass. For overlapping runs like ("a", "a", "a")
+        // with pair ("a", "a"), left-to-right yields ["aa", "a"].
+        let mut new_tokens = Vec::with_capacity(tokens.len());
+        let mut i = 0;
+        while i < tokens.len() {
+            if i + 1 < tokens.len() && tokens[i] == pair.0 && tokens[i + 1] == pair.1 {
+                let mut merged = String::with_capacity(tokens[i].len() + tokens[i + 1].len());
+                merged.push_str(&tokens[i]);
+                merged.push_str(&tokens[i + 1]);
+                new_tokens.push(merged);
+                i += 2;
+            } else {
+                new_tokens.push(std::mem::take(&mut tokens[i]));
+                i += 1;
+            }
+        }
+        *tokens = new_tokens;
+    }
 }
 
 /// Tokenizer family declared by `tokenizer.ggml.model`. Maps
@@ -252,7 +331,7 @@ impl TokenizerConfig {
     }
 }
 
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Debug, Error)]
 pub enum TokenizerError {
     #[error("required GGUF metadata key `{0}` is missing")]
     MissingKey(&'static str),
@@ -276,6 +355,9 @@ pub enum TokenizerError {
         "unsupported tokenizer model `{0:?}` — Milestone A implements gpt2 only"
     )]
     UnsupportedModel(TokenizerModel),
+
+    #[error("pre-tokenizer: {0}")]
+    PreTokenizer(#[from] PreTokenizerError),
 }
 
 // ─── Tokenizer (encode / decode handle) ───────────────────────────────────
@@ -298,10 +380,12 @@ pub struct Tokenizer {
     vocab_map: HashMap<String, u32>,
     /// Merge rank: `merge_ranks[(left, right)] = position in the
     /// merges list`. Lower rank = higher priority (applied first
-    /// in BPE). Unused in A2a; populated here so A2c doesn't have
-    /// to revisit load logic.
-    #[allow(dead_code)]
+    /// in BPE).
     merge_ranks: HashMap<(String, String), u32>,
+    /// Pre-tokenizer built from `config.pre_tokenizer`. Compiled
+    /// once per Tokenizer; regex state is thread-safe so this can
+    /// be reused across encode calls.
+    pre_tokenizer: PreTokenizer,
 }
 
 impl Tokenizer {
@@ -332,10 +416,17 @@ impl Tokenizer {
             .map(|(rank, (l, r))| ((l.clone(), r.clone()), rank as u32))
             .collect();
 
+        let pre_tokenizer_variant = config.pre_tokenizer.as_deref().ok_or(
+            TokenizerError::MissingKey("tokenizer.ggml.pre"),
+        )?;
+        let pre_tokenizer = PreTokenizer::new(pre_tokenizer_variant)
+            .map_err(TokenizerError::PreTokenizer)?;
+
         Ok(Self {
             config,
             vocab_map,
             merge_ranks,
+            pre_tokenizer,
         })
     }
 
@@ -353,12 +444,62 @@ impl Tokenizer {
 
     /// Encode a string to a sequence of token ids.
     ///
-    /// **A2a stub.** Returns `EncodeError::Unimplemented` for any
-    /// non-trivial input; wired through so the API shape is stable
-    /// while A2b (pre-tokenization) and A2c (BPE merges) fill in
-    /// the algorithm.
-    pub fn encode(&self, _text: &str) -> Result<Vec<u32>, EncodeError> {
-        Err(EncodeError::Unimplemented)
+    /// Pipeline:
+    ///   1. Pre-tokenize the input into regions per the
+    ///      `tokenizer.ggml.pre` variant (A2b).
+    ///   2. Byte-level-encode each region — every byte becomes
+    ///      a single `char` per the GPT-2 byte↔unicode map (A2a).
+    ///   3. BPE-merge the char sequence: greedily find the pair
+    ///      of adjacent tokens with the lowest merge rank, merge
+    ///      every occurrence left-to-right, repeat.
+    ///   4. Look each merged string up in the vocab.
+    ///   5. Prepend BOS / append EOS per `special.add_bos` /
+    ///      `add_eos`.
+    ///
+    /// Errors if a merged string isn't in the vocab. For a
+    /// well-formed byte-level BPE tokenizer this shouldn't happen
+    /// — single-byte fallback guarantees coverage — but we surface
+    /// it explicitly because it would otherwise produce silently
+    /// wrong token ids.
+    pub fn encode(&self, text: &str) -> Result<Vec<u32>, EncodeError> {
+        let regions = self
+            .pre_tokenizer
+            .split(text)
+            .map_err(|e| EncodeError::PreTokenizer(Box::new(e)))?;
+
+        let mut ids: Vec<u32> = Vec::new();
+
+        if self.config.special.add_bos
+            && let Some(bos) = self.config.special.bos
+        {
+            ids.push(bos);
+        }
+
+        // Reused per-region to avoid allocating a fresh Vec.
+        let mut pieces: Vec<String> = Vec::new();
+        for region in regions {
+            pieces.clear();
+            byte_level_encode_into(region, &mut pieces);
+            bpe_merge_inplace(&mut pieces, &self.merge_ranks);
+            for piece in pieces.iter() {
+                let id = self
+                    .vocab_map
+                    .get(piece)
+                    .copied()
+                    .ok_or_else(|| EncodeError::UnknownMerged {
+                        merged: piece.clone(),
+                    })?;
+                ids.push(id);
+            }
+        }
+
+        if self.config.special.add_eos
+            && let Some(eos) = self.config.special.eos
+        {
+            ids.push(eos);
+        }
+
+        Ok(ids)
     }
 
     /// Decode a sequence of token ids back to a UTF-8 string.
@@ -390,17 +531,17 @@ impl Tokenizer {
     }
 }
 
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Debug, Error)]
 pub enum EncodeError {
-    #[error("encode is not yet implemented — pre-tokenizer and BPE merges land in A2b/A2c")]
-    Unimplemented,
-
     /// A byte-level BPE encoder may see a pre-token whose
     /// fully-merged form isn't in the vocabulary. Shouldn't
     /// happen for well-formed vocabs (byte fallback guarantees
     /// coverage) but surfaced explicitly for debuggability.
     #[error("token sequence {merged:?} not in vocabulary")]
     UnknownMerged { merged: String },
+
+    #[error("pre-tokenizer: {0}")]
+    PreTokenizer(Box<PreTokenizerError>),
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -607,16 +748,24 @@ mod tests {
     // ─── A2a Tokenizer build + decode + encode stub ────────────────────
 
     fn synth_gpt2_config() -> TokenizerConfig {
-        // Mini vocab: two single-byte tokens ("a", "!") and one
-        // merged pair ("a!"). Enough to exercise build + decode.
-        let tokens = vec!["a".to_owned(), "!".to_owned(), "a!".to_owned()];
+        // Mini vocab: three single-byte letter tokens + one
+        // merged pair. Two letters in the same pre-token exercise
+        // BPE — letters stay together through pre-tokenization,
+        // unlike letter+punct which get split into separate
+        // regions.
+        let tokens = vec![
+            "a".to_owned(),
+            "b".to_owned(),
+            "c".to_owned(),
+            "ab".to_owned(),
+        ];
         TokenizerConfig {
             model: TokenizerModel::Gpt2,
-            pre_tokenizer: Some("gpt2".to_owned()),
+            pre_tokenizer: Some("smollm".to_owned()),
             tokens,
             scores: None,
-            token_types: vec![1, 1, 1],
-            merges: vec![("a".to_owned(), "!".to_owned())],
+            token_types: vec![1, 1, 1, 1],
+            merges: vec![("a".to_owned(), "b".to_owned())],
             special: SpecialTokens::default(),
         }
     }
@@ -630,11 +779,23 @@ mod tests {
     }
 
     #[test]
+    fn tokenizer_build_requires_pre_tokenizer_key() {
+        let mut cfg = synth_gpt2_config();
+        cfg.pre_tokenizer = None;
+        let err = Tokenizer::from_config(cfg).unwrap_err();
+        assert!(
+            matches!(err, TokenizerError::MissingKey("tokenizer.ggml.pre")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
     fn tokenizer_build_populates_vocab_map() {
         let t = Tokenizer::from_config(synth_gpt2_config()).unwrap();
         assert_eq!(t.token_id("a"), Some(0));
-        assert_eq!(t.token_id("!"), Some(1));
-        assert_eq!(t.token_id("a!"), Some(2));
+        assert_eq!(t.token_id("b"), Some(1));
+        assert_eq!(t.token_id("c"), Some(2));
+        assert_eq!(t.token_id("ab"), Some(3));
         assert_eq!(t.token_id("missing"), None);
     }
 
@@ -642,9 +803,10 @@ mod tests {
     fn decode_single_tokens_round_trips_bytes() {
         let t = Tokenizer::from_config(synth_gpt2_config()).unwrap();
         assert_eq!(t.decode(&[0]).unwrap(), "a");
-        assert_eq!(t.decode(&[1]).unwrap(), "!");
-        assert_eq!(t.decode(&[2]).unwrap(), "a!");
-        assert_eq!(t.decode(&[0, 1]).unwrap(), "a!");
+        assert_eq!(t.decode(&[1]).unwrap(), "b");
+        assert_eq!(t.decode(&[2]).unwrap(), "c");
+        assert_eq!(t.decode(&[3]).unwrap(), "ab");
+        assert_eq!(t.decode(&[0, 1]).unwrap(), "ab");
     }
 
     #[test]
@@ -661,13 +823,119 @@ mod tests {
         cfg.tokens.push("🤖".to_owned());
         cfg.token_types.push(1);
         let t = Tokenizer::from_config(cfg).unwrap();
-        let err = t.decode(&[3]).unwrap_err();
-        assert!(matches!(err, DecodeError::InvalidTokenChar { id: 3, .. }));
+        let err = t.decode(&[4]).unwrap_err();
+        assert!(matches!(err, DecodeError::InvalidTokenChar { id: 4, .. }));
     }
 
     #[test]
-    fn encode_is_stubbed_in_a2a() {
+    fn encode_synth_config_applies_a_single_merge() {
+        // Vocab: ["a","b","c","ab"]. Merge: ("a","b") → "ab".
+        // Input "ab" pre-tokenizes to ["ab"] (one letter run),
+        // byte-level-encodes to ["a","b"], BPE merges once into
+        // ["ab"], vocab-lookups to [3].
         let t = Tokenizer::from_config(synth_gpt2_config()).unwrap();
-        assert_eq!(t.encode("anything"), Err(EncodeError::Unimplemented));
+        assert_eq!(t.encode("ab").unwrap(), vec![3]);
+    }
+
+    #[test]
+    fn encode_falls_back_to_single_chars_when_no_merge_fires() {
+        // Input "ac" pre-tokens to ["ac"] but no merge rule for
+        // ("a","c") exists, so BPE leaves it as ["a","c"] → [0,2].
+        let t = Tokenizer::from_config(synth_gpt2_config()).unwrap();
+        assert_eq!(t.encode("ac").unwrap(), vec![0, 2]);
+    }
+
+    #[test]
+    fn encode_reports_unknown_merged_when_vocab_is_incomplete() {
+        // Char "x" isn't in the synth vocab.
+        let t = Tokenizer::from_config(synth_gpt2_config()).unwrap();
+        let err = t.encode("x").unwrap_err();
+        assert!(matches!(err, EncodeError::UnknownMerged { .. }));
+    }
+
+    #[test]
+    fn encode_prepends_bos_when_add_bos_set() {
+        let mut cfg = synth_gpt2_config();
+        cfg.special.bos = Some(42);
+        cfg.special.add_bos = true;
+        let t = Tokenizer::from_config(cfg).unwrap();
+        assert_eq!(t.encode("ab").unwrap(), vec![42, 3]);
+    }
+
+    #[test]
+    fn encode_appends_eos_when_add_eos_set() {
+        let mut cfg = synth_gpt2_config();
+        cfg.special.eos = Some(77);
+        cfg.special.add_eos = true;
+        let t = Tokenizer::from_config(cfg).unwrap();
+        assert_eq!(t.encode("ab").unwrap(), vec![3, 77]);
+    }
+
+    // ─── BPE merge primitive ──────────────────────────────────────────
+
+    fn s(x: &str) -> String {
+        x.to_owned()
+    }
+
+    fn ranks(pairs: &[(&str, &str)]) -> HashMap<(String, String), u32> {
+        pairs
+            .iter()
+            .enumerate()
+            .map(|(i, (l, r))| ((s(l), s(r)), i as u32))
+            .collect()
+    }
+
+    #[test]
+    fn bpe_merge_no_applicable_rule_leaves_tokens_alone() {
+        let mut t = vec![s("a"), s("b"), s("c")];
+        let r = ranks(&[("x", "y")]);
+        bpe_merge_inplace(&mut t, &r);
+        assert_eq!(t, vec![s("a"), s("b"), s("c")]);
+    }
+
+    #[test]
+    fn bpe_merge_applies_highest_priority_first() {
+        // Input: a b c. Rules: ("b","c")=0, ("a","b")=1.
+        // Best rank is ("b","c"); pass 1 merges → ["a", "bc"].
+        // Now no pair in ranks matches — "a"+"bc" isn't a rule.
+        // Result: ["a", "bc"].
+        let mut t = vec![s("a"), s("b"), s("c")];
+        let r = ranks(&[("b", "c"), ("a", "b")]);
+        bpe_merge_inplace(&mut t, &r);
+        assert_eq!(t, vec![s("a"), s("bc")]);
+    }
+
+    #[test]
+    fn bpe_merge_chains_merges_across_passes() {
+        // Input: a b c. Rules: ("a","b")=0, ("ab","c")=1.
+        // Pass 1: ("a","b") is only rank-0 pair → ["ab", "c"].
+        // Pass 2: ("ab","c") fires → ["abc"].
+        let mut t = vec![s("a"), s("b"), s("c")];
+        let r = ranks(&[("a", "b"), ("ab", "c")]);
+        bpe_merge_inplace(&mut t, &r);
+        assert_eq!(t, vec![s("abc")]);
+    }
+
+    #[test]
+    fn bpe_merge_overlapping_run_goes_left_to_right() {
+        // Input: a a a. Rule: ("a","a")=0. Left-to-right merges
+        // positions (0,1) first, leaving "aa" and "a" — no
+        // further merges. Canonical GPT-2 behavior.
+        let mut t = vec![s("a"), s("a"), s("a")];
+        let r = ranks(&[("a", "a")]);
+        bpe_merge_inplace(&mut t, &r);
+        assert_eq!(t, vec![s("aa"), s("a")]);
+    }
+
+    #[test]
+    fn bpe_merge_empty_or_single_input_is_noop() {
+        let r: HashMap<(String, String), u32> = HashMap::new();
+        let mut empty: Vec<String> = Vec::new();
+        bpe_merge_inplace(&mut empty, &r);
+        assert!(empty.is_empty());
+
+        let mut single = vec![s("x")];
+        bpe_merge_inplace(&mut single, &r);
+        assert_eq!(single, vec![s("x")]);
     }
 }
