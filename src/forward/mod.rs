@@ -19,6 +19,8 @@
 pub mod block;
 pub mod config;
 pub mod dequant;
+pub mod kv_cache;
+pub mod model;
 pub mod ops;
 pub mod pre_tokenize;
 pub mod tokenizer;

@@ -326,6 +326,7 @@ mod tests {
         // that `block::forward_block` will accept without panicking
         // on shape assertions.
         use crate::forward::block::{BlockConfig, BlockScratch, forward_block};
+        use crate::forward::kv_cache::LayerKvCache;
 
         if !Path::new(SMOLLM2).exists() {
             eprintln!("skipping: {SMOLLM2} not present");
@@ -346,10 +347,12 @@ mod tests {
             norm_eps: cfg.norm_eps,
         };
         let seq = 2;
-        let mut scratch = BlockScratch::new(&block_cfg, seq);
+        let max_ctx = 8;
+        let mut scratch = BlockScratch::new(&block_cfg, seq, max_ctx);
+        let mut cache = LayerKvCache::new(max_ctx, block_cfg.kv_width());
         let mut x = vec![0.01_f32; seq * cfg.hidden_dim];
         let view = weights.blocks[0].view();
-        forward_block(&mut x, &block_cfg, &view, seq, 0, &mut scratch);
+        forward_block(&mut x, &block_cfg, &view, seq, &mut cache, &mut scratch);
         // Just verify the output is finite — the correctness gate
         // is A8. Running one real block against real weights checks
         // every shape lines up.
