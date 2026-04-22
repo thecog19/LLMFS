@@ -8,8 +8,8 @@ fn repo_file(path: &str) -> PathBuf {
 fn readme_get_example_uses_output_flag() {
     let readme = std::fs::read_to_string(repo_file("README.md")).expect("read README.md");
     assert!(
-        readme.contains("./target/release/llmdb get model.gguf notes.txt --output ./notes.out"),
-        "README quickstart should match the current CLI get syntax"
+        readme.contains("./target/release/llmdb get model.gguf /notes.txt --output ./notes.out"),
+        "README quickstart should match the current V2 CLI get syntax"
     );
 }
 

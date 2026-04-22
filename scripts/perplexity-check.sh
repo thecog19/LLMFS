@@ -1,20 +1,19 @@
 #!/usr/bin/env bash
-# V2 inference-damage validation. For a given GGUF cover, measures
+# Inference-damage validation. For a given GGUF cover, measures
 # perplexity at three stages and emits CSV:
 #
 #   1. pristine     — the unmodified cover straight from disk.
-#   2. post_init    — after `llmdb v2-init` (writes anchor + empty
+#   2. post_init    — after `llmdb init` (writes anchor + empty
 #                     root directory + empty dirty bitmap; no user
 #                     data).
-#   3. post_write   — after mounting the V2 filesystem, writing
+#   3. post_write   — after mounting the filesystem, writing
 #                     ${PAYLOAD_BYTES} bytes of deterministic
 #                     pseudo-random data into a single file, and
 #                     unmounting (committing the cover back to disk).
 #
-# DESIGN-NEW §15 rebuilt V2 around anchor + inode + CoW so that
-# Q8_0 covers don't collapse on `init` — the V1-era failure mode
-# recorded in the memory file. This script is the headline check
-# for that claim.
+# DESIGN-NEW §15's anchor + inode + CoW design keeps Q8_0 covers
+# from collapsing on `init` — the V1-era failure mode recorded in
+# the memory file. This script is the headline check for that claim.
 #
 # Deps:
 #   llama-perplexity  — env LLMDB_LLAMA_PERPLEXITY, or common paths
@@ -23,10 +22,10 @@
 #   fusermount3       — unmount helper
 #
 # Usage:
-#   scripts/v2-perplexity-check.sh <model.gguf>
-#                                  [--payload BYTES] [--chunks N]
-#                                  [--ctx N] [--out-csv PATH]
-#                                  [--keep-tmp]
+#   scripts/perplexity-check.sh <model.gguf>
+#                               [--payload BYTES] [--chunks N]
+#                               [--ctx N] [--out-csv PATH]
+#                               [--keep-tmp]
 
 set -euo pipefail
 
@@ -193,14 +192,14 @@ echo "=== stage 1: pristine ===" >&2
 PRISTINE_PPL=$(measure_ppl "$MODEL_ABS" "pristine")
 emit "$MODEL_NAME,pristine,0,$PRISTINE_PPL,$CHUNKS,$CTX"
 
-# (2) post-init: copy → v2-init → measure
+# (2) post-init: copy → init → measure
 WORK_MODEL="$WORK/model-v2.gguf"
 cp --no-preserve=mode,ownership "$MODEL_ABS" "$WORK_MODEL"
 chmod u+w "$WORK_MODEL"
 
-echo "=== stage 2: v2-init ===" >&2
-"$LLMDB" v2-init "$WORK_MODEL" > "$WORK/v2-init.log"
-cat "$WORK/v2-init.log" >&2
+echo "=== stage 2: init ===" >&2
+"$LLMDB" init "$WORK_MODEL" > "$WORK/init.log"
+cat "$WORK/init.log" >&2
 
 POSTINIT_PPL=$(measure_ppl "$WORK_MODEL" "post_init")
 emit "$MODEL_NAME,post_init,0,$POSTINIT_PPL,$CHUNKS,$CTX"
@@ -212,11 +211,11 @@ PAYLOAD="$WORK/payload.bin"
 gen_bytes "$PAYLOAD" "$PAYLOAD_BYTES"
 
 echo "=== stage 3: writing ${PAYLOAD_BYTES} bytes via FUSE ===" >&2
-"$LLMDB" v2-mount "$WORK_MODEL" "$MNT" > "$WORK/v2-mount.log" 2>&1 &
+"$LLMDB" mount "$WORK_MODEL" "$MNT" > "$WORK/mount.log" 2>&1 &
 MOUNT_PID=$!
 if ! wait_for_mount "$MNT"; then
     kill "$MOUNT_PID" 2>/dev/null || true
-    cat "$WORK/v2-mount.log" >&2
+    cat "$WORK/mount.log" >&2
     exit 5
 fi
 
@@ -232,7 +231,7 @@ fi
 echo "--- unmounting ---" >&2
 "$LLMDB" unmount "$MNT"
 wait "$MOUNT_PID" || true
-cat "$WORK/v2-mount.log" >&2
+cat "$WORK/mount.log" >&2
 
 POSTWRITE_PPL=$(measure_ppl "$WORK_MODEL" "post_write")
 emit "$MODEL_NAME,post_write,$PAYLOAD_BYTES,$POSTWRITE_PPL,$CHUNKS,$CTX"
