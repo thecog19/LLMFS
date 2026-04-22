@@ -290,15 +290,19 @@ impl Filesystem {
         allocator.reserve_weights(unique_weights(&anchor_placement))?;
 
         let super_root_ptr = anchor_outcome.active.super_root;
+        // The super-root chunk may be v1 (100B) or v2 (116B). Size
+        // the read to the pointer's stored length so either lands.
+        let super_root_chunk_len =
+            ((super_root_ptr.length_in_bits as usize) / 8).min(SUPER_ROOT_BYTES);
         let mut super_root_bytes = [0u8; SUPER_ROOT_BYTES];
         read_chunk(
             cover.bytes(),
             &map,
             super_root_ptr,
             0,
-            &mut super_root_bytes,
+            &mut super_root_bytes[..super_root_chunk_len],
         )?;
-        let super_root = SuperRoot::decode(&super_root_bytes)?;
+        let super_root = SuperRoot::decode(&super_root_bytes[..super_root_chunk_len])?;
 
         if super_root.generation != anchor_outcome.active.generation {
             return Err(FsError::GenerationMismatch {

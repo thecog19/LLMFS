@@ -3,11 +3,11 @@
 //! The super-root is a persistent record that the anchor points at.
 //! It carries pointers to every other V2 metadata structure (root
 //! directory inode, dedup index, dirty bitmap, free-run state,
-//! ceiling-magnitude bucket summary) plus a generation counter
-//! mirrored from the anchor.
+//! ceiling-magnitude bucket summary, salience inode) plus a
+//! generation counter mirrored from the anchor.
 //!
-//! Tests:
-//! 1. Size & layout: 100 bytes / 800 bits; byte offsets match spec.
+//! Tests (v2 layout, 116 bytes):
+//! 1. Size & layout: 116 bytes / 928 bits; byte offsets match spec.
 //! 2. Round-trip with all-null pointers (the EMPTY shape).
 //! 3. Round-trip with populated pointers + non-zero generation.
 //! 4. CRC validates — a flipped content byte makes decode fail.
@@ -15,6 +15,10 @@
 //! 6. Unsupported version → UnsupportedVersion error.
 //! 7. Truncated buffer → Truncated error.
 //! 8. Little-endian byte ordering spot-check.
+//!
+//! v1 backward-compat behavior lives next to the struct (see the
+//! unit tests in `src/v2/super_root.rs`); these integration tests
+//! exercise the v2-writer path that every mount now produces.
 
 use llmdb::v2::pointer::Pointer;
 use llmdb::v2::super_root::{SUPER_ROOT_BYTES, SuperRoot, SuperRootError};
@@ -30,8 +34,8 @@ fn sample_ptr(seed: u64) -> Pointer {
 }
 
 #[test]
-fn size_is_one_hundred_bytes() {
-    assert_eq!(SUPER_ROOT_BYTES, 100);
+fn size_is_one_hundred_sixteen_bytes() {
+    assert_eq!(SUPER_ROOT_BYTES, 116);
 }
 
 #[test]
@@ -50,6 +54,7 @@ fn populated_round_trip() {
         dirty_bitmap_inode: sample_ptr(3),
         free_run_state_inode: sample_ptr(4),
         ceiling_summary_inode: sample_ptr(5),
+        salience_inode: sample_ptr(6),
         generation: 42,
     };
     let bytes = sr.encode();
@@ -82,8 +87,9 @@ fn decode_detects_corruption_in_generation() {
         ..SuperRoot::EMPTY
     };
     let mut bytes = sr.encode();
-    // Flip a bit in the generation field (bytes 88..96).
-    bytes[88] ^= 0x01;
+    // Flip a bit in the generation field. v2 layout: generation
+    // at 104..112.
+    bytes[104] ^= 0x01;
     matches!(
         SuperRoot::decode(&bytes),
         Err(SuperRootError::BadChecksum { .. })
@@ -138,19 +144,19 @@ fn layout_magic_version_pointers() {
 
     // Magic b"V2SR" at offset 0.
     assert_eq!(&bytes[0..4], b"V2SR");
-    // Version = 1 at offset 4.
-    assert_eq!(bytes[4], 1);
+    // Version = 2 at offset 4 (B2 bumped it from 1 when
+    // salience_inode was added).
+    assert_eq!(bytes[4], 2);
     // Reserved at 5..8 is zero.
     assert_eq!(&bytes[5..8], &[0, 0, 0]);
     // root_dir_inode at offset 8..24 (16 bytes). First 2 bytes = slot LE.
     assert_eq!(&bytes[8..10], &[0x02, 0x01]);
-    // generation at offset 88..96 LE.
+    // v2 layout: salience_inode occupies 88..104, generation
+    // shifts to 104..112, crc32 to 112..116.
     assert_eq!(
-        &bytes[88..96],
+        &bytes[104..112],
         &[0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01],
     );
-    // crc32 at offset 96..100.
-    // (specific value depends on CRC32 of the first 96 bytes — just check it's nonzero)
-    let crc = u32::from_le_bytes(bytes[96..100].try_into().unwrap());
+    let crc = u32::from_le_bytes(bytes[112..116].try_into().unwrap());
     assert_ne!(crc, 0);
 }
