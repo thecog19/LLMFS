@@ -19,7 +19,9 @@ use std::path::Path;
 
 use thiserror::Error;
 
-use crate::forward::block::{BlockConfig, BlockScratch, BlockWeights, forward_block};
+use crate::forward::block::{
+    BlockConfig, BlockObserver, BlockScratch, BlockWeights, NoopObserver, forward_block,
+};
 use crate::forward::config::{ConfigError, LlamaConfig};
 use crate::forward::kv_cache::KvCache;
 use crate::forward::ops::{embed, matmul, rmsnorm};
@@ -146,7 +148,7 @@ impl ForwardModel {
         cache: &mut KvCache,
         scratch: &'a mut ModelScratch,
     ) -> &'a [f32] {
-        let seq_len = self.forward_common(tokens, cache, scratch);
+        let seq_len = self.forward_common(tokens, cache, scratch, &mut NoopObserver);
         let hidden = self.config.hidden_dim;
 
         // Final RMSNorm on the LAST position only.
@@ -178,7 +180,20 @@ impl ForwardModel {
         cache: &mut KvCache,
         scratch: &'a mut ModelScratch,
     ) -> &'a [f32] {
-        let seq_len = self.forward_common(tokens, cache, scratch);
+        self.forward_all_logits_with_observer(tokens, cache, scratch, &mut NoopObserver)
+    }
+
+    /// Same as [`Self::forward_all_logits`], but routes every
+    /// matmul-input site through `observer`. Used by the AWQ
+    /// collector during calibration (see [`crate::forward::awq`]).
+    pub fn forward_all_logits_with_observer<'a>(
+        &self,
+        tokens: &[u32],
+        cache: &mut KvCache,
+        scratch: &'a mut ModelScratch,
+        observer: &mut dyn BlockObserver,
+    ) -> &'a [f32] {
+        let seq_len = self.forward_common(tokens, cache, scratch, observer);
         let hidden = self.config.hidden_dim;
         let vocab = self.config.vocab_size;
 
@@ -209,6 +224,7 @@ impl ForwardModel {
         tokens: &[u32],
         cache: &mut KvCache,
         scratch: &mut ModelScratch,
+        observer: &mut dyn BlockObserver,
     ) -> usize {
         let seq_len = tokens.len();
         assert!(seq_len > 0, "forward called with empty token batch");
@@ -244,6 +260,8 @@ impl ForwardModel {
                 seq_len,
                 &mut cache.layers[layer_idx],
                 &mut scratch.block_scratch,
+                layer_idx,
+                observer,
             );
         }
 

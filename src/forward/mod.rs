@@ -16,6 +16,7 @@
 //! See `/home/suero/.claude/plans/lets-do-4-tool-harmonic-glade.md`
 //! for the phased build.
 
+pub mod awq;
 pub mod block;
 pub mod config;
 pub mod dequant;
@@ -33,6 +34,8 @@ pub mod weights;
 // and whatever wires into V2 calibration next. Narrowing those to
 // `pub(crate)` is reasonable once the B-milestones settle the
 // external-API shape.
+pub use awq::{ActivationSite, AwqCollector};
+pub use block::{BlockObserver, NoopObserver};
 pub use config::{ConfigError, LlamaConfig};
 pub use kv_cache::{KvCache, LayerKvCache};
 pub use model::{ForwardModel, ModelLoadError, ModelScratch};

@@ -23,8 +23,40 @@
 //! `[out_dim, in_dim]` row-major. Matmuls use
 //! [`crate::forward::ops::matmul`] directly — no pre-transpose.
 
+use crate::forward::awq::ActivationSite;
 use crate::forward::kv_cache::LayerKvCache;
 use crate::forward::ops::{matmul, rmsnorm, rope, softmax, swiglu};
+
+/// Called by [`forward_block`] at each distinct matmul-input site.
+/// See [`crate::forward::awq`] for the AWQ-specific implementation.
+/// A no-op `NoopObserver` is provided for callers that don't want
+/// any hook.
+pub trait BlockObserver {
+    fn observe(
+        &mut self,
+        site: ActivationSite,
+        layer: usize,
+        x: &[f32],
+        rows: usize,
+        cols: usize,
+    );
+}
+
+/// Zero-overhead observer that discards every callback.
+pub struct NoopObserver;
+
+impl BlockObserver for NoopObserver {
+    #[inline(always)]
+    fn observe(
+        &mut self,
+        _site: ActivationSite,
+        _layer: usize,
+        _x: &[f32],
+        _rows: usize,
+        _cols: usize,
+    ) {
+    }
+}
 
 /// Weights for one transformer block. All slices are `&[f32]`
 /// because Milestone A runs on dequantized F32 weights; Milestone C
@@ -126,6 +158,10 @@ impl BlockScratch {
 /// callers only need to reset the cache (`LayerKvCache::clear()`)
 /// between independent sequences. Scratch's `.scores` slice must
 /// hold at least `cache.current_len + seq_len` entries.
+// Eight distinct conceptual inputs (tensor, config, weights, batch
+// size, cache, scratch, position, observer hook). Bundling any of
+// them obscures more than it clarifies at this layer.
+#[allow(clippy::too_many_arguments)]
 pub fn forward_block(
     x: &mut [f32],
     cfg: &BlockConfig,
@@ -133,6 +169,8 @@ pub fn forward_block(
     seq_len: usize,
     cache: &mut LayerKvCache,
     scratch: &mut BlockScratch,
+    layer_idx: usize,
+    observer: &mut dyn BlockObserver,
 ) {
     assert_eq!(x.len(), seq_len * cfg.hidden);
     assert_eq!(cache.kv_width, cfg.kv_width());
@@ -165,6 +203,13 @@ pub fn forward_block(
     //    Matmul asserts exact slice lengths, so we slice scratch
     //    down to seq_len rows — it may be sized for a larger max
     //    batch, but only these rows are live this call.
+    observer.observe(
+        ActivationSite::QkvInput,
+        layer_idx,
+        &scratch.norm_out[..seq_len * cfg.hidden],
+        seq_len,
+        cfg.hidden,
+    );
     matmul(
         &scratch.norm_out[..seq_len * cfg.hidden],
         weights.wq,
@@ -269,6 +314,13 @@ pub fn forward_block(
     }
 
     // 5. Output projection into proj_out.
+    observer.observe(
+        ActivationSite::AttnOutputInput,
+        layer_idx,
+        &scratch.attn_out[..seq_len * cfg.q_width()],
+        seq_len,
+        cfg.q_width(),
+    );
     matmul(
         &scratch.attn_out[..seq_len * cfg.q_width()],
         weights.wo,
@@ -293,6 +345,13 @@ pub fn forward_block(
     }
 
     // 8. Gate / up projections.
+    observer.observe(
+        ActivationSite::FfnGateUpInput,
+        layer_idx,
+        &scratch.norm_out[..seq_len * cfg.hidden],
+        seq_len,
+        cfg.hidden,
+    );
     matmul(
         &scratch.norm_out[..seq_len * cfg.hidden],
         weights.w_gate,
@@ -318,6 +377,13 @@ pub fn forward_block(
     );
 
     // 10. Down projection.
+    observer.observe(
+        ActivationSite::FfnDownInput,
+        layer_idx,
+        &scratch.ffn_down_in[..seq_len * cfg.ffn_dim],
+        seq_len,
+        cfg.ffn_dim,
+    );
     matmul(
         &scratch.ffn_down_in[..seq_len * cfg.ffn_dim],
         weights.w_down,
@@ -451,7 +517,16 @@ mod tests {
         let snapshot = x.clone();
         let mut scratch = BlockScratch::new(&cfg, 1, 8);
         let mut cache = fresh_cache(&cfg, 8);
-        forward_block(&mut x, &cfg, &w.view(), 1, &mut cache, &mut scratch);
+        forward_block(
+            &mut x,
+            &cfg,
+            &w.view(),
+            1,
+            &mut cache,
+            &mut scratch,
+            0,
+            &mut NoopObserver,
+        );
         assert_eq!(x, snapshot, "zero projections should leave x unchanged");
     }
 
@@ -466,7 +541,16 @@ mod tests {
         let mut x = vec![0.0_f32; cfg.hidden];
         let mut scratch = BlockScratch::new(&cfg, 1, 8);
         let mut cache = fresh_cache(&cfg, 8);
-        forward_block(&mut x, &cfg, &w.view(), 1, &mut cache, &mut scratch);
+        forward_block(
+            &mut x,
+            &cfg,
+            &w.view(),
+            1,
+            &mut cache,
+            &mut scratch,
+            0,
+            &mut NoopObserver,
+        );
         for v in x {
             assert!(v.abs() < 1e-6, "zero input drifted to {v}");
         }
@@ -482,12 +566,30 @@ mod tests {
         let mut x1 = x0.clone();
         let mut s1 = BlockScratch::new(&cfg, 3, 8);
         let mut c1 = fresh_cache(&cfg, 8);
-        forward_block(&mut x1, &cfg, &w.view(), 3, &mut c1, &mut s1);
+        forward_block(
+            &mut x1,
+            &cfg,
+            &w.view(),
+            3,
+            &mut c1,
+            &mut s1,
+            0,
+            &mut NoopObserver,
+        );
 
         let mut x2 = x0.clone();
         let mut s2 = BlockScratch::new(&cfg, 3, 8);
         let mut c2 = fresh_cache(&cfg, 8);
-        forward_block(&mut x2, &cfg, &w.view(), 3, &mut c2, &mut s2);
+        forward_block(
+            &mut x2,
+            &cfg,
+            &w.view(),
+            3,
+            &mut c2,
+            &mut s2,
+            0,
+            &mut NoopObserver,
+        );
 
         assert_eq!(x1, x2, "forward_block is nondeterministic");
     }
@@ -514,8 +616,26 @@ mod tests {
         let mut sb = BlockScratch::new(&cfg, 3, 8);
         let mut ca = fresh_cache(&cfg, 8);
         let mut cb = fresh_cache(&cfg, 8);
-        forward_block(&mut x_a, &cfg, &w.view(), 3, &mut ca, &mut sa);
-        forward_block(&mut x_b, &cfg, &w.view(), 3, &mut cb, &mut sb);
+        forward_block(
+            &mut x_a,
+            &cfg,
+            &w.view(),
+            3,
+            &mut ca,
+            &mut sa,
+            0,
+            &mut NoopObserver,
+        );
+        forward_block(
+            &mut x_b,
+            &cfg,
+            &w.view(),
+            3,
+            &mut cb,
+            &mut sb,
+            0,
+            &mut NoopObserver,
+        );
 
         for d in 0..cfg.hidden {
             assert!(
@@ -536,7 +656,16 @@ mod tests {
         let start_len = x.len();
         let mut s = BlockScratch::new(&cfg, 4, 8);
         let mut cache = fresh_cache(&cfg, 8);
-        forward_block(&mut x, &cfg, &w.view(), 4, &mut cache, &mut s);
+        forward_block(
+            &mut x,
+            &cfg,
+            &w.view(),
+            4,
+            &mut cache,
+            &mut s,
+            0,
+            &mut NoopObserver,
+        );
         assert_eq!(x.len(), start_len);
         assert!(x.iter().all(|v| v.is_finite()));
     }
@@ -557,17 +686,44 @@ mod tests {
         let mut x_single = [t0.clone(), t1.clone(), t2.clone()].concat();
         let mut s_single = BlockScratch::new(&cfg, 3, 8);
         let mut c_single = fresh_cache(&cfg, 8);
-        forward_block(&mut x_single, &cfg, &w.view(), 3, &mut c_single, &mut s_single);
+        forward_block(
+            &mut x_single,
+            &cfg,
+            &w.view(),
+            3,
+            &mut c_single,
+            &mut s_single,
+            0,
+            &mut NoopObserver,
+        );
 
         // (b) Two-step: prefill [t0, t1], then decode [t2].
         let mut x_step = [t0.clone(), t1.clone()].concat();
         let mut s_step = BlockScratch::new(&cfg, 2, 8);
         let mut c_step = fresh_cache(&cfg, 8);
-        forward_block(&mut x_step, &cfg, &w.view(), 2, &mut c_step, &mut s_step);
+        forward_block(
+            &mut x_step,
+            &cfg,
+            &w.view(),
+            2,
+            &mut c_step,
+            &mut s_step,
+            0,
+            &mut NoopObserver,
+        );
         let mut x_step2 = t2.clone();
         // Scratch for the second call with batch=1.
         let mut s_step2 = BlockScratch::new(&cfg, 1, 8);
-        forward_block(&mut x_step2, &cfg, &w.view(), 1, &mut c_step, &mut s_step2);
+        forward_block(
+            &mut x_step2,
+            &cfg,
+            &w.view(),
+            1,
+            &mut c_step,
+            &mut s_step2,
+            0,
+            &mut NoopObserver,
+        );
 
         // The pos-2 row of the single-shot run must equal the
         // decoded output from step 2.
