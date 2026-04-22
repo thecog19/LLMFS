@@ -785,70 +785,92 @@ with the process that owns it.
 
 ## 8. `ask` Command
 
-The `ask` command loads the model for inference, gives it tool-use access to the stego filesystem, and lets it answer questions about files stored in its own weights.
+The `ask` command loads the model for inference, gives it tool-use access to the V2 filesystem embedded in the cover, and lets it answer questions about files stored in its own weights.
 
 ### Architecture
 
 ```
 User question
     → llmdb ask process
-        → load model via llama.cpp (subprocess or llama-cpp-rs)
-        → construct system prompt with tool definitions
-        → send user question
+        → mmap the GGUF and mount it as a V2 Filesystem
+        → spawn llama-server against the same GGUF on a free port
+        → construct system prompt + tool definitions
         → model generates tool calls
-        → llmdb executes tool calls against StegoDevice
-        → results fed back to model
+        → AskSession dispatches each call to v2::Filesystem
+        → results fed back to the model
         → model generates final answer
+        → session loops (REPL) until exit / Ctrl-D
 ```
 
-### Tool Definitions
+### Tool definitions
 
-The model receives these tool definitions in its system prompt:
+The V2 filesystem is hierarchical and path-addressed, so the tool surface mirrors Unix idioms. Four tools; all paths are absolute.
 
 ```json
 [
     {
-        "name": "list_files",
-        "description": "List all files stored in the model's weights",
+        "name": "ls",
+        "description": "List the entries in an absolute directory path. Returns an array of {name, kind, size_bytes}. `kind` is 'file' or 'directory'.",
+        "parameters": {
+            "path": {"type": "string", "description": "absolute path; '/' for the root"}
+        }
+    },
+    {
+        "name": "read",
+        "description": "Return up to 16 KiB of the contents of a file at an absolute path, as UTF-8 text. The result is truncated for larger files; call `stat` first to check size.",
+        "parameters": {
+            "path": {"type": "string", "description": "absolute file path"}
+        }
+    },
+    {
+        "name": "stat",
+        "description": "Return metadata for a file or directory: kind, size_bytes, and (for files) a hex CRC32 of the contents.",
+        "parameters": {
+            "path": {"type": "string", "description": "absolute path"}
+        }
+    },
+    {
+        "name": "list_all_files",
+        "description": "Recursively list every file in the filesystem. Returns [{path, size_bytes}]. Directories are traversed but not themselves listed.",
         "parameters": {}
-    },
-    {
-        "name": "read_file",
-        "description": "Read the contents of a file stored in the model's weights",
-        "parameters": {
-            "filename": {"type": "string", "description": "Name of file to read"}
-        }
-    },
-    {
-        "name": "file_info",
-        "description": "Get metadata about a file (size, permissions, timestamps)",
-        "parameters": {
-            "filename": {"type": "string", "description": "Name of file"}
-        }
     }
 ]
 ```
 
-### System Prompt
+**Why four tools and not just `ls`+`read`.** Three considerations:
+
+- `stat` separates "check size before reading" from the read itself. The 16 KiB truncation on `read` is load-bearing (a multi-MB blob would blow the model's context), and a model that just wants to know "how big is this?" shouldn't have to pay for the bytes.
+- `stat` reports a **content CRC32** computed on the fly from the file bytes. V2 inodes don't store CRC — they store `length + pointers` — so this is read-path work. A model comparing two files ("did recipe.txt change?") gets the answer without a full `read` round-trip.
+- `list_all_files` is explicitly sugar for small models. SmolLM2-135M and similar don't reliably multi-step `ls /` → `ls /docs` → `read /docs/notes.md`; giving them a one-shot "here's every file" tool means the bridge isn't pointless on toy models. Any model large enough to plan navigation ignores it.
+
+V2 has no POSIX mode / mtime / uid / gid to report — the FUSE driver fabricates those per-session — so those fields aren't in the tool surface.
+
+### System prompt
 
 ```
-You are a language model with files stored in your own weights.
-You can use the provided tools to list and read these files.
-When asked about your files, use the tools to look up the information
-rather than guessing. The files are stored steganographically in your
-weight parameters — you are literally reading data from your own neural network.
+You are a helpful assistant with access to the files stored
+inside an LLMDB steganographic V2 filesystem. The filesystem is
+hierarchical — paths are absolute and start with '/'. Use the
+provided tools (ls, read, stat, list_all_files) to answer
+questions about those files. Prefer tool calls over speculation;
+if a file is relevant, call `read` on it. For a broad survey,
+`list_all_files` returns every file in one shot. Keep answers
+concise.
 ```
 
-### Inference Backend
+### Inference backend
 
-V1 shells out to `llama-server` (from llama.cpp) running locally, communicating via the OpenAI-compatible API it exposes. This avoids linking llama.cpp's C++ into our Rust binary.
+Shells out to `llama-server` (from llama.cpp) running locally, communicating via the OpenAI-compatible API it exposes. This avoids linking llama.cpp's C++ into our Rust binary.
 
 Startup sequence:
-1. `llmdb ask model.gguf` starts `llama-server --model model.gguf --port <random>` as a subprocess.
-2. Wait for the server to be ready (poll the `/health` endpoint).
-3. Send chat completion requests with tools to `http://localhost:<port>/v1/chat/completions`.
-4. Parse tool-call responses, execute against StegoDevice, feed results back.
-5. On exit, kill the subprocess.
+1. `llmdb ask model.gguf` opens the cover RW, mmaps it, and mounts it as a `v2::Filesystem` (§15.3).
+2. Picks a free loopback port and spawns `llama-server --model model.gguf --port <port>` as a subprocess.
+3. Waits for the server to be ready (polls the `/health` endpoint).
+4. Sends chat completion requests with tools to `http://localhost:<port>/v1/chat/completions`.
+5. Parses tool-call responses; each call dispatches to the corresponding `v2::Filesystem` method via `AskSession::dispatch_tool_call` (`src/ask/bridge.rs`). The tool-call loop is capped at `MAX_TOOL_ITERATIONS = 8` per user question.
+6. On exit, kills the subprocess and msyncs the filesystem.
+
+The filesystem mount and `llama-server` both touch the same GGUF file — llama-server mmaps it read-only, V2 holds an `MmapMut`. Linux's page cache keeps the two views coherent; V2 only writes to stealable bits inside its own allocated runs, so live model weights never shift from under the inference process.
 
 ## 9. CLI
 
