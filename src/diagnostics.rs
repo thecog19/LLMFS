@@ -1,230 +1,165 @@
-//! `status` reporting: gather a structured view of device state from a
-//! `StegoDevice` and format it for humans.
+//! `status` reporting for the V2 filesystem: gather a structured
+//! view from a `v2::Filesystem` and format it for humans.
 //!
-//! Kept deliberately simple for V1 — the per-tier "used bytes" figure
-//! assumes sequential allocation (Tier1 fills first, then Tier2, then
-//! Lobotomy), which matches the V1 allocator. A more accurate mapping
-//! would walk each live file's block chain and look up the backing
-//! tensor's tier; that's a Task 15 concern once the quality harness
-//! needs the extra fidelity.
+//! V2 has no concept of POSIX-mode tiers, lobotomy, or per-write
+//! perplexity heuristics — placement is uniformly ceiling-magnitude-
+//! ranked across every eligible weight. The status report reflects
+//! that: file/dir counts, bytes stored, generation, dedup table size,
+//! dirty-bitmap usage, and allocator free-weight balance, plus the
+//! distinct quant types the cover contributes.
 
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
-use crate::fs::file_ops::FsError;
 use crate::gguf::quant::GgufQuantType;
-use crate::stego::device::StegoDevice;
-use crate::stego::integrity::decode_quant_profile;
-use crate::stego::planner::TensorTier;
-
-/// Retained so `bootstrap_smoke` keeps working. Real status info comes
-/// from `gather(&StegoDevice)`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DiagnosticsBootstrap {
-    pub tracks_tiers: bool,
-}
-
-impl Default for DiagnosticsBootstrap {
-    fn default() -> Self {
-        Self { tracks_tiers: true }
-    }
-}
+use crate::stego::tensor_map::TensorMap;
+use crate::v2::directory::EntryKind;
+use crate::v2::fs::{Filesystem, FsError};
 
 #[derive(Debug, Clone)]
 pub struct DeviceStatus {
-    pub total_blocks: u32,
-    pub used_blocks: u32,
-    pub free_blocks: u32,
-    pub utilization_pct: f32,
-    pub file_count: u32,
-    pub total_stored_bytes: u64,
-    pub tier_utilization: BTreeMap<TensorTier, TierUsage>,
-    pub quant_profile: Vec<GgufQuantType>,
-    pub lobotomy: bool,
-    pub dirty_on_open: bool,
-    /// Monotonic counter bumped on every superblock persist. Exposed so
-    /// external tools (notably the `ask` cache) can detect modifications
-    /// to the device between sessions without diffing the whole state.
+    /// Anchor / super-root generation. Bumps once per commit.
     pub generation: u64,
-    pub estimated_perplexity_impact: PerplexityImpact,
+    /// Number of regular files in the tree (recursive count).
+    pub file_count: u32,
+    /// Number of directories in the tree (recursive count, excluding `/`).
+    pub directory_count: u32,
+    /// Sum of file lengths (bytes), recursive.
+    pub total_stored_bytes: u64,
+    /// Total weights the allocator can place chunks into. Equals the
+    /// sum of `weight_count` over slots with stealable bits.
+    pub allocator_total_capacity_weights: u64,
+    /// Weights currently free (not part of any live chunk).
+    pub allocator_free_weights: u64,
+    /// Number of unique content-hash entries currently in the dedup
+    /// index (one per live file chunk that's been seen).
+    pub dedup_entries: u64,
+    /// Bits set in the persistent dirty bitmap (= weights ever
+    /// written to since init).
+    pub dirty_bits_set: u64,
+    /// Total bits in the dirty bitmap (= total stealable weights).
+    pub dirty_bits_total: u64,
+    /// Distinct quant types contributed by stealable slots.
+    pub quant_profile: Vec<GgufQuantType>,
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct TierUsage {
-    /// Total stego capacity contributed by tensors in this tier.
-    pub capacity_bytes: u64,
-    /// Approximate bytes currently occupied in this tier — assumes
-    /// sequential allocation order Tier1 → Tier2 → Lobotomy.
-    pub used_bytes: u64,
-    pub tensor_count: u32,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct PerplexityImpact {
-    pub score: f32,
-    pub bucket: PerplexityBucket,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PerplexityBucket {
-    Negligible,
-    Low,
-    Moderate,
-    Severe,
-}
-
-impl PerplexityBucket {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Negligible => "negligible",
-            Self::Low => "low",
-            Self::Moderate => "moderate",
-            Self::Severe => "severe",
+/// Walk the V2 filesystem + accessors and produce a [`DeviceStatus`].
+pub fn gather(fs: &Filesystem, map: &TensorMap) -> Result<DeviceStatus, FsError> {
+    let mut file_count = 0_u32;
+    let mut directory_count = 0_u32;
+    let mut total_stored_bytes = 0_u64;
+    walk(fs, "/", &mut |path, kind| -> Result<(), FsError> {
+        match kind {
+            EntryKind::File => {
+                file_count = file_count.saturating_add(1);
+                let inode = fs.inode_at(path)?;
+                total_stored_bytes = total_stored_bytes.saturating_add(inode.length);
+            }
+            EntryKind::Directory => {
+                directory_count = directory_count.saturating_add(1);
+            }
         }
-    }
-}
+        Ok(())
+    })?;
 
-pub fn gather(device: &StegoDevice) -> Result<DeviceStatus, FsError> {
-    let sb = device.superblock().clone();
-    let total_blocks = device.total_blocks();
-    let free_blocks = device.free_blocks()?;
-    let used_blocks = total_blocks.saturating_sub(free_blocks);
-    let utilization_pct = if total_blocks == 0 {
-        0.0
-    } else {
-        (used_blocks as f32 / total_blocks as f32) * 100.0
-    };
+    let dirty = fs.dirty_bitmap();
+    let allocator_total_capacity_weights: u64 = map
+        .slots
+        .iter()
+        .filter(|s| s.stealable_bits_per_weight > 0)
+        .map(|s| s.weight_count)
+        .sum();
 
-    let files = device.list_files()?;
-    let file_count = files.len() as u32;
-    let total_stored_bytes = files.iter().map(|e| e.size_bytes).sum();
-
-    let plan = device.allocation_plan();
-    let mut tier_capacity: BTreeMap<TensorTier, u64> = BTreeMap::new();
-    let mut tier_count: BTreeMap<TensorTier, u32> = BTreeMap::new();
-    for t in &plan.tensors {
-        *tier_capacity.entry(t.tier).or_insert(0) += t.capacity_bytes_floor;
-        *tier_count.entry(t.tier).or_insert(0) += 1;
-    }
-
-    // Assume V1's sequential fill order (Tier1 → Tier2 → Lobotomy) so we
-    // can approximate per-tier used_bytes without walking file block
-    // chains. When V2's sensitivity-ordered allocator lands this falls
-    // back to the same "first-to-be-allocated" distribution.
-    let used_bytes = used_blocks as u64 * crate::BLOCK_SIZE as u64;
-    let mut tier_utilization = BTreeMap::new();
-    let mut remaining = used_bytes;
-    for tier in [TensorTier::Tier1, TensorTier::Tier2, TensorTier::Lobotomy] {
-        let capacity = tier_capacity.get(&tier).copied().unwrap_or(0);
-        let count = tier_count.get(&tier).copied().unwrap_or(0);
-        if capacity == 0 && count == 0 {
+    let mut quant_set: BTreeSet<u32> = BTreeSet::new();
+    let mut quant_profile: Vec<GgufQuantType> = Vec::new();
+    for slot in &map.slots {
+        if slot.stealable_bits_per_weight == 0 {
             continue;
         }
-        let used = remaining.min(capacity);
-        remaining = remaining.saturating_sub(used);
-        tier_utilization.insert(
-            tier,
-            TierUsage {
-                capacity_bytes: capacity,
-                used_bytes: used,
-                tensor_count: count,
-            },
-        );
+        let key = slot.quant_type as u32;
+        if quant_set.insert(key) {
+            quant_profile.push(slot.quant_type);
+        }
     }
 
-    let estimated_perplexity_impact = score_perplexity_impact(&tier_utilization);
-
     Ok(DeviceStatus {
-        total_blocks,
-        used_blocks,
-        free_blocks,
-        utilization_pct,
+        generation: fs.generation(),
         file_count,
+        directory_count,
         total_stored_bytes,
-        tier_utilization,
-        quant_profile: decode_quant_profile(sb.fields.quant_profile),
-        lobotomy: sb.is_lobotomy(),
-        dirty_on_open: device.was_dirty_on_open(),
-        generation: sb.fields.generation,
-        estimated_perplexity_impact,
+        allocator_total_capacity_weights,
+        allocator_free_weights: fs.allocator_free_weights(),
+        dedup_entries: fs.dedup_index().len() as u64,
+        dirty_bits_set: dirty.set_count(),
+        dirty_bits_total: dirty.total_bits(),
+        quant_profile,
     })
 }
 
-fn score_perplexity_impact(tiers: &BTreeMap<TensorTier, TierUsage>) -> PerplexityImpact {
-    let weight = |t: TensorTier| match t {
-        TensorTier::Tier1 => 0.5,
-        TensorTier::Tier2 => 1.0,
-        TensorTier::Lobotomy => 5.0,
-        TensorTier::Skip => 0.0,
-    };
-    let mut score = 0.0_f32;
-    for (tier, usage) in tiers {
-        if usage.capacity_bytes == 0 {
-            continue;
+/// Recursively visit every entry under `dir`. The callback receives
+/// the absolute path and kind of each entry.
+fn walk<F>(fs: &Filesystem, dir: &str, cb: &mut F) -> Result<(), FsError>
+where
+    F: FnMut(&str, EntryKind) -> Result<(), FsError>,
+{
+    for entry in fs.readdir(dir)? {
+        let child_path = if dir == "/" {
+            format!("/{}", entry.name)
+        } else {
+            format!("{}/{}", dir.trim_end_matches('/'), entry.name)
+        };
+        cb(&child_path, entry.kind)?;
+        if entry.kind == EntryKind::Directory {
+            walk(fs, &child_path, cb)?;
         }
-        let ratio = usage.used_bytes as f32 / usage.capacity_bytes as f32;
-        score += ratio * weight(*tier);
     }
-    let bucket = if score < 0.01 {
-        PerplexityBucket::Negligible
-    } else if score < 0.25 {
-        PerplexityBucket::Low
-    } else if score < 1.0 {
-        PerplexityBucket::Moderate
-    } else {
-        PerplexityBucket::Severe
-    };
-    PerplexityImpact { score, bucket }
+    Ok(())
 }
 
 pub fn format_human(status: &DeviceStatus) -> String {
     let mut out = String::new();
-    let _ = writeln!(out, "total:       {} blocks", status.total_blocks);
-    let _ = writeln!(out, "used:        {} blocks", status.used_blocks);
-    let _ = writeln!(out, "free:        {} blocks", status.free_blocks);
-    let _ = writeln!(out, "utilization: {:.1}%", status.utilization_pct);
-    let _ = writeln!(out, "files:       {}", status.file_count);
-    let _ = writeln!(out, "stored:      {} bytes", status.total_stored_bytes);
-    let _ = writeln!(out, "quant:       {:?}", status.quant_profile);
+    let _ = writeln!(out, "generation:         {}", status.generation);
+    let _ = writeln!(out, "files:              {}", status.file_count);
+    let _ = writeln!(out, "directories:        {}", status.directory_count);
+    let _ = writeln!(out, "stored:             {} bytes", status.total_stored_bytes);
+
+    let dirty_pct = if status.dirty_bits_total == 0 {
+        0.0
+    } else {
+        (status.dirty_bits_set as f64 / status.dirty_bits_total as f64) * 100.0
+    };
     let _ = writeln!(
         out,
-        "lobotomy:    {}",
-        if status.lobotomy { "yes" } else { "no" }
+        "dirty weights:      {} / {} ({:.3}%)",
+        status.dirty_bits_set, status.dirty_bits_total, dirty_pct
     );
+
+    let used_weights = status
+        .allocator_total_capacity_weights
+        .saturating_sub(status.allocator_free_weights);
+    let alloc_pct = if status.allocator_total_capacity_weights == 0 {
+        0.0
+    } else {
+        (used_weights as f64 / status.allocator_total_capacity_weights as f64) * 100.0
+    };
     let _ = writeln!(
         out,
-        "dirty:       {}",
-        if status.dirty_on_open {
-            "yes (recovered on open)"
-        } else {
-            "no"
-        }
+        "allocator:          {} / {} weights used ({:.3}%)",
+        used_weights, status.allocator_total_capacity_weights, alloc_pct
     );
-    let _ = writeln!(out, "generation:  {}", status.generation);
-    out.push('\n');
-    let _ = writeln!(out, "per-tier breakdown:");
-    for (tier, usage) in &status.tier_utilization {
-        let pct = if usage.capacity_bytes == 0 {
-            0.0
-        } else {
-            (usage.used_bytes as f32 / usage.capacity_bytes as f32) * 100.0
-        };
-        let _ = writeln!(
-            out,
-            "  {:<9}  {:>4} tensors   {:>10} / {:>10} B   ({:.1}%)",
-            format!("{:?}", tier),
-            usage.tensor_count,
-            usage.used_bytes,
-            usage.capacity_bytes,
-            pct
-        );
-    }
-    out.push('\n');
-    let _ = writeln!(
-        out,
-        "est. perplexity impact: {} (score {:.3})",
-        status.estimated_perplexity_impact.bucket.as_str(),
-        status.estimated_perplexity_impact.score
-    );
+
+    let _ = writeln!(out, "dedup entries:      {}", status.dedup_entries);
+
+    let quant_str = if status.quant_profile.is_empty() {
+        "(none)".to_owned()
+    } else {
+        status
+            .quant_profile
+            .iter()
+            .map(|q| format!("{q:?}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let _ = writeln!(out, "quant profile:      {quant_str}");
     out
 }

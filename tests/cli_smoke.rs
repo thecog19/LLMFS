@@ -137,15 +137,14 @@ fn wipe_yes_leaves_device_fresh_with_zero_files() {
         .assert()
         .success();
 
-    let status = llmdb().arg("status").arg(&fx.path).assert().success();
-    let stdout = String::from_utf8_lossy(&status.get_output().stdout).into_owned();
+    // After wipe, the device has no stored files. `ls` still uses
+    // the V1 surface in this commit; C3 rewrites this whole test
+    // against the V2 CLI surface.
+    let ls = llmdb().arg("ls").arg(&fx.path).assert().success();
+    let stdout = String::from_utf8_lossy(&ls.get_output().stdout).into_owned();
     assert!(
-        stdout.contains("files:"),
-        "status missing files line: {stdout}"
-    );
-    assert!(
-        stdout.lines().any(|line| line.trim() == "files:       0"),
-        "wipe should leave 0 files visible, status was:\n{stdout}"
+        stdout.trim().is_empty(),
+        "wipe should leave 0 files visible, `ls` was:\n{stdout}"
     );
 }
 

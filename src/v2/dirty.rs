@@ -66,6 +66,11 @@ impl DirtyBitmap {
         self.total_bits
     }
 
+    /// Number of bits currently set (i.e. weights ever marked dirty).
+    pub fn set_count(&self) -> u64 {
+        self.bits.iter().map(|b| b.count_ones() as u64).sum()
+    }
+
     /// Is `(slot, weight_index)` marked dirty?
     pub fn is_dirty(&self, slot: u16, weight_index: u32) -> bool {
         let bit = self.bit_index(slot, weight_index);

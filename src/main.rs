@@ -164,7 +164,7 @@ fn main() {
 fn dispatch(cmd: Command, mode: AllocationMode, options: DeviceOptions) -> Result<(), CliError> {
     match cmd {
         Command::Init { model } => cmd_init(&model, mode, options),
-        Command::Status { model } => cmd_status(&model, mode, options),
+        Command::Status { model } => cmd_status(&model),
         Command::Store {
             model,
             host_path,
@@ -240,12 +240,28 @@ fn cmd_init(model: &Path, mode: AllocationMode, options: DeviceOptions) -> Resul
     Ok(())
 }
 
-fn cmd_status(model: &Path, mode: AllocationMode, options: DeviceOptions) -> Result<(), CliError> {
-    let device = StegoDevice::open_with_options(model, mode, options).map_err(open_err)?;
-    println!("device:      {}", model.display());
-    let status = llmdb::diagnostics::gather(&device).map_err(fs_err)?;
+fn cmd_status(model: &Path) -> Result<(), CliError> {
+    use llmdb::gguf::parser::parse_path as parse_gguf;
+    use llmdb::stego::planner::build_allocation_plan;
+    use llmdb::stego::tensor_map::TensorMap;
+    use llmdb::v2::fs::Filesystem as V2Filesystem;
+
+    let parsed = parse_gguf(model)
+        .map_err(|e| CliError::user(format!("parse {}: {e}", model.display())))?;
+    let plan = build_allocation_plan(&parsed.tensors, AllocationMode::Standard);
+    let map = TensorMap::from_allocation_plan_with_base(&plan, parsed.tensor_data_offset as u64);
+    let cover = std::fs::read(model)
+        .map_err(|e| CliError::internal(format!("reading {}: {e}", model.display())))?;
+    let fs = V2Filesystem::mount(cover, map.clone()).map_err(|e| {
+        CliError::user(format!(
+            "V2 mount (no anchor? run `llmdb v2-init` first): {e}"
+        ))
+    })?;
+
+    println!("device:             {}", model.display());
+    let status = llmdb::diagnostics::gather(&fs, &map)
+        .map_err(|e| CliError::user(format!("gather: {e}")))?;
     print!("{}", llmdb::diagnostics::format_human(&status));
-    device.close().map_err(dev_err)?;
     Ok(())
 }
 
