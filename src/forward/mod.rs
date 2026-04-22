@@ -26,3 +26,18 @@ pub mod perplexity;
 pub mod pre_tokenize;
 pub mod tokenizer;
 pub mod weights;
+
+// Re-exports for the common entry points. Submodules stay `pub`
+// for now — the low-level types (`BlockScratch`, `LayerKvCache`,
+// `LlamaConfig`, …) are still used directly by A7's test harness
+// and whatever wires into V2 calibration next. Narrowing those to
+// `pub(crate)` is reasonable once the B-milestones settle the
+// external-API shape.
+pub use config::{ConfigError, LlamaConfig};
+pub use kv_cache::{KvCache, LayerKvCache};
+pub use model::{ForwardModel, ModelLoadError, ModelScratch};
+pub use perplexity::PerplexityError;
+pub use tokenizer::{
+    DecodeError, EncodeError, SpecialTokens, Tokenizer, TokenizerConfig, TokenizerError,
+    TokenizerModel,
+};

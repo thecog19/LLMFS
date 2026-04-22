@@ -23,13 +23,18 @@ use crate::forward::block::{BlockConfig, BlockScratch, BlockWeights, forward_blo
 use crate::forward::config::{ConfigError, LlamaConfig};
 use crate::forward::kv_cache::KvCache;
 use crate::forward::ops::{embed, matmul, rmsnorm};
+use crate::forward::perplexity::{PerplexityError, perplexity};
+use crate::forward::tokenizer::{DecodeError, EncodeError, Tokenizer, TokenizerError};
 use crate::forward::weights::{LlamaWeights, WeightLoadError};
 use crate::gguf::parser::{ParseError, parse_path};
 
-/// Dequantized llama-arch model ready to forward.
+/// Dequantized llama-arch model ready to forward. Bundles the
+/// tokenizer alongside the weights so callers can go from `&str`
+/// to logits in two method calls.
 pub struct ForwardModel {
     pub config: LlamaConfig,
     pub weights: LlamaWeights,
+    pub tokenizer: Tokenizer,
     block_cfg: BlockConfig,
 }
 
@@ -79,14 +84,17 @@ pub enum ModelLoadError {
     Config(#[from] ConfigError),
     #[error("weights: {0}")]
     Weights(#[from] WeightLoadError),
+    #[error("tokenizer: {0}")]
+    Tokenizer(#[from] TokenizerError),
 }
 
 impl ForwardModel {
-    /// Load + dequantize a GGUF file.
+    /// Load + dequantize a GGUF file, including its tokenizer.
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self, ModelLoadError> {
         let path = path.as_ref();
         let gguf = parse_path(path)?;
         let config = LlamaConfig::from_gguf(&gguf)?;
+        let tokenizer = Tokenizer::from_gguf(&gguf)?;
         let weights = LlamaWeights::load(path, &config)?;
         let block_cfg = BlockConfig {
             hidden: config.hidden_dim,
@@ -101,8 +109,32 @@ impl ForwardModel {
         Ok(Self {
             config,
             weights,
+            tokenizer,
             block_cfg,
         })
+    }
+
+    /// Tokenize `text` via the model's embedded tokenizer. BOS /
+    /// EOS handling follows the tokenizer config (see
+    /// [`Tokenizer::encode`]).
+    pub fn encode(&self, text: &str) -> Result<Vec<u32>, EncodeError> {
+        self.tokenizer.encode(text)
+    }
+
+    /// Decode token ids back to a string.
+    pub fn decode(&self, ids: &[u32]) -> Result<String, DecodeError> {
+        self.tokenizer.decode(ids)
+    }
+
+    /// Perplexity on a pre-tokenized stream at the given context
+    /// length. Non-overlapping chunks of `ctx_len` tokens each;
+    /// cross-entropy accumulated, exponentiated at the end.
+    pub fn perplexity(
+        &self,
+        tokens: &[u32],
+        ctx_len: usize,
+    ) -> Result<f32, PerplexityError> {
+        perplexity(self, tokens, ctx_len)
     }
 
     /// Run the forward pass on `tokens`. Appends to `cache` and
