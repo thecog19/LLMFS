@@ -1,4 +1,4 @@
-//! End-to-end test for the `ask` bridge against a real llama-server.
+//! End-to-end test for the V2 `ask` bridge against a real llama-server.
 //!
 //! Gated by `LLMDB_E2E_ASK=1` so the default `cargo test` run doesn't
 //! depend on a compiled llama.cpp. When enabled, the test:
@@ -6,14 +6,15 @@
 //! 1. locates `llama-server` (env `LLMDB_LLAMA_SERVER` or PATH),
 //! 2. locates an F16 GGUF (env `LLMDB_E2E_GGUF` or
 //!    `models/smollm2-135m-f16.gguf`) — must be F16/F32 so the model
-//!    still inferences after `init` (see DESIGN-NEW §2),
-//! 3. copies the GGUF to a tempdir, runs `llmdb init`, stores two
-//!    text files with known contents,
-//! 4. spawns `LlamaServer`, waits for `/health`,
+//!    still inferences after V2 init,
+//! 3. copies the GGUF to a tempdir, builds a V2 filesystem on it via
+//!    the public V2 API, writes two files with known contents,
+//!    persists the cover bytes back to disk,
+//! 4. spawns `LlamaServer` against the modified GGUF, waits for `/health`,
 //! 5. drives `AskSession` with a prompt that the model should answer
-//!    by calling `list_files` + `read_file`,
+//!    by calling `list_all_files` + `read`,
 //! 6. asserts that at least one tool call happened and that the
-//!    stored files' names appear in the transcript.
+//!    stored passphrase appears somewhere in the transcript.
 //!
 //! Runtime is dominated by model load + a handful of tokens, so the
 //! test takes ~10-30 s with smollm2-135m-f16 on CPU.
@@ -23,8 +24,10 @@ use std::path::{Path, PathBuf};
 
 use llmdb::ask::bridge::{AskSession, HttpChatClient};
 use llmdb::ask::server::LlamaServer;
-use llmdb::stego::device::{DeviceOptions, StegoDevice};
-use llmdb::stego::planner::AllocationMode;
+use llmdb::gguf::parser::parse_path as parse_gguf;
+use llmdb::stego::planner::{AllocationMode, build_allocation_plan};
+use llmdb::stego::tensor_map::TensorMap;
+use llmdb::v2::fs::Filesystem as V2Filesystem;
 
 fn gated() -> bool {
     std::env::var("LLMDB_E2E_ASK").ok().as_deref() == Some("1")
@@ -46,34 +49,37 @@ fn locate_model() -> Option<PathBuf> {
     fallback.exists().then_some(fallback)
 }
 
-fn prepare_device(src: &Path) -> (tempfile::TempDir, PathBuf) {
+/// Open a cover, build the V2 tensor map, return the cover bytes
+/// alongside it. Used both before and after writing files.
+fn load_cover(model: &Path) -> (Vec<u8>, TensorMap) {
+    let parsed = parse_gguf(model).expect("parse gguf");
+    let plan = build_allocation_plan(&parsed.tensors, AllocationMode::Standard);
+    let map = TensorMap::from_allocation_plan_with_base(&plan, parsed.tensor_data_offset as u64);
+    let cover = std::fs::read(model).expect("read cover");
+    (cover, map)
+}
+
+fn prepare_v2_fs(src: &Path) -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().expect("tempdir");
     let copy = dir.path().join("ask_e2e.gguf");
     std::fs::copy(src, &copy).expect("copy model");
 
-    let mut device = StegoDevice::initialize_with_options(
-        &copy,
-        AllocationMode::Standard,
-        DeviceOptions { verbose: false },
+    // Init the V2 filesystem on the copy, write two files, persist.
+    let (cover, map) = load_cover(&copy);
+    let mut fs = V2Filesystem::init(cover, map).expect("v2 init");
+    fs.create_file(
+        "/passphrase.txt",
+        b"The secret passphrase is PURPLE ELEPHANT.\n",
     )
-    .expect("init device");
+    .expect("create passphrase.txt");
+    fs.create_file(
+        "/recipe.txt",
+        b"Ingredients:\n- 200g flour\n- 1 banana\n- 2 eggs\n",
+    )
+    .expect("create recipe.txt");
+    let cover_after = fs.unmount();
+    std::fs::write(&copy, &cover_after).expect("write cover back");
 
-    device
-        .store_bytes(
-            b"The secret passphrase is PURPLE ELEPHANT.\n",
-            "passphrase.txt",
-            0o644,
-        )
-        .expect("store passphrase.txt");
-    device
-        .store_bytes(
-            b"Ingredients:\n- 200g flour\n- 1 banana\n- 2 eggs\n",
-            "recipe.txt",
-            0o644,
-        )
-        .expect("store recipe.txt");
-
-    device.close().expect("close");
     (dir, copy)
 }
 
@@ -90,25 +96,24 @@ fn ask_session_drives_tool_calls_against_real_llama_server() {
         );
     };
 
-    let (_dir, stego_path) = prepare_device(&model);
+    let (_dir, stego_path) = prepare_v2_fs(&model);
     let port = pick_free_port();
 
     let server = LlamaServer::spawn(&stego_path, port).expect("spawn llama-server");
     assert_eq!(server.port(), port);
 
-    let mut device = StegoDevice::open_with_options(
-        &stego_path,
-        AllocationMode::Standard,
-        DeviceOptions { verbose: false },
-    )
-    .expect("reopen stego device for session");
+    // Re-mount the V2 filesystem for the session — same cover bytes
+    // we just wrote, but loaded fresh so the test exercises the
+    // mount path.
+    let (cover, map) = load_cover(&stego_path);
+    let mut fs = V2Filesystem::mount(cover, map).expect("v2 mount for session");
 
     let client = HttpChatClient::new(server.base_url());
-    let mut session = AskSession::new(client, &mut device, "ask-e2e");
+    let mut session = AskSession::new(client, &mut fs, "ask-e2e");
 
     let answer = session
         .ask(
-            "Call the read_file tool on the file named \"passphrase.txt\" \
+            "Call the `read` tool on the file at path \"/passphrase.txt\" \
              and return its contents verbatim in your reply. Do not \
              paraphrase.",
         )
@@ -126,12 +131,14 @@ fn ask_session_drives_tool_calls_against_real_llama_server() {
         "expected at least one tool call in the transcript; got none. \
          final answer was: {answer:?}"
     );
+
+    // Either `read` (preferred) or `list_all_files` would suffice for
+    // the model to surface the passphrase content. Accept either.
+    let called_names: Vec<&str> = tool_invocations.iter().map(|(n, _)| *n).collect();
     assert!(
-        tool_invocations
-            .iter()
-            .any(|(name, _)| *name == "read_file"),
-        "expected a read_file call; got {tool_invocations:?}. \
-         final answer: {answer:?}"
+        called_names.iter().any(|n| matches!(*n, "read" | "list_all_files" | "ls" | "stat")),
+        "expected a fs-tool call (read/ls/stat/list_all_files); \
+         got {called_names:?}. final answer: {answer:?}"
     );
 
     // Tool result containing the passphrase must have reached the
@@ -148,7 +155,6 @@ fn ask_session_drives_tool_calls_against_real_llama_server() {
         "expected passphrase content to appear in the transcript:\n{transcript}"
     );
 
-    let called_names: Vec<&str> = tool_invocations.iter().map(|(n, _)| *n).collect();
     eprintln!(
         "ask_e2e: tools called: {called_names:?}; \
          final answer length = {} bytes",

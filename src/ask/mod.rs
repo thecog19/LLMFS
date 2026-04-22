@@ -3,8 +3,7 @@ pub mod server;
 
 use thiserror::Error;
 
-use crate::fs::file_ops::FsError;
-use crate::stego::device::DeviceError;
+use crate::v2::fs::FsError as V2FsError;
 
 #[derive(Debug, Error)]
 pub enum AskError {
@@ -20,10 +19,8 @@ pub enum AskError {
     ToolCallLimitExceeded { limit: usize },
     #[error("invalid tool call: {0}")]
     InvalidToolCall(String),
-    #[error("device error: {0}")]
-    Device(#[from] DeviceError),
-    #[error("file system error: {0}")]
-    Fs(#[from] FsError),
+    #[error("v2 filesystem error: {0}")]
+    V2Fs(#[from] V2FsError),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("json error: {0}")]

@@ -191,7 +191,7 @@ fn dispatch(cmd: Command, mode: AllocationMode, options: DeviceOptions) -> Resul
             allow_other,
         } => cmd_mount(&model, &mount_point, allow_other, mode, options),
         Command::Unmount { mount_point } => cmd_unmount(&mount_point),
-        Command::Ask { model } => cmd_ask(&model, mode, options),
+        Command::Ask { model } => cmd_ask(&model),
         Command::Dump { model } => cmd_dump(&model, mode, options),
         Command::V2Init { model } => cmd_v2_init(&model),
         Command::V2Mount {
@@ -463,16 +463,27 @@ fn cmd_unmount(mount_point: &Path) -> Result<(), CliError> {
     ))
 }
 
-fn cmd_ask(
-    model: &Path,
-    alloc_mode: AllocationMode,
-    options: DeviceOptions,
-) -> Result<(), CliError> {
-    // We need the device for tool-call dispatch AND the model path for
-    // llama-server. The device opens normally, then we spawn the server
-    // on a free port.
-    let mut device =
-        StegoDevice::open_with_options(model, alloc_mode, options).map_err(open_err)?;
+fn cmd_ask(model: &Path) -> Result<(), CliError> {
+    use llmdb::gguf::parser::parse_path as parse_gguf;
+    use llmdb::stego::planner::build_allocation_plan;
+    use llmdb::stego::tensor_map::TensorMap;
+    use llmdb::v2::fs::Filesystem as V2Filesystem;
+
+    // Load the cover as a V2 filesystem. The model bytes serve double
+    // duty: llama-server reads the file directly from disk, and the
+    // V2 fs reads a snapshot into memory for tool-call dispatch. We
+    // write any modifications back at session end.
+    let parsed = parse_gguf(model)
+        .map_err(|e| CliError::user(format!("parse {}: {e}", model.display())))?;
+    let plan = build_allocation_plan(&parsed.tensors, AllocationMode::Standard);
+    let map = TensorMap::from_allocation_plan_with_base(&plan, parsed.tensor_data_offset as u64);
+    let cover = std::fs::read(model)
+        .map_err(|e| CliError::internal(format!("reading {}: {e}", model.display())))?;
+    let mut fs = V2Filesystem::mount(cover, map).map_err(|e| {
+        CliError::user(format!(
+            "V2 mount (no anchor? run `llmdb v2-init` first): {e}"
+        ))
+    })?;
 
     let port = pick_free_port()?;
     println!("spawning llama-server on port {port} …");
@@ -480,7 +491,7 @@ fn cmd_ask(
     println!("llama-server ready at {}", server.base_url());
 
     let client = HttpChatClient::new(server.base_url());
-    let mut session = AskSession::new(client, &mut device, "llmdb-ask");
+    let mut session = AskSession::new(client, &mut fs, "llmdb-ask");
 
     println!("\n`ask` session ready. Type a question, or Ctrl-D / `exit` to quit.\n");
 
@@ -515,6 +526,14 @@ fn cmd_ask(
     // `server`'s Drop kills the subprocess.
     drop(session);
     drop(server);
+
+    // Persist any state changes the model drove via tool calls. The
+    // current 4-tool set is read-only, but `unmount` is still the
+    // canonical way to close out the cover mmap → cover-bytes path.
+    let cover_after = fs.unmount();
+    std::fs::write(model, &cover_after).map_err(|e| {
+        CliError::internal(format!("writing {}: {e}", model.display()))
+    })?;
     Ok(())
 }
 
