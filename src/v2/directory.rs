@@ -99,9 +99,7 @@ pub struct Directory {
 
 #[derive(Debug, Error)]
 pub enum DirectoryError {
-    #[error(
-        "truncated directory header: need {DIRECTORY_HEADER_BYTES} bytes, got {0}"
-    )]
+    #[error("truncated directory header: need {DIRECTORY_HEADER_BYTES} bytes, got {0}")]
     TruncatedHeader(usize),
 
     #[error(
@@ -109,9 +107,7 @@ pub enum DirectoryError {
     )]
     TruncatedEntryHeader { offset: usize, available: usize },
 
-    #[error(
-        "truncated entry name at offset {offset}: need {needed} bytes, {available} available"
-    )]
+    #[error("truncated entry name at offset {offset}: need {needed} bytes, {available} available")]
     TruncatedName {
         offset: usize,
         needed: usize,
@@ -124,9 +120,7 @@ pub enum DirectoryError {
     #[error("entry reserved bytes at offset {offset} must be zero, got {bytes:?}")]
     ReservedNotZero { offset: usize, bytes: [u8; 2] },
 
-    #[error(
-        "invalid entry name: must be 1..={MAX_NAME_LEN} UTF-8 bytes and contain no '/' or NUL"
-    )]
+    #[error("invalid entry name: must be 1..={MAX_NAME_LEN} UTF-8 bytes and contain no '/' or NUL")]
     InvalidName,
 
     #[error("directory already contains an entry named '{0}'")]
@@ -254,7 +248,11 @@ impl Directory {
                 .to_owned();
             validate_name(&name)?;
             cursor += name_len;
-            entries.push(DirEntry { kind, name, inode: ptr });
+            entries.push(DirEntry {
+                kind,
+                name,
+                inode: ptr,
+            });
         }
         if cursor != bytes.len() {
             return Err(DirectoryError::TrailingBytes {

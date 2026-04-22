@@ -190,8 +190,8 @@ fn oob_write_returns_error_and_preserves_cover() {
     matches!(err, ChunkError::OutOfBounds { .. });
     assert_eq!(cover, before, "OOB write must not touch the cover");
 
-    let err = write_chunk(&mut cover, &map, ptr, 1, &[0x00])
-        .expect_err("writing at offset == capacity");
+    let err =
+        write_chunk(&mut cover, &map, ptr, 1, &[0x00]).expect_err("writing at offset == capacity");
     matches!(err, ChunkError::OutOfBounds { .. });
     assert_eq!(cover, before);
 }
@@ -266,7 +266,10 @@ fn chunk_in_middle_of_slot() {
     read_chunk(&cover, &map, other, 0, &mut other_out).unwrap();
     assert_eq!(other_out, [0x11, 0x22]);
     read_chunk(&cover, &map, ptr, 0, &mut out).unwrap();
-    assert_eq!(out, data, "writing to earlier chunk must not disturb later one");
+    assert_eq!(
+        out, data,
+        "writing to earlier chunk must not disturb later one"
+    );
 }
 
 #[test]
@@ -285,8 +288,8 @@ fn q8_0_chunk_round_trip() {
     };
 
     let data: [u8; 16] = [
-        0x00, 0xFF, 0xA5, 0x5A, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99,
-        0xAA, 0xBB, 0xCC,
+        0x00, 0xFF, 0xA5, 0x5A, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB,
+        0xCC,
     ];
     write_chunk(&mut cover, &map, ptr, 0, &data).expect("write");
     let mut out = [0u8; 16];
@@ -360,7 +363,10 @@ fn partial_final_byte_round_trips_low_bits_only() {
     let mut out = [0u8; 2];
     read_chunk(&cover, &map, ptr, 0, &mut out).expect("read partial-byte chunk");
     assert_eq!(out[0], 0xA5);
-    assert_eq!(out[1], 0x0F, "only the low 4 bits of the tail byte are addressable");
+    assert_eq!(
+        out[1], 0x0F,
+        "only the low 4 bits of the tail byte are addressable"
+    );
 }
 
 #[test]

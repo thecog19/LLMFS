@@ -84,12 +84,7 @@ fn brute_force_ceiling(mmap: &[u8], slot: &TensorSlot, weight_index: u64) -> f32
                 weight_index,
                 bit_index: bit_idx as u8,
             };
-            write_bit(
-                &mut probe,
-                slot,
-                pos,
-                ((v >> bit_idx) & 1) == 1,
-            );
+            write_bit(&mut probe, slot, pos, ((v >> bit_idx) & 1) == 1);
         }
         let mag = read_weight_abs(&probe, slot, weight_index);
         if mag > max_mag {
@@ -117,12 +112,7 @@ fn assert_invariance_and_tightness(mmap: &[u8], slot: &TensorSlot, weight_index:
                 weight_index,
                 bit_index: bit_idx as u8,
             };
-            write_bit(
-                &mut probe,
-                slot,
-                pos,
-                ((v >> bit_idx) & 1) == 1,
-            );
+            write_bit(&mut probe, slot, pos, ((v >> bit_idx) & 1) == 1);
         }
         // Invariance: ceiling is the same across all stealable-bit
         // configurations.
@@ -159,9 +149,7 @@ fn assert_invariance_and_tightness(mmap: &[u8], slot: &TensorSlot, weight_index:
         saw_tightness,
         "no stealable-bit configuration of {:?} weight {} reaches ceiling {} — \
          the ceiling is loose",
-        slot.quant_type,
-        weight_index,
-        expected,
+        slot.quant_type, weight_index, expected,
     );
 }
 
@@ -285,7 +273,9 @@ fn q8_0_ceiling_scales_with_block_scale() {
 fn q8_0_ceiling_invariance_tightness() {
     // Multiple int8 values with non-unit scale to stress both the
     // high-nibble handling and the scale multiplication.
-    let ints: Vec<i8> = (0..32).map(|i| ((i * 17 + 3) as i8).wrapping_sub(64)).collect();
+    let ints: Vec<i8> = (0..32)
+        .map(|i| ((i * 17 + 3) as i8).wrapping_sub(64))
+        .collect();
     let block = q8_0_fixture_block(0.1, &ints);
     let slot = slot_of(GgufQuantType::Q8_0, 32, 0);
     for w in 0..32 {
@@ -303,8 +293,7 @@ fn q3_k_ceiling_invariance_tightness() {
     // magnitude. Brute-force across stealable-bit configurations.
     let mut block = vec![0_u8; q3_k::BLOCK_BYTES];
     // Set d = 1.0 (fp16)
-    block[q3_k::D_OFFSET..q3_k::D_OFFSET + 2]
-        .copy_from_slice(&f32_to_f16_bits(1.0).to_le_bytes());
+    block[q3_k::D_OFFSET..q3_k::D_OFFSET + 2].copy_from_slice(&f32_to_f16_bits(1.0).to_le_bytes());
     // Set a few scales so weights aren't all zero-ceiling
     for i in 0..q3_k::SCALES_BYTES {
         block[q3_k::SCALES_OFFSET + i] = (i as u8).wrapping_add(5);

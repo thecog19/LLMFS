@@ -253,8 +253,14 @@ fn read_returns_file_content_for_nested_path() {
     let seen = seen.borrow();
     let tool_msg = seen[1].iter().find(|m| m.role == "tool").expect("tool msg");
     let content = tool_msg.content.as_deref().unwrap_or_default();
-    assert!(content.contains("important notes"), "missing payload: {content}");
-    assert!(content.contains("\"truncated\":false"), "should not truncate small file: {content}");
+    assert!(
+        content.contains("important notes"),
+        "missing payload: {content}"
+    );
+    assert!(
+        content.contains("\"truncated\":false"),
+        "should not truncate small file: {content}"
+    );
 }
 
 #[test]
@@ -310,8 +316,14 @@ fn stat_on_directory_omits_crc32() {
     let seen = seen.borrow();
     let tool_msg = seen[1].iter().find(|m| m.role == "tool").expect("tool msg");
     let content = tool_msg.content.as_deref().unwrap_or_default();
-    assert!(content.contains("\"kind\":\"directory\""), "wrong kind: {content}");
-    assert!(!content.contains("crc32"), "crc32 should be absent for dirs: {content}");
+    assert!(
+        content.contains("\"kind\":\"directory\""),
+        "wrong kind: {content}"
+    );
+    assert!(
+        !content.contains("crc32"),
+        "crc32 should be absent for dirs: {content}"
+    );
 }
 
 #[test]

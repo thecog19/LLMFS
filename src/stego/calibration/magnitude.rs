@@ -58,11 +58,7 @@ pub fn read_weight_abs(mmap: &[u8], slot: &TensorSlot, weight_index: u64) -> f32
 ///
 /// Non-stealable quant types (`stealable_bits_hint == 0`) return
 /// `0.0`, matching `read_weight_abs`'s convention.
-pub fn read_weight_ceiling_abs(
-    mmap: &[u8],
-    slot: &TensorSlot,
-    weight_index: u64,
-) -> f32 {
+pub fn read_weight_ceiling_abs(mmap: &[u8], slot: &TensorSlot, weight_index: u64) -> f32 {
     match slot.quant_type {
         GgufQuantType::F16 => read_f16_ceiling(mmap, slot.data_offset, weight_index),
         GgufQuantType::F32 => read_f32_ceiling(mmap, slot.data_offset, weight_index),
@@ -72,10 +68,9 @@ pub fn read_weight_ceiling_abs(
         // replicating them inline would drift from the packer; using
         // the packer's own `read_weight_value` via a probe copy of the
         // block keeps them in lockstep.
-        GgufQuantType::Q3K
-        | GgufQuantType::Q4K
-        | GgufQuantType::Q5K
-        | GgufQuantType::Q6K => read_kquant_ceiling(mmap, slot, weight_index),
+        GgufQuantType::Q3K | GgufQuantType::Q4K | GgufQuantType::Q5K | GgufQuantType::Q6K => {
+            read_kquant_ceiling(mmap, slot, weight_index)
+        }
         // Non-stealable quant types — same 0.0 convention as
         // `read_weight_abs`.
         GgufQuantType::Q2K

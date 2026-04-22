@@ -137,7 +137,9 @@ fn ask_session_drives_tool_calls_against_real_llama_server() {
     // the model to surface the passphrase content. Accept either.
     let called_names: Vec<&str> = tool_invocations.iter().map(|(n, _)| *n).collect();
     assert!(
-        called_names.iter().any(|n| matches!(*n, "read" | "list_all_files" | "ls" | "stat")),
+        called_names
+            .iter()
+            .any(|n| matches!(*n, "read" | "list_all_files" | "ls" | "stat")),
         "expected a fs-tool call (read/ls/stat/list_all_files); \
          got {called_names:?}. final answer: {answer:?}"
     );

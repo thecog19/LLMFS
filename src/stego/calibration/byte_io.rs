@@ -35,9 +35,7 @@ use crate::stego::calibration::placement::MetadataPlacement;
 use crate::stego::tensor_map::TensorMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
-#[error(
-    "byte I/O out of range: offset={offset} len={len} capacity_bytes={capacity_bytes}"
-)]
+#[error("byte I/O out of range: offset={offset} len={len} capacity_bytes={capacity_bytes}")]
 pub struct OutOfBoundsError {
     pub offset: u64,
     pub len: u64,

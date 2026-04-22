@@ -113,12 +113,7 @@ impl CeilingSummary {
     /// by the range contribute their full bucket max. Ranges beyond
     /// the slot's weight count are clamped at the last bucket — no
     /// panic.
-    pub fn max_over_range(
-        &self,
-        slot_index: u32,
-        start_weight: u64,
-        len_weights: u64,
-    ) -> f32 {
+    pub fn max_over_range(&self, slot_index: u32, start_weight: u64, len_weights: u64) -> f32 {
         if len_weights == 0 {
             return 0.0;
         }
@@ -142,9 +137,7 @@ impl CeilingSummary {
     pub fn serialize(&self) -> Vec<u8> {
         let slot_count = self.per_slot.len() as u32;
         let total_buckets: usize = self.per_slot.iter().map(|s| s.len()).sum();
-        let mut out = Vec::with_capacity(
-            HEADER_LEN + 4 * slot_count as usize + 4 * total_buckets,
-        );
+        let mut out = Vec::with_capacity(HEADER_LEN + 4 * slot_count as usize + 4 * total_buckets);
         out.extend_from_slice(MAGIC);
         out.push(VERSION);
         out.extend_from_slice(&[0_u8; 3]); // reserved
@@ -176,8 +169,7 @@ impl CeilingSummary {
         if version != VERSION {
             return Err(CeilingError::UnsupportedVersion(version));
         }
-        let slot_count =
-            u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+        let slot_count = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
 
         let per_slot_counts_start = HEADER_LEN;
         let per_slot_counts_end = per_slot_counts_start + 4 * slot_count;

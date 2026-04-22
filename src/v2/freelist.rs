@@ -135,24 +135,15 @@ impl FreeRunSet {
             .range(..=(slot, weight_index))
             .next_back()
             .map(|(k, _)| *k);
-        let key = containing_key.ok_or(ReserveError::NotFree {
-            slot,
-            weight_index,
-        })?;
+        let key = containing_key.ok_or(ReserveError::NotFree { slot, weight_index })?;
         if key.0 != slot {
-            return Err(ReserveError::NotFree {
-                slot,
-                weight_index,
-            });
+            return Err(ReserveError::NotFree { slot, weight_index });
         }
         let entry = *self.by_position.get(&key).unwrap();
         let run_start = key.1;
         let run_end = run_start + entry.length_in_weights;
         if weight_index < run_start || weight_index >= run_end {
-            return Err(ReserveError::NotFree {
-                slot,
-                weight_index,
-            });
+            return Err(ReserveError::NotFree { slot, weight_index });
         }
 
         // Remove the whole run.
@@ -161,11 +152,7 @@ impl FreeRunSet {
         // Reinsert the left half, if any.
         if weight_index > run_start {
             let left_len = weight_index - run_start;
-            let left_max = ceiling.max_over_range(
-                slot as u32,
-                run_start as u64,
-                left_len as u64,
-            );
+            let left_max = ceiling.max_over_range(slot as u32, run_start as u64, left_len as u64);
             self.insert_raw(FreeRun {
                 slot,
                 start_weight: run_start,
@@ -178,11 +165,8 @@ impl FreeRunSet {
         if weight_index + 1 < run_end {
             let right_start = weight_index + 1;
             let right_len = run_end - right_start;
-            let right_max = ceiling.max_over_range(
-                slot as u32,
-                right_start as u64,
-                right_len as u64,
-            );
+            let right_max =
+                ceiling.max_over_range(slot as u32, right_start as u64, right_len as u64);
             self.insert_raw(FreeRun {
                 slot,
                 start_weight: right_start,
@@ -308,7 +292,10 @@ impl FreeRunSet {
     }
 
     fn insert_raw(&mut self, run: FreeRun) {
-        debug_assert!(run.length_in_weights > 0, "refusing to insert zero-length run");
+        debug_assert!(
+            run.length_in_weights > 0,
+            "refusing to insert zero-length run"
+        );
         debug_assert!(
             !self.by_position.contains_key(&(run.slot, run.start_weight)),
             "duplicate free run at ({}, {})",

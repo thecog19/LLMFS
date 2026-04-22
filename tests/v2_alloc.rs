@@ -169,7 +169,10 @@ fn alloc_prefers_lower_max_ceiling_across_slots() {
     let mut alloc = Allocator::new_for_map(&map, summary).expect("allocator");
 
     let ptr = alloc.alloc(&map, 32).expect("alloc");
-    assert_eq!(ptr.slot, 1, "allocator should prefer the lower-ceiling slot");
+    assert_eq!(
+        ptr.slot, 1,
+        "allocator should prefer the lower-ceiling slot"
+    );
 }
 
 #[test]
@@ -217,7 +220,10 @@ fn alloc_returns_none_on_exhaustion() {
     let mut alloc = Allocator::new_for_map(&map, summary).expect("allocator");
 
     // 4 weights × 4 bits = 16 bits capacity.
-    assert!(alloc.alloc(&map, 17).is_none(), "over-capacity request errors");
+    assert!(
+        alloc.alloc(&map, 17).is_none(),
+        "over-capacity request errors"
+    );
     assert!(alloc.alloc(&map, 16).is_some(), "exact fit succeeds");
     assert!(alloc.alloc(&map, 1).is_none(), "nothing left");
 }
@@ -373,7 +379,11 @@ fn free_rejects_pointer_past_slot_end() {
         other => panic!("expected PointerOutOfBounds, got {other:?}"),
     }
 
-    assert_eq!(alloc.free_run_count(), 1, "bogus free must not mutate allocator state");
+    assert_eq!(
+        alloc.free_run_count(),
+        1,
+        "bogus free must not mutate allocator state"
+    );
     assert_eq!(alloc.total_free_weights(), 16);
 }
 
@@ -384,7 +394,11 @@ fn new_for_map_rejects_slots_larger_than_pointer_width() {
     let summary = summary_with_zero_buckets(&[1]);
 
     match Allocator::new_for_map(&map, summary) {
-        Err(AllocError::SlotTooLarge { slot, weight_count, max_weights }) => {
+        Err(AllocError::SlotTooLarge {
+            slot,
+            weight_count,
+            max_weights,
+        }) => {
             assert_eq!(slot, 0);
             assert_eq!(weight_count, u32::MAX as u64 + 1);
             assert_eq!(max_weights, u32::MAX as u64);
@@ -402,7 +416,10 @@ fn new_for_map_rejects_more_slots_than_pointer_width() {
     let summary = summary_with_zero_buckets(&vec![1; u16::MAX as usize + 2]);
 
     match Allocator::new_for_map(&map, summary) {
-        Err(AllocError::TooManySlots { slot_count, max_slots }) => {
+        Err(AllocError::TooManySlots {
+            slot_count,
+            max_slots,
+        }) => {
             assert_eq!(slot_count, u16::MAX as usize + 2);
             assert_eq!(max_slots, u16::MAX as usize + 1);
         }

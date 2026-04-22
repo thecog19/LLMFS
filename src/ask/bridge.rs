@@ -298,9 +298,9 @@ impl<'a, C: ChatClient> AskSession<'a, C> {
 }
 
 fn required_path<'a>(args: &'a Value, tool: &str) -> Result<&'a str, AskError> {
-    args.get("path")
-        .and_then(Value::as_str)
-        .ok_or_else(|| AskError::InvalidToolCall(format!("{tool} requires a `path` string argument")))
+    args.get("path").and_then(Value::as_str).ok_or_else(|| {
+        AskError::InvalidToolCall(format!("{tool} requires a `path` string argument"))
+    })
 }
 
 fn entry_kind_str(kind: EntryKind) -> &'static str {
@@ -322,7 +322,9 @@ fn path_kind(fs: &V2Filesystem, path: &str) -> Result<EntryKind, AskError> {
             return Ok(entry.kind);
         }
     }
-    Err(AskError::V2Fs(crate::v2::fs::FsError::PathNotFound(path.to_owned())))
+    Err(AskError::V2Fs(crate::v2::fs::FsError::PathNotFound(
+        path.to_owned(),
+    )))
 }
 
 /// Split `/a/b/c` → (`/a/b`, `c`); split `/x` → (`/`, `x`).
@@ -347,11 +349,7 @@ fn join_path(dir: &str, name: &str) -> String {
 
 /// Walk the tree depth-first, collecting every file's path + size.
 /// Directories are recursed into but not themselves reported.
-fn walk_files(
-    fs: &V2Filesystem,
-    dir: &str,
-    out: &mut Vec<(String, u64)>,
-) -> Result<(), AskError> {
+fn walk_files(fs: &V2Filesystem, dir: &str, out: &mut Vec<(String, u64)>) -> Result<(), AskError> {
     for entry in fs.readdir(dir)? {
         let child_path = join_path(dir, &entry.name);
         match entry.kind {

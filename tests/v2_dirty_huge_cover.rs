@@ -116,10 +116,10 @@ fn sparse_marks_for_280gb_cover_allocate_only_touched_pages() {
     // apart that each lands in a different sparse page.
     let positions: &[(u16, u32)] = &[
         (0, 0),
-        (0, 999_999_999),       // last weight of slot 0
-        (50, 500_000_000),      // mid-slot, mid-cover
-        (139, 0),               // first weight of last slot
-        (139, 999_999_999),     // last weight of last slot
+        (0, 999_999_999),   // last weight of slot 0
+        (50, 500_000_000),  // mid-slot, mid-cover
+        (139, 0),           // first weight of last slot
+        (139, 999_999_999), // last weight of last slot
     ];
     for &(slot, w) in positions {
         bitmap.mark(slot, w);

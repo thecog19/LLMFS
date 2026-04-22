@@ -117,8 +117,7 @@ fn all_zeros_file_collapses_to_a_single_data_chunk() {
 
     // At least one pointer should appear twice — dedup hit among
     // identical interior chunks.
-    let unique: HashSet<(u16, u32)> =
-        ptrs.iter().map(|p| (p.slot, p.start_weight)).collect();
+    let unique: HashSet<(u16, u32)> = ptrs.iter().map(|p| (p.slot, p.start_weight)).collect();
     assert!(
         unique.len() < ptrs.len(),
         "all-zeros file should dedup some chunks: {} pointers → {} unique",
@@ -188,8 +187,7 @@ fn dedup_survives_remount() {
         .collect();
     let cover1 = fs.unmount().expect("unmount");
 
-    let mut fs2 =
-        Filesystem::mount_with_cdc_params(cover1, map, small_cdc()).expect("mount");
+    let mut fs2 = Filesystem::mount_with_cdc_params(cover1, map, small_cdc()).expect("mount");
     // After mount the dedup index should have been rebuilt from
     // the current inode tree.
     assert!(fs2.dedup_index().len() >= original_ptrs.len());
@@ -200,7 +198,10 @@ fn dedup_survives_remount() {
         .iter()
         .map(|p| (p.slot, p.start_weight))
         .collect();
-    assert_eq!(original_ptrs, after_remount, "dedup should match pre-remount");
+    assert_eq!(
+        original_ptrs, after_remount,
+        "dedup should match pre-remount"
+    );
 }
 
 // ------------------------------------------------------------------
@@ -227,8 +228,7 @@ fn distinct_content_produces_distinct_pointers() {
     fs.create_file("/data", &data).expect("write");
 
     let ptrs = direct_pointers(&fs);
-    let unique: HashSet<(u16, u32)> =
-        ptrs.iter().map(|p| (p.slot, p.start_weight)).collect();
+    let unique: HashSet<(u16, u32)> = ptrs.iter().map(|p| (p.slot, p.start_weight)).collect();
     // Every chunk has distinct content → pointers should be all
     // distinct. Equality (not just ≤) confirms no false dedup hits.
     assert_eq!(

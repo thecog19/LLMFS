@@ -136,7 +136,10 @@ fn insert_with_merge_three_way_coalesce() {
     let got = fl.pop_best_fit(1).expect("pop");
     assert_eq!(got.start_weight, 0);
     assert_eq!(got.length_in_weights, 250);
-    assert!((got.max_ceiling - 0.8).abs() < f32::EPSILON, "max should be 0.8");
+    assert!(
+        (got.max_ceiling - 0.8).abs() < f32::EPSILON,
+        "max should be 0.8"
+    );
 }
 
 #[test]
@@ -253,15 +256,31 @@ fn reserve_weight_not_in_any_run_errors() {
 
     // Before the run.
     let err = fl.reserve_weight(0, 50, &summary).expect_err("not free");
-    assert_eq!(err, ReserveError::NotFree { slot: 0, weight_index: 50 });
+    assert_eq!(
+        err,
+        ReserveError::NotFree {
+            slot: 0,
+            weight_index: 50
+        }
+    );
     // After the run.
-    let err = fl
-        .reserve_weight(0, 200, &summary)
-        .expect_err("not free");
-    assert_eq!(err, ReserveError::NotFree { slot: 0, weight_index: 200 });
+    let err = fl.reserve_weight(0, 200, &summary).expect_err("not free");
+    assert_eq!(
+        err,
+        ReserveError::NotFree {
+            slot: 0,
+            weight_index: 200
+        }
+    );
     // Wrong slot.
     let err = fl.reserve_weight(1, 100, &summary).expect_err("not free");
-    assert_eq!(err, ReserveError::NotFree { slot: 1, weight_index: 100 });
+    assert_eq!(
+        err,
+        ReserveError::NotFree {
+            slot: 1,
+            weight_index: 100
+        }
+    );
 }
 
 #[test]
@@ -275,7 +294,11 @@ fn reserve_many_weights_produces_many_small_runs() {
     for w in [5_u32, 100, 200, 300, 400, 500, 600, 700, 800, 900] {
         fl.reserve_weight(0, w, &summary).expect("reserve");
     }
-    assert_eq!(fl.len(), 11, "10 reservations → 11 gaps in the original run");
+    assert_eq!(
+        fl.len(),
+        11,
+        "10 reservations → 11 gaps in the original run"
+    );
 }
 
 // ------------------------------------------------------------------

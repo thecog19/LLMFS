@@ -114,8 +114,7 @@ impl AnchorSlot {
     fn decode(bytes: &[u8; SLOT_BYTES]) -> Result<Self, AnchorError> {
         let generation = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
         let super_root = Pointer::decode(&bytes[8..8 + Pointer::SIZE])?;
-        let crc32 =
-            u32::from_le_bytes(bytes[8 + Pointer::SIZE..SLOT_BYTES].try_into().unwrap());
+        let crc32 = u32::from_le_bytes(bytes[8 + Pointer::SIZE..SLOT_BYTES].try_into().unwrap());
         Ok(Self {
             generation,
             super_root,
@@ -190,11 +189,7 @@ pub fn find_anchor_placement(mmap: &[u8], map: &TensorMap) -> MetadataPlacement 
     find_placement_for_bits(mmap, map, ANCHOR_BITS)
 }
 
-fn find_placement_for_bits(
-    mmap: &[u8],
-    map: &TensorMap,
-    needed_bits: u64,
-) -> MetadataPlacement {
+fn find_placement_for_bits(mmap: &[u8], map: &TensorMap, needed_bits: u64) -> MetadataPlacement {
     use std::collections::BinaryHeap;
 
     // Heap key: (ceiling_bits, WeightRef). For non-negative IEEE-754
@@ -295,8 +290,7 @@ pub fn init_anchor(
     let slot0 = AnchorSlot::with_pointer(0, super_root);
     let slot1 = AnchorSlot::with_pointer(1, super_root);
     buf[HEADER_BYTES..HEADER_BYTES + SLOT_BYTES].copy_from_slice(&slot0.encode());
-    buf[HEADER_BYTES + SLOT_BYTES..HEADER_BYTES + 2 * SLOT_BYTES]
-        .copy_from_slice(&slot1.encode());
+    buf[HEADER_BYTES + SLOT_BYTES..HEADER_BYTES + 2 * SLOT_BYTES].copy_from_slice(&slot1.encode());
 
     write_bytes(mmap, map, &placement, 0, &buf)?;
     Ok(())
@@ -309,10 +303,7 @@ pub fn init_anchor(
 /// callers that mount or commit frequently, use
 /// [`read_anchor_with_placement`] with a cached placement (the
 /// placement is O(N) in total eligible weights).
-pub fn read_anchor(
-    mmap: &[u8],
-    map: &TensorMap,
-) -> Result<AnchorReadOutcome, AnchorError> {
+pub fn read_anchor(mmap: &[u8], map: &TensorMap) -> Result<AnchorReadOutcome, AnchorError> {
     let placement = find_anchor_placement(mmap, map);
     read_anchor_with_placement(mmap, map, &placement)
 }

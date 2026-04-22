@@ -43,7 +43,9 @@ use crate::v2::pointer::Pointer;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ChunkError {
-    #[error("chunk I/O out of bounds: byte_offset={byte_offset} len={len} capacity_bytes={capacity_bytes}")]
+    #[error(
+        "chunk I/O out of bounds: byte_offset={byte_offset} len={len} capacity_bytes={capacity_bytes}"
+    )]
     OutOfBounds {
         byte_offset: u64,
         len: u64,
@@ -53,7 +55,9 @@ pub enum ChunkError {
     SlotOutOfRange { slot: u16, slot_count: usize },
     #[error("pointer targets slot {slot}, which has no stealable bits")]
     NonStealableSlot { slot: u16 },
-    #[error("pointer range [{start_weight}, {end_weight}) lies outside slot {slot} with {weight_count} weights")]
+    #[error(
+        "pointer range [{start_weight}, {end_weight}) lies outside slot {slot} with {weight_count} weights"
+    )]
     PointerOutOfBounds {
         slot: u16,
         start_weight: u32,
@@ -177,11 +181,13 @@ fn validate_pointer_range(
 
 fn check_bounds(pointer: Pointer, byte_offset: u64, len: u64) -> Result<(), ChunkError> {
     let cap = byte_capacity(pointer);
-    let end = byte_offset.checked_add(len).ok_or(ChunkError::OutOfBounds {
-        byte_offset,
-        len,
-        capacity_bytes: cap,
-    })?;
+    let end = byte_offset
+        .checked_add(len)
+        .ok_or(ChunkError::OutOfBounds {
+            byte_offset,
+            len,
+            capacity_bytes: cap,
+        })?;
     if end > cap {
         return Err(ChunkError::OutOfBounds {
             byte_offset,

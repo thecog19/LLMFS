@@ -177,7 +177,10 @@ fn synthesize_f32_cover(weight_count: u64, seed: u64) -> (TensorSlot, Vec<u8>) {
 /// nibble of 0 can push to 15 but that's still a small magnitude if
 /// scale is small; we want a mix).
 fn synthesize_q8_0_cover(weight_count: u64, seed: u64) -> (TensorSlot, Vec<u8>) {
-    assert!(weight_count.is_multiple_of(32), "Q8_0 blocks are 32 weights");
+    assert!(
+        weight_count.is_multiple_of(32),
+        "Q8_0 blocks are 32 weights"
+    );
     let block_count = weight_count / 32;
     let mut rng = Rng::new(seed);
     let mut bytes = Vec::with_capacity(block_count as usize * 34);
@@ -234,12 +237,7 @@ struct Findability {
     cover_bytes_modified: usize,
 }
 
-fn measure(
-    cover: &mut [u8],
-    map: &TensorMap,
-    needed_bits: u64,
-    data: &[u8],
-) -> Findability {
+fn measure(cover: &mut [u8], map: &TensorMap, needed_bits: u64, data: &[u8]) -> Findability {
     let before = cover.to_vec();
     let placement_a = compute_metadata_placement(cover, map, needed_bits);
     assert!(
@@ -274,7 +272,11 @@ fn measure(
     read_bytes(cover, map, &placement_b, 0, &mut readback).expect("read in-bounds");
     let byte_mismatch = readback.iter().zip(data).filter(|(a, b)| a != b).count();
 
-    let cover_bytes_modified = before.iter().zip(cover.iter()).filter(|(a, b)| a != b).count();
+    let cover_bytes_modified = before
+        .iter()
+        .zip(cover.iter())
+        .filter(|(a, b)| a != b)
+        .count();
 
     Findability {
         position_drift,

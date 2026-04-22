@@ -87,11 +87,9 @@ impl Pointer {
         }
         let slot = u16::from_le_bytes([bytes[0], bytes[1]]);
         let start_weight = u32::from_le_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]);
-        let length_in_bits =
-            u32::from_le_bytes([bytes[6], bytes[7], bytes[8], bytes[9]]);
+        let length_in_bits = u32::from_le_bytes([bytes[6], bytes[7], bytes[8], bytes[9]]);
         let flags = u16::from_le_bytes([bytes[10], bytes[11]]);
-        let reserved =
-            u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
+        let reserved = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
         if reserved != 0 {
             return Err(PointerError::NonZeroReserved { found: reserved });
         }

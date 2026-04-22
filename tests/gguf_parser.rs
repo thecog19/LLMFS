@@ -78,3 +78,19 @@ fn rejects_unsupported_versions() {
     let err = parse_path(&fixture.path).expect_err("unsupported version should fail");
     assert!(matches!(err, ParseError::UnsupportedVersion(7)));
 }
+
+#[test]
+fn empty_file_reports_unexpected_eof() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("empty.gguf");
+    std::fs::write(&path, []).expect("write empty file");
+
+    let err = parse_path(&path).expect_err("empty file should fail");
+    assert!(matches!(
+        err,
+        ParseError::UnexpectedEof {
+            context: "magic",
+            ..
+        }
+    ));
+}

@@ -31,8 +31,8 @@ use llmdb::stego::calibration::magnitude::read_weight_ceiling_abs;
 use llmdb::stego::planner::TensorTier;
 use llmdb::stego::tensor_map::{TensorMap, TensorSlot};
 use llmdb::v2::anchor::{
-    ANCHOR_BITS, AnchorError, SlotIndex, commit_anchor, find_anchor_placement,
-    init_anchor, read_anchor,
+    ANCHOR_BITS, AnchorError, SlotIndex, commit_anchor, find_anchor_placement, init_anchor,
+    read_anchor,
 };
 use llmdb::v2::pointer::Pointer;
 
@@ -225,7 +225,8 @@ fn commit_bumps_generation_and_alternates_slot() {
     assert_eq!(after_init.active.generation, 1);
     assert_eq!(after_init.active_slot, SlotIndex::Slot1);
 
-    let gen_1 = commit_anchor(&mut cover, &map, sr1, after_init.active.generation).expect("commit 1");
+    let gen_1 =
+        commit_anchor(&mut cover, &map, sr1, after_init.active.generation).expect("commit 1");
     assert_eq!(gen_1, after_init.active.generation + 1);
     let after_1 = read_anchor(&cover, &map).expect("read after commit 1");
     assert_eq!(after_1.active.super_root, sr1);

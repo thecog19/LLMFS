@@ -27,7 +27,12 @@ fn f16_tensor(name: &str, weight_count: usize) -> SyntheticTensorSpec {
 
 fn make_f16_tensors(count: usize, weights_per_tensor: usize) -> Vec<SyntheticTensorSpec> {
     (0..count)
-        .map(|i| f16_tensor(&format!("blk.{}.ffn_down.weight", count - 1 - i), weights_per_tensor))
+        .map(|i| {
+            f16_tensor(
+                &format!("blk.{}.ffn_down.weight", count - 1 - i),
+                weights_per_tensor,
+            )
+        })
         .collect()
 }
 
@@ -56,7 +61,13 @@ fn init_reports_capacity_summary() {
     let out = llmdb().arg("init").arg(&fx.path).assert().success();
     let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
 
-    for label in ["initialized", "cover size:", "eligible slots:", "eligible weights:", "generation:"] {
+    for label in [
+        "initialized",
+        "cover size:",
+        "eligible slots:",
+        "eligible weights:",
+        "generation:",
+    ] {
         assert!(
             stdout.contains(label),
             "init output missing `{label}`:\n{stdout}"
@@ -113,7 +124,10 @@ fn store_ls_get_rm_roundtrip() {
     // ls at root and at /notes
     let ls_root = llmdb().arg("ls").arg(&fx.path).assert().success();
     let root_out = String::from_utf8_lossy(&ls_root.get_output().stdout).into_owned();
-    assert!(root_out.contains("notes/"), "root ls missing notes/: {root_out}");
+    assert!(
+        root_out.contains("notes/"),
+        "root ls missing notes/: {root_out}"
+    );
 
     let ls_notes = llmdb()
         .arg("ls")
@@ -236,14 +250,19 @@ fn re_init_wipes_prior_state() {
     init(&fx.path);
     let ls = llmdb().arg("ls").arg(&fx.path).assert().success();
     let stdout = String::from_utf8_lossy(&ls.get_output().stdout).into_owned();
-    assert!(stdout.trim().is_empty(), "re-init should leave 0 files: {stdout}");
+    assert!(
+        stdout.trim().is_empty(),
+        "re-init should leave 0 files: {stdout}"
+    );
 }
 
 #[test]
 fn help_flag_lists_v2_subcommands() {
     let out = llmdb().arg("--help").assert().success();
     let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
-    for verb in ["init", "status", "mount", "unmount", "ls", "store", "get", "rm", "ask"] {
+    for verb in [
+        "init", "status", "mount", "unmount", "ls", "store", "get", "rm", "ask",
+    ] {
         assert!(
             stdout.contains(verb),
             "--help missing verb `{verb}`:\n{stdout}"

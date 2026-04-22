@@ -106,7 +106,12 @@ fn cdc() -> FastCdcParams {
 /// Returns `None` when FUSE isn't usable.
 fn spawn_mount_with_two_files(
     bytes_per_file: usize,
-) -> Option<(tempfile::TempDir, fuser::BackgroundSession, Vec<u8>, Vec<u8>)> {
+) -> Option<(
+    tempfile::TempDir,
+    fuser::BackgroundSession,
+    Vec<u8>,
+    Vec<u8>,
+)> {
     if !fuse_available() {
         eprintln!("skipping: /dev/fuse or fusermount missing");
         return None;
@@ -117,7 +122,9 @@ fn spawn_mount_with_two_files(
     // Two files with distinct content so dedup doesn't collapse them
     // to the same chunks (which would make the test unrepresentative).
     let payload_a: Vec<u8> = (0..bytes_per_file).map(|i| (i % 251) as u8).collect();
-    let payload_b: Vec<u8> = (0..bytes_per_file).map(|i| ((i * 31 + 7) % 251) as u8).collect();
+    let payload_b: Vec<u8> = (0..bytes_per_file)
+        .map(|i| ((i * 31 + 7) % 251) as u8)
+        .collect();
     fs.create_file("/a.bin", &payload_a).expect("create /a.bin");
     fs.create_file("/b.bin", &payload_b).expect("create /b.bin");
 

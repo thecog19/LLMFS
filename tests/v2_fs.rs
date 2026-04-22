@@ -237,16 +237,36 @@ fn mount_fails_cleanly_on_inode_pointer_with_invalid_slot() {
     let super_root_ptr = anchor_outcome.active.super_root;
 
     let mut super_root_bytes = [0u8; SUPER_ROOT_BYTES];
-    read_chunk(cover_after.bytes(), &map, super_root_ptr, 0, &mut super_root_bytes)
-        .expect("read super-root");
+    read_chunk(
+        cover_after.bytes(),
+        &map,
+        super_root_ptr,
+        0,
+        &mut super_root_bytes,
+    )
+    .expect("read super-root");
     let super_root = SuperRoot::decode(&super_root_bytes).expect("decode super-root");
 
     let root_inode_ptr = super_root.root_dir_inode;
     let mut inode_bytes = [0u8; INODE_BYTES];
-    read_chunk(cover_after.bytes(), &map, root_inode_ptr, 0, &mut inode_bytes).expect("read inode");
+    read_chunk(
+        cover_after.bytes(),
+        &map,
+        root_inode_ptr,
+        0,
+        &mut inode_bytes,
+    )
+    .expect("read inode");
     let mut inode = Inode::decode(&inode_bytes).expect("decode inode");
     inode.direct[0].slot = u16::MAX;
-    write_chunk(cover_after.bytes_mut(), &map, root_inode_ptr, 0, &inode.encode()).expect("write inode");
+    write_chunk(
+        cover_after.bytes_mut(),
+        &map,
+        root_inode_ptr,
+        0,
+        &inode.encode(),
+    )
+    .expect("write inode");
 
     match Filesystem::mount_with_cdc_params(cover_after, map, small_cdc()) {
         Err(FsError::PointerSlotOutOfRange {
@@ -281,16 +301,13 @@ fn multiple_writes_across_multiple_sessions() {
     fs.create_file("/data", b"session-1 data").expect("write 1");
     let cover1 = fs.unmount().expect("unmount");
 
-    let mut fs2 = Filesystem::mount_with_cdc_params(cover1, map.clone(), small_cdc())
-        .expect("mount 1");
+    let mut fs2 =
+        Filesystem::mount_with_cdc_params(cover1, map.clone(), small_cdc()).expect("mount 1");
     assert_eq!(fs2.read_file("/data").expect("read"), b"session-1 data");
     fs2.create_file("/data", b"session-2 replaces")
         .expect("write 2");
     let cover2 = fs2.unmount().expect("unmount");
 
     let fs3 = Filesystem::mount_with_cdc_params(cover2, map, small_cdc()).expect("mount 2");
-    assert_eq!(
-        fs3.read_file("/data").expect("read"),
-        b"session-2 replaces"
-    );
+    assert_eq!(fs3.read_file("/data").expect("read"), b"session-2 replaces");
 }

@@ -36,8 +36,7 @@ fn smollm2_135m_f16_round_trips_through_v2_filesystem() {
 
     let parsed = parse_path(PRISTINE_F16).expect("parse pristine GGUF");
     let plan = build_allocation_plan(&parsed.tensors, AllocationMode::Standard);
-    let map =
-        TensorMap::from_allocation_plan_with_base(&plan, parsed.tensor_data_offset as u64);
+    let map = TensorMap::from_allocation_plan_with_base(&plan, parsed.tensor_data_offset as u64);
     let cover = std::fs::read(PRISTINE_F16).expect("read pristine bytes");
 
     let total_weights: u64 = map.slots.iter().map(|s| s.weight_count).sum();

@@ -181,6 +181,14 @@ struct WriteBuffer {
     mode: u16,
     contents: Vec<u8>,
     dirty: bool,
+    revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FlushSnapshot {
+    path: String,
+    contents: Vec<u8>,
+    revision: u64,
 }
 
 // ==================================================================
@@ -334,20 +342,53 @@ impl Ctx {
     /// exists or it's clean. Holds the V2 write lock during the
     /// commit; per-buffer Mutex is held only to snapshot contents.
     fn flush_buffer(&self, ino: u64) -> Result<(), FsError> {
-        let buf = match self.buffer(ino) {
-            Some(b) => b,
-            None => return Ok(()),
-        };
-        let (path, contents) = {
-            let b = buf.lock().unwrap();
-            if !b.dirty {
+        loop {
+            let Some((buf, snapshot)) = self.snapshot_dirty_buffer(ino) else {
+                return Ok(());
+            };
+            self.fs
+                .write()
+                .unwrap()
+                .create_file(&snapshot.path, &snapshot.contents)?;
+            if Self::finish_flush(&buf, snapshot.revision) {
                 return Ok(());
             }
-            (b.path.clone(), b.contents.clone())
+        }
+    }
+
+    fn snapshot_dirty_buffer(&self, ino: u64) -> Option<(Arc<Mutex<WriteBuffer>>, FlushSnapshot)> {
+        let buf = self.buffer(ino)?;
+        let snapshot = {
+            let b = buf.lock().unwrap();
+            if !b.dirty {
+                return None;
+            }
+            FlushSnapshot {
+                path: b.path.clone(),
+                contents: b.contents.clone(),
+                revision: b.revision,
+            }
         };
-        self.fs.write().unwrap().create_file(&path, &contents)?;
+        Some((buf, snapshot))
+    }
+
+    fn finish_flush(buf: &Arc<Mutex<WriteBuffer>>, flushed_revision: u64) -> bool {
         let mut b = buf.lock().unwrap();
-        b.dirty = false;
+        if b.revision == flushed_revision {
+            b.dirty = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn unlink_path(&self, path: &str) -> Result<(), FsError> {
+        self.fs.write().unwrap().unlink(path)?;
+        let ino = self.inodes.read().unwrap().ino_for_path(path);
+        if let Some(ino) = ino {
+            self.buffers.write().unwrap().remove(&ino);
+            self.inodes.write().unwrap().forget(ino);
+        }
         Ok(())
     }
 }
@@ -602,15 +643,14 @@ impl FuserFilesystem for LlmdbV2Fs {
 // Per-method work bodies (run on worker threads)
 // ==================================================================
 
-fn do_lookup(
-    ctx: Ctx,
-    parent: u64,
-    name: OsString,
-    uid: u32,
-    gid: u32,
-    reply: ReplyEntry,
-) {
-    let parent_path = match ctx.inodes.read().unwrap().path_of(parent).map(str::to_owned) {
+fn do_lookup(ctx: Ctx, parent: u64, name: OsString, uid: u32, gid: u32, reply: ReplyEntry) {
+    let parent_path = match ctx
+        .inodes
+        .read()
+        .unwrap()
+        .path_of(parent)
+        .map(str::to_owned)
+    {
         Some(p) => p,
         None => {
             reply.error(libc::ENOENT);
@@ -809,6 +849,7 @@ fn do_write(ctx: Ctx, ino: u64, offset: i64, data: Vec<u8>, reply: ReplyWrite) {
                 mode: DEFAULT_FILE_MODE,
                 contents: existing,
                 dirty: false,
+                revision: 0,
             }));
             map.insert(ino, Arc::clone(&buf));
             buf
@@ -822,6 +863,7 @@ fn do_write(ctx: Ctx, ino: u64, offset: i64, data: Vec<u8>, reply: ReplyWrite) {
     }
     b.contents[start..end].copy_from_slice(&data);
     b.dirty = true;
+    b.revision = b.revision.wrapping_add(1);
     reply.written(data.len() as u32);
 }
 
@@ -834,7 +876,13 @@ fn do_create(
     gid: u32,
     reply: ReplyCreate,
 ) {
-    let parent_path = match ctx.inodes.read().unwrap().path_of(parent).map(str::to_owned) {
+    let parent_path = match ctx
+        .inodes
+        .read()
+        .unwrap()
+        .path_of(parent)
+        .map(str::to_owned)
+    {
         Some(p) => p,
         None => {
             reply.error(libc::EINVAL);
@@ -869,6 +917,7 @@ fn do_create(
             mode: buf_mode,
             contents: Vec::new(),
             dirty: false,
+            revision: 0,
         })),
     );
     let attr = FileAttr {
@@ -892,7 +941,13 @@ fn do_create(
 }
 
 fn do_unlink(ctx: Ctx, parent: u64, name: OsString, reply: ReplyEmpty) {
-    let parent_path = match ctx.inodes.read().unwrap().path_of(parent).map(str::to_owned) {
+    let parent_path = match ctx
+        .inodes
+        .read()
+        .unwrap()
+        .path_of(parent)
+        .map(str::to_owned)
+    {
         Some(p) => p,
         None => {
             reply.error(libc::ENOENT);
@@ -905,26 +960,20 @@ fn do_unlink(ctx: Ctx, parent: u64, name: OsString, reply: ReplyEmpty) {
     };
     let path = join_path(&parent_path, name_str);
 
-    let ino_opt = ctx.inodes.read().unwrap().ino_for_path(&path);
-    if let Some(ino) = ino_opt {
-        ctx.buffers.write().unwrap().remove(&ino);
-        ctx.inodes.write().unwrap().forget(ino);
-    }
-    match ctx.fs.write().unwrap().unlink(&path) {
+    match ctx.unlink_path(&path) {
         Ok(()) => reply.ok(),
         Err(err) => reply.error(fs_err_to_errno(&err)),
     }
 }
 
-fn do_mkdir(
-    ctx: Ctx,
-    parent: u64,
-    name: OsString,
-    uid: u32,
-    gid: u32,
-    reply: ReplyEntry,
-) {
-    let parent_path = match ctx.inodes.read().unwrap().path_of(parent).map(str::to_owned) {
+fn do_mkdir(ctx: Ctx, parent: u64, name: OsString, uid: u32, gid: u32, reply: ReplyEntry) {
+    let parent_path = match ctx
+        .inodes
+        .read()
+        .unwrap()
+        .path_of(parent)
+        .map(str::to_owned)
+    {
         Some(p) => p,
         None => {
             reply.error(libc::EINVAL);
@@ -947,7 +996,13 @@ fn do_mkdir(
 }
 
 fn do_rmdir(ctx: Ctx, parent: u64, name: OsString, reply: ReplyEmpty) {
-    let parent_path = match ctx.inodes.read().unwrap().path_of(parent).map(str::to_owned) {
+    let parent_path = match ctx
+        .inodes
+        .read()
+        .unwrap()
+        .path_of(parent)
+        .map(str::to_owned)
+    {
         Some(p) => p,
         None => {
             reply.error(libc::ENOENT);
@@ -1002,6 +1057,7 @@ fn do_setattr(
                     mode: DEFAULT_FILE_MODE,
                     contents: existing,
                     dirty: false,
+                    revision: 0,
                 }));
                 map.insert(ino, Arc::clone(&buf));
                 buf
@@ -1011,10 +1067,12 @@ fn do_setattr(
         if let Some(new_size) = size {
             b.contents.resize(new_size as usize, 0);
             b.dirty = true;
+            b.revision = b.revision.wrapping_add(1);
         }
         if let Some(new_mode) = mode {
             b.mode = (new_mode & 0o7777) as u16;
             b.dirty = true;
+            b.revision = b.revision.wrapping_add(1);
         }
     }
 
@@ -1085,6 +1143,10 @@ pub fn spawn_background(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gguf::quant::GgufQuantType;
+    use crate::stego::planner::TensorTier;
+    use crate::stego::tensor_map::{TensorMap, TensorSlot};
+    use crate::v2::cdc::FastCdcParams;
 
     #[test]
     fn root_maps_to_ino_1() {
@@ -1129,5 +1191,196 @@ mod tests {
     #[test]
     fn join_path_nested_parent() {
         assert_eq!(join_path("/a/b", "c"), "/a/b/c");
+    }
+
+    fn small_cdc() -> FastCdcParams {
+        FastCdcParams {
+            min_size: 32,
+            avg_size: 64,
+            max_size: 128,
+        }
+    }
+
+    fn f32_to_f16_bits(value: f32) -> u16 {
+        let bits = value.to_bits();
+        let sign = ((bits >> 31) & 0x1) as u16;
+        let exp32 = ((bits >> 23) & 0xFF) as i32;
+        let mantissa32 = bits & 0x7FFFFF;
+        if exp32 == 0 {
+            return sign << 15;
+        }
+        let exp16 = exp32 - 127 + 15;
+        if exp16 <= 0 {
+            return sign << 15;
+        }
+        if exp16 >= 31 {
+            return (sign << 15) | (0x1F << 10);
+        }
+        let mantissa16 = (mantissa32 >> 13) as u16;
+        (sign << 15) | ((exp16 as u16) << 10) | mantissa16
+    }
+
+    fn make_cover() -> (Vec<u8>, TensorMap) {
+        let weight_count = 20_000_u64;
+        let values: Vec<f32> = (0..weight_count)
+            .map(|i| {
+                let sign = if i % 3 == 0 { -1.0 } else { 1.0 };
+                sign * ((i + 1) as f32) * 0.00002
+            })
+            .collect();
+        let mut bytes = Vec::with_capacity(values.len() * 2);
+        for v in &values {
+            bytes.extend_from_slice(&f32_to_f16_bits(*v).to_le_bytes());
+        }
+        let slot = TensorSlot {
+            name: "fuse.unit.f16".to_owned(),
+            quant_type: GgufQuantType::F16,
+            tier: TensorTier::Tier1,
+            data_offset: 0,
+            weight_count,
+            stealable_bits_per_weight: GgufQuantType::F16.stealable_bits_hint(),
+            capacity_bits: weight_count * GgufQuantType::F16.stealable_bits_hint() as u64,
+            bit_start: 0,
+            bit_end: weight_count * GgufQuantType::F16.stealable_bits_hint() as u64,
+        };
+        let map = TensorMap {
+            slots: vec![slot.clone()],
+            total_capacity_bits: slot.capacity_bits,
+            total_capacity_bytes: slot.capacity_bits / 8,
+        };
+        (bytes, map)
+    }
+
+    fn test_ctx() -> Ctx {
+        let (cover, map) = make_cover();
+        let fs = Filesystem::init_with_cdc_params(cover, map, small_cdc()).expect("init");
+        Ctx {
+            fs: Arc::new(RwLock::new(fs)),
+            inodes: Arc::new(RwLock::new(InodeMap::default())),
+            buffers: Arc::new(RwLock::new(HashMap::new())),
+            mount_time: SystemTime::UNIX_EPOCH,
+        }
+    }
+
+    #[test]
+    fn flush_buffer_retries_until_latest_revision_is_persisted() {
+        let ctx = test_ctx();
+        ctx.fs
+            .write()
+            .unwrap()
+            .create_file("/race.txt", b"seed")
+            .expect("seed file");
+        let ino = ctx.inodes.write().unwrap().intern("/race.txt");
+        let buf = Arc::new(Mutex::new(WriteBuffer {
+            path: "/race.txt".to_owned(),
+            mode: DEFAULT_FILE_MODE,
+            contents: b"old".to_vec(),
+            dirty: true,
+            revision: 1,
+        }));
+        ctx.buffers.write().unwrap().insert(ino, Arc::clone(&buf));
+
+        let (buf, snapshot) = ctx
+            .snapshot_dirty_buffer(ino)
+            .expect("dirty snapshot should exist");
+        {
+            let mut b = buf.lock().unwrap();
+            b.contents = b"new".to_vec();
+            b.dirty = true;
+            b.revision = 2;
+        }
+
+        ctx.fs
+            .write()
+            .unwrap()
+            .create_file(&snapshot.path, &snapshot.contents)
+            .expect("persist stale snapshot");
+        assert!(
+            !Ctx::finish_flush(&buf, snapshot.revision),
+            "newer writes must keep the buffer dirty",
+        );
+        assert_eq!(
+            ctx.fs
+                .read()
+                .unwrap()
+                .read_file("/race.txt")
+                .expect("read stale"),
+            b"old"
+        );
+        assert!(ctx.buffer(ino).unwrap().lock().unwrap().dirty);
+
+        ctx.flush_buffer(ino).expect("flush latest revision");
+
+        assert_eq!(
+            ctx.fs
+                .read()
+                .unwrap()
+                .read_file("/race.txt")
+                .expect("read latest"),
+            b"new"
+        );
+        let b = ctx.buffer(ino).unwrap();
+        let b = b.lock().unwrap();
+        assert!(!b.dirty);
+        assert_eq!(b.revision, 2);
+    }
+
+    #[test]
+    fn unlink_path_failure_keeps_cached_state() {
+        let ctx = test_ctx();
+        let ino = ctx.inodes.write().unwrap().intern("/ghost.txt");
+        ctx.buffers.write().unwrap().insert(
+            ino,
+            Arc::new(Mutex::new(WriteBuffer {
+                path: "/ghost.txt".to_owned(),
+                mode: DEFAULT_FILE_MODE,
+                contents: b"pending".to_vec(),
+                dirty: true,
+                revision: 1,
+            })),
+        );
+
+        let err = ctx
+            .unlink_path("/ghost.txt")
+            .expect_err("unlink should fail");
+        assert!(matches!(err, FsError::PathNotFound(_)));
+        assert_eq!(
+            ctx.inodes.read().unwrap().ino_for_path("/ghost.txt"),
+            Some(ino)
+        );
+        assert!(ctx.buffer(ino).is_some());
+    }
+
+    #[test]
+    fn unlink_path_success_cleans_up_cached_state() {
+        let ctx = test_ctx();
+        ctx.fs
+            .write()
+            .unwrap()
+            .create_file("/gone.txt", b"bye")
+            .expect("create file");
+        let ino = ctx.inodes.write().unwrap().intern("/gone.txt");
+        ctx.buffers.write().unwrap().insert(
+            ino,
+            Arc::new(Mutex::new(WriteBuffer {
+                path: "/gone.txt".to_owned(),
+                mode: DEFAULT_FILE_MODE,
+                contents: b"bye".to_vec(),
+                dirty: false,
+                revision: 0,
+            })),
+        );
+
+        ctx.unlink_path("/gone.txt").expect("unlink");
+
+        assert!(!ctx.fs.read().unwrap().exists("/gone.txt"));
+        assert!(
+            ctx.inodes
+                .read()
+                .unwrap()
+                .ino_for_path("/gone.txt")
+                .is_none()
+        );
+        assert!(ctx.buffer(ino).is_none());
     }
 }

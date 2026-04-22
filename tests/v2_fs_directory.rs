@@ -175,7 +175,12 @@ fn readdir_reports_entries_sorted() {
     fs.mkdir("/zeta").unwrap();
     fs.mkdir("/alpha").unwrap();
     fs.mkdir("/mu").unwrap();
-    let names: Vec<_> = fs.readdir("/").unwrap().into_iter().map(|e| e.name).collect();
+    let names: Vec<_> = fs
+        .readdir("/")
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
     assert_eq!(names, vec!["alpha", "mu", "zeta"]);
 }
 
@@ -406,14 +411,16 @@ fn directory_tree_survives_remount() {
     fs.create_file("/top.txt", b"top-level").unwrap();
 
     let cover_after = fs.unmount().expect("unmount");
-    let fs2 = Filesystem::mount_with_cdc_params(cover_after, map, small_cdc())
-        .expect("mount");
+    let fs2 = Filesystem::mount_with_cdc_params(cover_after, map, small_cdc()).expect("mount");
 
     assert!(fs2.exists("/a"));
     assert!(fs2.exists("/a/b"));
     assert!(fs2.exists("/a/b/file.txt"));
     assert!(fs2.exists("/top.txt"));
-    assert_eq!(fs2.read_file("/a/b/file.txt").unwrap(), b"persistent".to_vec());
+    assert_eq!(
+        fs2.read_file("/a/b/file.txt").unwrap(),
+        b"persistent".to_vec()
+    );
     assert_eq!(fs2.read_file("/top.txt").unwrap(), b"top-level".to_vec());
 
     let a_entries = fs2.readdir("/a").unwrap();

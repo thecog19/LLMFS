@@ -84,7 +84,10 @@ fn decode_detects_corruption_in_generation() {
     let mut bytes = sr.encode();
     // Flip a bit in the generation field (bytes 88..96).
     bytes[88] ^= 0x01;
-    matches!(SuperRoot::decode(&bytes), Err(SuperRootError::BadChecksum { .. }));
+    matches!(
+        SuperRoot::decode(&bytes),
+        Err(SuperRootError::BadChecksum { .. })
+    );
 }
 
 #[test]
@@ -112,7 +115,10 @@ fn decode_rejects_unsupported_version() {
 #[test]
 fn decode_rejects_truncated() {
     let bytes = [0u8; SUPER_ROOT_BYTES - 1];
-    matches!(SuperRoot::decode(&bytes), Err(SuperRootError::Truncated { .. }));
+    matches!(
+        SuperRoot::decode(&bytes),
+        Err(SuperRootError::Truncated { .. })
+    );
 }
 
 #[test]

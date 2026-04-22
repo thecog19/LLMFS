@@ -17,9 +17,15 @@ use std::collections::HashSet;
 use llmdb::gguf::quant::GgufQuantType;
 use llmdb::stego::planner::TensorTier;
 use llmdb::stego::tensor_map::{TensorMap, TensorSlot};
+use llmdb::v2::anchor::{find_anchor_placement, read_anchor_with_placement};
 use llmdb::v2::cdc::FastCdcParams;
-use llmdb::v2::fs::Filesystem;
+use llmdb::v2::chunk::{read_chunk, write_chunk};
+use llmdb::v2::cover::CoverStorage;
+use llmdb::v2::dirty::DirtyBitmapError;
+use llmdb::v2::fs::{Filesystem, FsError};
+use llmdb::v2::inode::{INODE_BYTES, Inode};
 use llmdb::v2::pointer::Pointer;
+use llmdb::v2::super_root::{SUPER_ROOT_BYTES, SuperRoot};
 
 fn f32_to_f16_bits(value: f32) -> u16 {
     let bits = value.to_bits();
@@ -249,8 +255,7 @@ fn dirty_bits_survive_unmount_and_remount() {
         .collect();
 
     let cover_after = fs.unmount().expect("unmount");
-    let fs2 =
-        Filesystem::mount_with_cdc_params(cover_after, map, small_cdc()).expect("mount");
+    let fs2 = Filesystem::mount_with_cdc_params(cover_after, map, small_cdc()).expect("mount");
 
     // After remount, every weight we touched should STILL be dirty —
     // the bitmap was persisted and read back.
@@ -260,5 +265,60 @@ fn dirty_bits_survive_unmount_and_remount() {
             bm.is_dirty(*s, *w),
             "weight (slot {s}, w {w}) should still be dirty after remount",
         );
+    }
+}
+
+#[test]
+fn truncated_persisted_bitmap_fails_mount() {
+    let (cover, map) = make_cover();
+    let mut fs = Filesystem::init_with_cdc_params(cover, map.clone(), small_cdc()).expect("init");
+    fs.create_file("/data", &random_bytes(300, 7))
+        .expect("write");
+
+    let mut cover_after = fs.unmount().expect("unmount");
+    let placement = find_anchor_placement(cover_after.bytes(), &map);
+    let anchor = read_anchor_with_placement(cover_after.bytes(), &map, &placement).expect("anchor");
+
+    let mut super_root_bytes = [0u8; SUPER_ROOT_BYTES];
+    read_chunk(
+        cover_after.bytes(),
+        &map,
+        anchor.active.super_root,
+        0,
+        &mut super_root_bytes,
+    )
+    .expect("read super-root");
+    let super_root = SuperRoot::decode(&super_root_bytes).expect("decode super-root");
+
+    let mut inode_bytes = [0u8; INODE_BYTES];
+    read_chunk(
+        cover_after.bytes(),
+        &map,
+        super_root.dirty_bitmap_inode,
+        0,
+        &mut inode_bytes,
+    )
+    .expect("read bitmap inode");
+    let mut inode = Inode::decode(&inode_bytes).expect("decode bitmap inode");
+    let expected = inode.length;
+    inode.length -= 1;
+    write_chunk(
+        cover_after.bytes_mut(),
+        &map,
+        super_root.dirty_bitmap_inode,
+        0,
+        &inode.encode(),
+    )
+    .expect("truncate bitmap inode");
+
+    match Filesystem::mount_with_cdc_params(cover_after, map, small_cdc()) {
+        Err(FsError::Dirty(DirtyBitmapError::ByteCountMismatch {
+            expected: got_expected,
+            got,
+        })) => {
+            assert_eq!(got_expected, expected);
+            assert_eq!(got, expected - 1);
+        }
+        other => panic!("expected dirty bitmap byte-count error, got {other:?}"),
     }
 }

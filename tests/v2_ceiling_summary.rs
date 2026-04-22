@@ -246,9 +246,7 @@ fn multi_slot_summary() {
 
 #[test]
 fn serialize_roundtrip() {
-    let values: Vec<f32> = (0..600)
-        .map(|i| ((i as f32) - 300.0) * 0.005)
-        .collect();
+    let values: Vec<f32> = (0..600).map(|i| ((i as f32) - 300.0) * 0.005).collect();
     let bytes = synthesize_f16_cover(&values);
     let map = single_slot_map(f16_slot(600, 0));
     let summary = CeilingSummary::build(&bytes, &map);

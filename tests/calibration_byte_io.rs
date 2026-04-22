@@ -135,10 +135,8 @@ fn multi_slot_map(slots: Vec<TensorSlot>) -> TensorMap {
 #[test]
 fn byte_capacity_is_bit_count_floor_divided_by_eight() {
     // 10 F16 weights × 4 bits = 40 bits → 5 bytes, no tail.
-    let (slot, _bytes) = f16_slot_with_values(
-        &[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
-        0,
-    );
+    let (slot, _bytes) =
+        f16_slot_with_values(&[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0], 0);
     let _map = single_slot_map(slot);
     let p = MetadataPlacement {
         positions: (0..40)
@@ -242,7 +240,10 @@ fn write_oob_returns_error_and_does_not_touch_cover() {
     assert_eq!(err.offset, 0);
     assert_eq!(err.len, 2);
     assert_eq!(err.capacity_bytes, 1);
-    assert_eq!(cover, before, "OOB write must not have partial side effects");
+    assert_eq!(
+        cover, before,
+        "OOB write must not have partial side effects"
+    );
 
     // Offset-triggered OOB.
     let err = write_bytes(&mut cover, &map, &placement, 1, &[0x00])
@@ -360,7 +361,12 @@ fn write_touches_only_byte_n_positions() {
     // Pre-set positions 0..8 to a distinctive value via bit_io so we can
     // detect any accidental clobber.
     for i in 0..8 {
-        write_bit(&mut cover, &map.slots[0], placement.positions[i], i % 2 == 0);
+        write_bit(
+            &mut cover,
+            &map.slots[0],
+            placement.positions[i],
+            i % 2 == 0,
+        );
     }
 
     write_bytes(&mut cover, &map, &placement, 1, &[0xC3]).unwrap();

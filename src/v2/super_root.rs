@@ -128,8 +128,7 @@ impl SuperRoot {
             return Err(SuperRootError::UnsupportedVersion(version));
         }
 
-        let stored_crc =
-            u32::from_le_bytes(bytes[GENERATION_END..CRC_END].try_into().unwrap());
+        let stored_crc = u32::from_le_bytes(bytes[GENERATION_END..CRC_END].try_into().unwrap());
         let computed_crc = crc_of(&bytes[0..GENERATION_END]);
         if computed_crc != stored_crc {
             return Err(SuperRootError::BadChecksum {
@@ -143,9 +142,7 @@ impl SuperRoot {
         let dirty_bitmap_inode = Pointer::decode(&bytes[DEDUP_END..DIRTY_END])?;
         let free_run_state_inode = Pointer::decode(&bytes[DIRTY_END..FREELIST_END])?;
         let ceiling_summary_inode = Pointer::decode(&bytes[FREELIST_END..CEILING_END])?;
-        let generation = u64::from_le_bytes(
-            bytes[CEILING_END..GENERATION_END].try_into().unwrap(),
-        );
+        let generation = u64::from_le_bytes(bytes[CEILING_END..GENERATION_END].try_into().unwrap());
 
         Ok(Self {
             root_dir_inode,

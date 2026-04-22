@@ -239,8 +239,12 @@ impl Filesystem {
             generation: 1,
             ..SuperRoot::EMPTY
         };
-        let super_root_ptr =
-            alloc_and_write(cover.bytes_mut(), &map, &mut allocator, &super_root.encode())?;
+        let super_root_ptr = alloc_and_write(
+            cover.bytes_mut(),
+            &map,
+            &mut allocator,
+            &super_root.encode(),
+        )?;
         mark_pointer_dirty(&mut dirty_bitmap, &map, super_root_ptr);
 
         anchor::init_anchor(cover.bytes_mut(), &map, super_root_ptr)?;
@@ -287,7 +291,13 @@ impl Filesystem {
 
         let super_root_ptr = anchor_outcome.active.super_root;
         let mut super_root_bytes = [0u8; SUPER_ROOT_BYTES];
-        read_chunk(cover.bytes(), &map, super_root_ptr, 0, &mut super_root_bytes)?;
+        read_chunk(
+            cover.bytes(),
+            &map,
+            super_root_ptr,
+            0,
+            &mut super_root_bytes,
+        )?;
         let super_root = SuperRoot::decode(&super_root_bytes)?;
 
         if super_root.generation != anchor_outcome.active.generation {
@@ -305,8 +315,7 @@ impl Filesystem {
         // pointer as we encounter it. Corrupted pointers (e.g. an
         // out-of-range slot) surface through reserve_pointer's
         // checks rather than opaque chunk-read failures downstream.
-        let mut reserved: std::collections::HashSet<(u16, u32)> =
-            std::collections::HashSet::new();
+        let mut reserved: std::collections::HashSet<(u16, u32)> = std::collections::HashSet::new();
         let mut tree_chunks: std::collections::HashSet<(u16, u32, u32)> =
             std::collections::HashSet::new();
         walk_tree_pointers(cover.bytes(), &map, root_inode_ptr, &mut |ptr| {
@@ -333,7 +342,8 @@ impl Filesystem {
             )?;
         }
         if !super_root.dirty_bitmap_inode.is_null() {
-            let bitmap_chunks = inode_tree_chunks(cover.bytes(), &map, super_root.dirty_bitmap_inode)?;
+            let bitmap_chunks =
+                inode_tree_chunks(cover.bytes(), &map, super_root.dirty_bitmap_inode)?;
             for (slot, start, len_bits) in bitmap_chunks {
                 if reserved.insert((slot, start)) {
                     let p = Pointer {
@@ -975,11 +985,9 @@ fn alloc_and_write(
     data: &[u8],
 ) -> Result<Pointer, FsError> {
     let bit_count = (data.len() * 8) as u32;
-    let ptr = allocator
-        .alloc(map, bit_count)
-        .ok_or(FsError::OutOfSpace {
-            requested_bits: bit_count,
-        })?;
+    let ptr = allocator.alloc(map, bit_count).ok_or(FsError::OutOfSpace {
+        requested_bits: bit_count,
+    })?;
     write_chunk(cover, map, ptr, 0, data)?;
     Ok(ptr)
 }
@@ -1150,8 +1158,7 @@ fn persist_bitmap_streaming(
         // inner feed loop calls `dedup_or_write_no_mark`.
         match dirty.page_at(page_idx) {
             Some(p) => {
-                page_buf[..bytes_this_step]
-                    .copy_from_slice(&p[in_page..in_page + bytes_this_step]);
+                page_buf[..bytes_this_step].copy_from_slice(&p[in_page..in_page + bytes_this_step]);
             }
             None => page_buf[..bytes_this_step].fill(0),
         }
@@ -1229,6 +1236,14 @@ fn load_bitmap_streaming(
 ) -> Result<(), FsError> {
     let inode = read_inode(cover, map, inode_ptr)?;
     let length = inode.length;
+    let expected = bitmap.total_bytes();
+    if length != expected {
+        return Err(DirtyBitmapError::ByteCountMismatch {
+            expected,
+            got: length,
+        }
+        .into());
+    }
     let data_ptrs = collect_data_pointers(&inode, cover, map)?;
     let mut offset: u64 = 0;
     let mut buf = vec![0u8; 16 * 1024];
@@ -1526,11 +1541,7 @@ fn persist_as_byte_stream(
 
 /// Decode an inode chunk, walk its data chunks, concatenate, and
 /// truncate to `inode.length`.
-fn load_byte_stream(
-    cover: &[u8],
-    map: &TensorMap,
-    inode_ptr: Pointer,
-) -> Result<Vec<u8>, FsError> {
+fn load_byte_stream(cover: &[u8], map: &TensorMap, inode_ptr: Pointer) -> Result<Vec<u8>, FsError> {
     let inode = read_inode(cover, map, inode_ptr)?;
     let length = inode.length as usize;
     let data_ptrs = collect_data_pointers(&inode, cover, map)?;

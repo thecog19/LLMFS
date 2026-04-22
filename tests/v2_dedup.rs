@@ -131,6 +131,5 @@ fn content_hash_equality_by_bytes() {
     assert_ne!(a, c);
 
     // Ord is derived lexicographically for BTreeSet-ability.
-    let _sorted: std::collections::BTreeSet<ContentHash> =
-        [a, b, c].into_iter().collect();
+    let _sorted: std::collections::BTreeSet<ContentHash> = [a, b, c].into_iter().collect();
 }

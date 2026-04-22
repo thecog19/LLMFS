@@ -1,6 +1,7 @@
-use std::fs;
+use std::fs::File;
 use std::path::Path;
 
+use memmap2::Mmap;
 use thiserror::Error;
 
 use crate::gguf::quant::GgufQuantType;
@@ -166,7 +167,13 @@ pub enum ParseError {
 }
 
 pub fn parse_path(path: impl AsRef<Path>) -> Result<GgufFile, ParseError> {
-    let bytes = fs::read(path)?;
+    let file = File::open(path)?;
+    if file.metadata()?.len() == 0 {
+        return parse_bytes(&[]);
+    }
+    // SAFETY: the file is opened read-only and the mapping is used
+    // only for immutable parsing before being dropped.
+    let bytes = unsafe { Mmap::map(&file)? };
     parse_bytes(&bytes)
 }
 

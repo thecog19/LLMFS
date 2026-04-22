@@ -22,16 +22,27 @@ fn main() {
 
     let t0 = Instant::now();
     let parsed = parse_gguf(&path).expect("parse");
-    eprintln!("parse_gguf:              {:>8.3}s", t0.elapsed().as_secs_f64());
+    eprintln!(
+        "parse_gguf:              {:>8.3}s",
+        t0.elapsed().as_secs_f64()
+    );
 
     let t1 = Instant::now();
     let plan = build_allocation_plan(&parsed.tensors, AllocationMode::Standard);
     let map = TensorMap::from_allocation_plan_with_base(&plan, parsed.tensor_data_offset as u64);
-    eprintln!("build map ({:>3} slots):   {:>8.3}s", map.slots.len(), t1.elapsed().as_secs_f64());
+    eprintln!(
+        "build map ({:>3} slots):   {:>8.3}s",
+        map.slots.len(),
+        t1.elapsed().as_secs_f64()
+    );
 
     let t2 = Instant::now();
     let cover = std::fs::read(&path).expect("read cover");
-    eprintln!("std::fs::read ({} MB): {:>8.3}s", cover.len() / 1_048_576, t2.elapsed().as_secs_f64());
+    eprintln!(
+        "std::fs::read ({} MB): {:>8.3}s",
+        cover.len() / 1_048_576,
+        t2.elapsed().as_secs_f64()
+    );
 
     // CeilingSummary::build cost in isolation (also done inside mount).
     let t3 = Instant::now();
@@ -66,7 +77,10 @@ fn main() {
 
     let t4 = Instant::now();
     let fs = Filesystem::mount(cover, map.clone()).expect("mount");
-    eprintln!("Filesystem::mount (full): {:>8.3}s", t4.elapsed().as_secs_f64());
+    eprintln!(
+        "Filesystem::mount (full): {:>8.3}s",
+        t4.elapsed().as_secs_f64()
+    );
 
     eprintln!(
         "  generation={} dedup_entries={} dirty_bits_set={}",
@@ -75,5 +89,8 @@ fn main() {
         fs.dirty_bitmap().set_count(),
     );
 
-    eprintln!("total wall:             {:>8.3}s", t0.elapsed().as_secs_f64());
+    eprintln!(
+        "total wall:             {:>8.3}s",
+        t0.elapsed().as_secs_f64()
+    );
 }

@@ -107,9 +107,10 @@ fn init_then_write_then_remount_via_mmap_cover() {
             .open(tmp.path())
             .expect("reopen for init");
         let mmap = open_mmap(&file);
-        let mut fs = Filesystem::init_with_cdc_params(mmap, map.clone(), small_cdc())
-            .expect("init on mmap");
-        fs.create_file("/notes.md", b"persisted via mmap").expect("create");
+        let mut fs =
+            Filesystem::init_with_cdc_params(mmap, map.clone(), small_cdc()).expect("init on mmap");
+        fs.create_file("/notes.md", b"persisted via mmap")
+            .expect("create");
         // Drop the cover; flushed by unmount.
         drop(fs.unmount().expect("unmount flushes msync"));
     }
@@ -122,8 +123,7 @@ fn init_then_write_then_remount_via_mmap_cover() {
             .open(tmp.path())
             .expect("reopen for mount");
         let mmap = open_mmap(&file);
-        let fs = Filesystem::mount_with_cdc_params(mmap, map, small_cdc())
-            .expect("mount on mmap");
+        let fs = Filesystem::mount_with_cdc_params(mmap, map, small_cdc()).expect("mount on mmap");
         let read = fs.read_file("/notes.md").expect("read");
         assert_eq!(read, b"persisted via mmap".to_vec());
         // Don't bother flushing — read-only path.

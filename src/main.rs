@@ -165,8 +165,8 @@ fn dispatch(cmd: Command) -> Result<(), CliError> {
 /// filesystem state. The returned map is fed to `Filesystem::init`
 /// or `Filesystem::mount` together with the cover bytes.
 fn build_tensor_map(model: &Path) -> Result<TensorMap, CliError> {
-    let parsed = parse_gguf(model)
-        .map_err(|e| CliError::user(format!("parse {}: {e}", model.display())))?;
+    let parsed =
+        parse_gguf(model).map_err(|e| CliError::user(format!("parse {}: {e}", model.display())))?;
     let plan = build_allocation_plan(&parsed.tensors, AllocationMode::Standard);
     Ok(TensorMap::from_allocation_plan_with_base(
         &plan,
@@ -198,11 +198,8 @@ fn open_cover_mmap(model: &Path) -> Result<MmapMut, CliError> {
 fn mount_v2(model: &Path) -> Result<V2Filesystem, CliError> {
     let map = build_tensor_map(model)?;
     let cover = open_cover_mmap(model)?;
-    V2Filesystem::mount(cover, map).map_err(|e| {
-        CliError::user(format!(
-            "V2 mount (no anchor? run `llmdb init` first): {e}"
-        ))
-    })
+    V2Filesystem::mount(cover, map)
+        .map_err(|e| CliError::user(format!("V2 mount (no anchor? run `llmdb init` first): {e}")))
 }
 
 /// Consume `fs` and flush its mmap-backed cover to disk. Wraps the
@@ -256,9 +253,7 @@ fn cmd_status(model: &Path) -> Result<(), CliError> {
     let map = build_tensor_map(model)?;
     let cover = open_cover_mmap(model)?;
     let fs = V2Filesystem::mount(cover, map.clone()).map_err(|e| {
-        CliError::user(format!(
-            "V2 mount (no anchor? run `llmdb init` first): {e}"
-        ))
+        CliError::user(format!("V2 mount (no anchor? run `llmdb init` first): {e}"))
     })?;
 
     println!("device:             {}", model.display());
@@ -318,9 +313,9 @@ fn cmd_mount(model: &Path, mount_point: &Path, allow_other: bool) -> Result<(), 
                 .to_owned(),
         )
     })?;
-    let fs = lock
-        .into_inner()
-        .map_err(|_| CliError::internal("V2 filesystem RwLock poisoned (a FUSE op panicked)".to_owned()))?;
+    let fs = lock.into_inner().map_err(|_| {
+        CliError::internal("V2 filesystem RwLock poisoned (a FUSE op panicked)".to_owned())
+    })?;
     flush_and_close(model, fs)?;
     println!("flushed cover to {}", model.display());
     println!("done");
@@ -381,9 +376,8 @@ fn cmd_ls(model: &Path, path: &str) -> Result<(), CliError> {
 }
 
 fn cmd_store(model: &Path, host_path: &Path, stego_path: &str) -> Result<(), CliError> {
-    let bytes = std::fs::read(host_path).map_err(|e| {
-        CliError::user(format!("reading {}: {e}", host_path.display()))
-    })?;
+    let bytes = std::fs::read(host_path)
+        .map_err(|e| CliError::user(format!("reading {}: {e}", host_path.display())))?;
 
     let mut fs = mount_v2(model)?;
     ensure_parent_dirs(&mut fs, stego_path)?;
@@ -402,9 +396,8 @@ fn cmd_get(model: &Path, stego_path: &str, output: Option<PathBuf>) -> Result<()
         let leaf = stego_path.rsplit('/').next().unwrap_or(stego_path);
         PathBuf::from(leaf)
     });
-    std::fs::write(&out_path, &bytes).map_err(|e| {
-        CliError::internal(format!("writing {}: {e}", out_path.display()))
-    })?;
+    std::fs::write(&out_path, &bytes)
+        .map_err(|e| CliError::internal(format!("writing {}: {e}", out_path.display())))?;
     println!("wrote {}", out_path.display());
     Ok(())
 }

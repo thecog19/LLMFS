@@ -121,7 +121,11 @@ pub fn format_human(status: &DeviceStatus) -> String {
     let _ = writeln!(out, "generation:         {}", status.generation);
     let _ = writeln!(out, "files:              {}", status.file_count);
     let _ = writeln!(out, "directories:        {}", status.directory_count);
-    let _ = writeln!(out, "stored:             {} bytes", status.total_stored_bytes);
+    let _ = writeln!(
+        out,
+        "stored:             {} bytes",
+        status.total_stored_bytes
+    );
 
     let dirty_pct = if status.dirty_bits_total == 0 {
         0.0

@@ -54,15 +54,15 @@ impl Default for FastCdcParams {
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum FastCdcError {
-    #[error("avg_size {0} is not a power of two; FastCDC's mask trick needs exactly log2(avg) bits")]
+    #[error(
+        "avg_size {0} is not a power of two; FastCDC's mask trick needs exactly log2(avg) bits"
+    )]
     AvgNotPowerOfTwo(usize),
 
-    #[error("size order invalid: require 0 < min_size ≤ avg_size ≤ max_size; got min={min}, avg={avg}, max={max}")]
-    InvalidSizeOrder {
-        min: usize,
-        avg: usize,
-        max: usize,
-    },
+    #[error(
+        "size order invalid: require 0 < min_size ≤ avg_size ≤ max_size; got min={min}, avg={avg}, max={max}"
+    )]
+    InvalidSizeOrder { min: usize, avg: usize, max: usize },
 
     #[error("avg_size must be ≥ 4 so bits-1 ≥ 1 bit of looseness in the post-avg mask")]
     AvgTooSmall(usize),
@@ -208,10 +208,7 @@ impl FastCdcStream {
         // Boundary check window: positions [min_size, max_size).
         // Mirrors the loop bounds in `next_boundary`.
         if pos >= self.params.min_size && pos < self.params.max_size {
-            self.hash = self
-                .hash
-                .wrapping_shl(1)
-                .wrapping_add(GEAR[byte as usize]);
+            self.hash = self.hash.wrapping_shl(1).wrapping_add(GEAR[byte as usize]);
             let mask = if pos < self.params.avg_size {
                 self.mask_s
             } else {
@@ -315,7 +312,9 @@ mod tests {
     #[test]
     fn streaming_matches_slice_short_inputs() {
         let params = FastCdcParams::default();
-        for len in [0_usize, 1, 100, 1023, 1024, 1025, 4095, 4096, 4097, 16383, 16384, 16385] {
+        for len in [
+            0_usize, 1, 100, 1023, 1024, 1025, 4095, 4096, 4097, 16383, 16384, 16385,
+        ] {
             let data: Vec<u8> = (0..len).map(|i| (i * 13 + 7) as u8).collect();
             assert_eq!(
                 stream_chunks(&data, &params),

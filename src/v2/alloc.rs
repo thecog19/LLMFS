@@ -53,7 +53,9 @@ pub enum AllocError {
     #[error("no free run with length ≥ {requested_bits} bits")]
     OutOfSpace { requested_bits: u32 },
 
-    #[error("free called on a pointer that overlaps an existing free run (slot {slot}, start {start})")]
+    #[error(
+        "free called on a pointer that overlaps an existing free run (slot {slot}, start {start})"
+    )]
     DoubleFree { slot: u16, start: u32 },
 
     #[error("pointer references slot {slot} but map has only {slot_count} slots")]
@@ -62,7 +64,9 @@ pub enum AllocError {
     #[error("pointer targets slot {slot}, which has no stealable bits")]
     NonStealableSlot { slot: u16 },
 
-    #[error("pointer range [{start_weight}, {end_weight}) lies outside slot {slot} with {weight_count} weights")]
+    #[error(
+        "pointer range [{start_weight}, {end_weight}) lies outside slot {slot} with {weight_count} weights"
+    )]
     PointerOutOfBounds {
         slot: u16,
         start_weight: u32,
@@ -115,11 +119,7 @@ impl Allocator {
                     max_weights: MAX_WEIGHTS_PER_SLOT,
                 });
             }
-            let max_ceiling = ceiling.max_over_range(
-                slot_idx as u32,
-                0,
-                slot.weight_count,
-            );
+            let max_ceiling = ceiling.max_over_range(slot_idx as u32, 0, slot.weight_count);
             freelist.insert(FreeRun {
                 slot: slot_idx as u16,
                 start_weight: 0,
@@ -178,9 +178,9 @@ impl Allocator {
             return Some(Pointer::NULL);
         }
 
-        let picked = self.freelist.pop_best_fit_where(|run| {
-            run_fits_length(map, run, length_in_bits)
-        })?;
+        let picked = self
+            .freelist
+            .pop_best_fit_where(|run| run_fits_length(map, run, length_in_bits))?;
         Some(self.finalize_alloc(map, picked, length_in_bits))
     }
 
@@ -221,12 +221,7 @@ impl Allocator {
     /// Split a picked run if longer than needed, push the remainder
     /// back to the free list, and return a `Pointer` to the
     /// allocated prefix. Shared by every alloc path.
-    fn finalize_alloc(
-        &mut self,
-        map: &TensorMap,
-        picked: FreeRun,
-        length_in_bits: u32,
-    ) -> Pointer {
+    fn finalize_alloc(&mut self, map: &TensorMap, picked: FreeRun, length_in_bits: u32) -> Pointer {
         let slot = &map.slots[picked.slot as usize];
         let bpw = slot.stealable_bits_per_weight as u32;
         let needed_weights = weights_for_bits(length_in_bits, bpw);
