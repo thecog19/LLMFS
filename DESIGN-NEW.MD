@@ -1205,6 +1205,19 @@ safety trade — picking by worst-case `|w|` rather than current
 
 Per-quant-type ceiling formulas: §15.10.
 
+**Bounded-heap selection.** The anchor wants only the N lowest-
+ceiling positions, which is a top-K problem, not a sort. The
+implementation walks every eligible weight once, pushing
+`(ceiling_bits, WeightRef)` into a `BinaryHeap` capped at
+`K_max = anchor_bits`; entries that would exceed the cap evict the
+current maximum. Cost is `O(total_eligible_weights · log K_max)`
+with ~bytes of peak heap memory instead of the ~1.7 GB a full sort
+of a 100 M-weight cover would allocate. For non-negative IEEE-754
+magnitudes, comparing raw bits as `u32` is exact and preserves the
+`(ceiling, WeightRef)` tiebreaker that keeps placement
+deterministic across init/mount cycles. This collapses anchor
+setup from ~13 s to <0.5 s on a 270 MB F16 cover.
+
 **Anchor contents — two-slot generational root:**
 ```
 slot0: [ generation u64 | super_root_pointer (16 B) | crc32 u32 ]
@@ -1264,7 +1277,7 @@ bits a `Pointer` refers to.
 - User files (content = raw bytes of the file)
 - Directories (content = list of `(name, child_inode_pointer, kind)` entries)
 - The dedup hash index (content = BLAKE3-128-keyed map of chunk positions)
-- The dirty bitmap (content = one bit per potential chunk-start position)
+- The dirty bitmap (content = one bit per stealable weight — see §15.5 for the sparse-page + streaming-serialize representation)
 - The free-run state (content = serialized `BTreeMap` of free runs)
 - The ceiling-magnitude bucket summary (content = max-ceiling per 256-weight bucket)
 
@@ -1312,12 +1325,62 @@ two-slot root + CRC per chunk: corruption is detectable (CRC
 fails) and recoverable from the previous root generation. The 40%
 expansion cost of RS framing is avoided.
 
+**Cover storage abstraction.** The `Filesystem` holds the cover
+bytes behind a `Box<dyn CoverStorage>` trait (`src/v2/cover.rs`)
+with a minimal interface — `bytes`, `bytes_mut`, `flush`. Two
+implementations:
+
+- `Vec<u8>` — convenient for unit tests; the whole cover lives in
+  heap. `flush` is a no-op.
+- `memmap2::MmapMut` — production. The cover file stays on disk;
+  the OS pages bytes in/out on demand, so RAM use is bounded by
+  the working set (ceiling scan, anchor heap, dirty bitmap),
+  never by cover size. `flush` calls `msync(2)`.
+
+V2 internals (`read_chunk`, `write_chunk`, CDC, dedup, etc.) all
+take `&[u8]` / `&mut [u8]` slices, so they're storage-agnostic.
+The CLI always uses the mmap path — `open_cover_mmap` opens the
+GGUF read/write and maps it; `Filesystem::unmount` msyncs and
+returns the storage for the caller to drop. This is what lifts
+the practical capacity ceiling from "fits in RAM" to "fits on
+disk" — a 280 GB cover mounts with tens of MB resident, not 280
+GB.
+
 **Concurrency.** V2 is multi-reader / single-writer. Readers
 traverse from a snapshot of the active root-slot taken at
 op-start; they're immune to concurrent writers because the CoW
 tree they see is immutable until the next commit. Writers
-serialize on the root-slot commit via a single `RwLock` at the
-`Filesystem` boundary.
+serialize on the root-slot commit.
+
+At the `Filesystem` boundary (`src/v2/fuse.rs::LlmdbV2Fs`) the
+shared state is:
+- `fs: Arc<RwLock<Filesystem>>` — read-path FUSE methods (`read`,
+  `readdir`, `getattr`, `lookup`, `access`, `statfs`) take the
+  read lock; write-path methods (`write` flush, `release`,
+  `create`, `mkdir`, `rmdir`, `unlink`, `setattr`) take the write
+  lock. Multiple FUSE reads run concurrently; writes serialize.
+- `inodes: Arc<RwLock<InodeMap>>` — path ↔ kernel inode number
+  translation. Own lock so reads don't queue behind each other on
+  the fs lock.
+- `buffers: Arc<RwLock<HashMap<u64, Arc<Mutex<WriteBuffer>>>>>`
+  — per-inode write buffers; the outer `RwLock` guards the map
+  structure, the per-buffer `Mutex` lets concurrent writes to
+  *different* inodes proceed without serializing on each other.
+
+Lock acquisition order, when more than one is needed:
+`inodes → buffers → fs`.
+
+fuser 0.15's dispatch loop is single-threaded upstream — it reads
+one kernel request at a time and invokes our trait method
+synchronously. To get real parallelism we take advantage of fuser's
+own guidance ("filesystem methods may run concurrent by spawning
+threads"): each FUSE method clones the shared `Ctx`, captures the
+`Reply*` object (which is `Send`), `std::thread::spawn`s the work,
+and returns immediately. The dispatch loop is then free to pick up
+the next request while earlier ones are still in flight on worker
+threads. Measured effect: two concurrent readers on separate files
+drop from ~1.0× to ~0.5× of sequential wall-clock time — real
+parallelism, not head-of-line blocking.
 
 ### 15.4 Layer 2 — Progressive calibration
 
@@ -1403,6 +1466,51 @@ bucket**, persisted inside V2's filesystem as a regular inode.
 queries are slightly pessimistic (consider one bucket more than
 strictly needed) but precision-adequate for ranking. Computed
 once at `llmdb init`; read into memory at mount.
+
+**Dirty bitmap — sparse pages, streaming I/O.** The dirty bitmap
+is one bit per stealable weight. Naive dense storage scales with
+cover size: a 280 GB F16 cover gives a 17.5 GB bit array. That
+allocation would block mount, block every commit's serialize
+snapshot, and block every remount's load — all unconditionally,
+regardless of how many bits are actually set.
+
+V2's representation (`src/v2/dirty.rs`) is a
+`BTreeMap<u32, Box<[u8; PAGE_BYTES]>>` keyed by 4 KB page index.
+Pages allocate lazily on first `mark`; missing pages are
+implicitly all-zero. `is_dirty` / `is_range_dirty` skip missing
+pages without touching heap; `mark` populates at most one page
+per 32 768-weight region. RAM use is O(touched_pages · 4 KB),
+not O(total_weights / 8).
+
+Serialize and deserialize are streaming:
+- `write_to<W: Write>` emits the dense byte form to `W` one page
+  at a time, writing a 4 KB zero buffer for missing pages. It
+  never materialises the full byte array.
+- `write_bytes_at(offset, &bytes)` writes dense bytes from an
+  input slice, allocating a page only when that page's source
+  slice contains a non-zero byte. Deserialising 17 GB of zeros
+  from a V2 inode allocates zero pages.
+
+Bitmap persistence in the V2 fs is handled by two dedicated
+helpers in `src/v2/fs.rs` — `persist_bitmap_streaming` (CoW
+commit) and `load_bitmap_streaming` (mount). Persist feeds bytes
+through `FastCdcStream` (a state-machine equivalent of
+`chunk_ranges` in `src/v2/cdc.rs` — byte-at-a-time, same
+boundary positions, bounded in-flight buffer). Each emitted
+chunk goes through `dedup_or_write_no_mark`, which takes
+`dirty: &DirtyBitmap` (immutable — we're still iterating pages)
+and returns whether the chunk was newly allocated. After the
+streaming pass ends we mutably borrow the bitmap and mark every
+newly-allocated pointer. File-content persistence retains the
+slice-based `persist_as_byte_stream` path; files and directories
+are app-bounded, not cover-bounded, so streaming them is a
+separate concern.
+
+The streaming path is what unblocks mount on a 280 GB cover.
+Headline measurement (`tests/v2_dirty_huge_cover.rs`): construct
+a 140 G-bit bitmap, mark three distant weights, streaming-
+serialize 17.5 GB of bytes through a counting sink, streaming-
+deserialize 17.5 GB of zeros — total process RSS delta 128 KB.
 
 ### 15.6 Layer 4 — Content-defined chunking + dedup
 
@@ -1579,28 +1687,37 @@ respect the allocated-runs bitmap so two chunks never overlap. The
 bitmap is consulted at allocation; during a write, the packer
 touches only the bits inside its allocated run.
 
-### 15.11 Migration from V1
+### 15.11 Format identifier and CLI
 
-**No auto-migration.** A V1 cover mounted as V2 will have no valid
-anchor (V1 metadata sits at the start of the first-FFN tensor
-whose positions aren't ceiling-magnitude-ranked). V2 refuses to
-mount such a cover with `"no V2 filesystem found"`. To preserve
-V1 data, copy it out via V1 tooling before running `llmdb init`
-on the cover.
+**V1 is gone.** V1 was removed in commit `de268bf`; there is no
+longer any V1 code path to migrate from. A cover that wasn't
+`llmdb init`'d under V2 has no valid anchor, and V2 refuses to
+mount it with `"V2 mount (no anchor? run \`llmdb init\` first):
+anchor: bad magic"`.
 
-**Format identifier.** V2's super-root carries `version = 2`. The
-anchor's magic bytes distinguish V2 from any other (past or
-future) format attempting to live at the same rule-derived
-positions.
+**Format identifier.** V2's super-root carries `version = 2`; the
+anchor header carries magic `"LLMV"` + `version = 2`. These
+distinguish V2 from any other format that might live at the same
+rule-derived positions in the future.
 
-**V2 CLI additions.**
-- `llmdb init <cover>` — creates the anchor and initial super-root.
-- `llmdb mount <cover> <mount_point>` — mounts via FUSE;
-  multi-reader / single-writer.
-- `llmdb status <cover>` — reports filesystem state (free space,
-  file count, dedup hit rate, calibration stage).
-- `llmdb calibrate <cover> [--full]` — runs Layer 2 calibration
-  (future; see §15.4).
+**CLI surface.** See §9 for the full list. The V2-specific verbs:
+- `llmdb init <cover>` — creates the anchor + initial super-root
+  (+ empty root directory + empty dirty bitmap). Re-running on
+  an existing cover discards prior state.
+- `llmdb mount <cover> <mount_point>` — mounts via FUSE. Multi-
+  reader / single-writer; see §15.3 for the concurrency model.
+- `llmdb unmount <mount_point>` — shells out to `fusermount3 -u`.
+- `llmdb status <cover>` — reports generation, file / directory
+  counts, dirty-bit balance, dedup table size, allocator usage,
+  quant profile.
+- `llmdb ls`, `llmdb store`, `llmdb get`, `llmdb rm` — path-
+  based file operations; see README Quickstart for argument
+  shapes.
+- `llmdb ask <cover>` — spawn `llama-server` + run the tool-use
+  REPL (§8).
+
+Progressive Layer 2 calibration (§15.4) does not have a CLI
+surface yet; when it lands the verb will be documented here.
 
 ### 15.12 Out of scope for V2
 
@@ -1612,6 +1729,22 @@ positions.
   pass doesn't activate) — research.
 - Content-addressable cover (payload stored as offsets into
   existing weight bit-patterns) — research.
+
+**Known deferred RAM scaling on the file path.** Cover-bounded
+RAM (cover bytes, dirty bitmap) is fixed; *app-bounded* RAM is
+not. Two specific paths hold full file contents:
+- `Filesystem::read_file(path) -> Vec<u8>` returns the whole
+  file. FUSE's `read(offset, size)` calls this and slices the
+  result — a 10 GB file with a 64 KB read allocates 10 GB. Fix
+  shape (when wanted): add `read_file_range(path, offset,
+  length)` that walks only the intersecting inode chunks.
+- `WriteBuffer` in the FUSE driver holds a file's full contents
+  in RAM until `release` / `flush` / `fsync`. For a 50 GB file
+  written via FUSE, the session RSS tracks the file. Fix shape:
+  spill above a threshold, or commit incrementally.
+Both are bounded by what the user chose to read or write — not
+by cover size — so neither blocks mount, and both are deferred
+pending a concrete workload that hurts.
 
 ## 16. V3 Architecture — GPU Acceleration + Lossless Remap
 
