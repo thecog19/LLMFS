@@ -17,5 +17,6 @@
 //! for the phased build.
 
 pub mod dequant;
+pub mod ops;
 pub mod pre_tokenize;
 pub mod tokenizer;
