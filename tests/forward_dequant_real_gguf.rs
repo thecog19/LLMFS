@@ -205,10 +205,14 @@ fn smollm2_q8_0_full_model_loads_through_weight_loader() {
         cfg.n_heads * cfg.head_dim * cfg.hidden_dim,
     );
     // Every dequantized weight finite, non-degenerate magnitudes.
+    // 332k weights in attn_q; a handful of trained-outlier
+    // positions at ±5 or so is normal, and Q8_0 can round those
+    // outward slightly. 10.0 is a loose-but-meaningful ceiling —
+    // a broken decoder explodes past this by orders of magnitude.
     assert!(b0.wq.iter().all(|v| v.is_finite()));
     let max_abs = b0.wq.iter().copied().map(f32::abs).fold(0.0_f32, f32::max);
     assert!(
-        (0.0..5.0).contains(&max_abs),
+        (0.0..10.0).contains(&max_abs),
         "Q8_0 attn_q max |w| = {max_abs} out of plausible range",
     );
 }

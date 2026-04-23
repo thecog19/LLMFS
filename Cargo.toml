@@ -17,6 +17,12 @@ fancy-regex = { version = "0.16", default-features = false, features = ["std"] }
 fuser = { version = "0.15", default-features = false }
 libc = "0.2"
 memmap2 = "0.9.5"
+# Data-parallel over output columns in `forward::ops::matmul`. The
+# forward pass is the dominant cost in calibration runs; a naive
+# triple loop on SmolLM2-135M takes ~2 min per call single-
+# threaded. par_iter across output rows is the cheapest meaningful
+# win and doesn't need unsafe / explicit SIMD.
+rayon = "1.10"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0.12"
