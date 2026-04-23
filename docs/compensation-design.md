@@ -4,7 +4,7 @@
 
 **Status:** architecture for Phase E onward. Phase D0 (`docs/phase-d-measurement.md`) measured the per-layer Hessian structure that this design relies on; the low-rank Cholesky option in §2.2 and the F16 factor precision in §3.2 are both backed by that measurement. Phase D1 (not yet built) implements the lazy per-layer Hessian-and-factor computation this design assumes is available.
 
-**Relationship to the stego invariant.** No H, no Cholesky factor, no compensation operator is persistent. Everything is recomputed from the cover plus a user-supplied calibration corpus. This keeps the at-rest cover indistinguishable from a bare GGUF (see `project_stego_invariant_at_rest` memory / `DESIGN-NEW.MD §15`).
+**Relationship to the stego invariant.** No H, no Cholesky factor, no compensation operator is persistent. Everything is recomputed from the cover plus a calibration corpus that ships with LLMDB itself (bundled in the binary — see `src/calibrate.rs:DEFAULT_CALIBRATION_CORPUS`). The corpus is a property of the tool, not of the user or the cover. This keeps the at-rest cover indistinguishable from a bare GGUF (see `project_stego_invariant_at_rest` memory / `DESIGN-NEW.MD §15`).
 
 ---
 
@@ -98,7 +98,7 @@ Full layer factor, resident when the layer is active. ~`d² · 2` bytes per laye
 
 ### 3.3 L3: raw Hessian / full recompute
 
-Only accessed on drift-triggered recomputation. `H_layer` can be recomputed from the user-supplied calibration corpus — no external storage required, but seconds-to-minutes of compute. Background thread handles this; never on the hot path.
+Only accessed on drift-triggered recomputation. `H_layer` can be recomputed from the LLMDB-bundled calibration corpus — no external storage required, but seconds-to-minutes of compute. Background thread handles this; never on the hot path.
 
 ## 4. The hot-path loop
 
@@ -195,7 +195,7 @@ No cache state is persistent. On restart:
 3. Read metadata files (dirty-bit map, etc.).
 4. Filesystem is operational for reads. Direct bit extraction needs no Hessian state.
 
-Writes require the compensation machinery. First write to each layer triggers lazy computation of `H_layer` from the user-supplied calibration corpus — seconds per layer. Full steady-state reached after every write-targeted layer has been warmed.
+Writes require the compensation machinery. First write to each layer triggers lazy computation of `H_layer` from the LLMDB-bundled calibration corpus — seconds per layer. Full steady-state reached after every write-targeted layer has been warmed.
 
 **Scratch disk** (allowed by the at-rest-only stego invariant — local scratch is fine as long as it's wiped on unmount) is used for:
 - Staging calibration activations during Hessian computation.

@@ -442,7 +442,7 @@ regularization — no `εI` shim needed in the happy path.
 
 - **Where H or its factor lives.** Per `compensation-design.md §9` and
   the at-rest stego invariant, nothing H-related is persistent. H and
-  the Cholesky factor are recomputed from the user-supplied calibration
+  the Cholesky factor are recomputed from the LLMDB-bundled calibration
   corpus on cold start; the cost (seconds per layer on first write per
   mount) is accepted. D0's earlier framing of a "V2-resident
   `(λ, v)` codec" assumed on-disk persistence and is obsolete. The same
