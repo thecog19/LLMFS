@@ -1,146 +1,101 @@
 # Concurrency — design
 
-**Scope:** how LLMDB's mount path coexists with external readers of the cover file (other llama.cpp instances, `ollama`, anything that mmaps the GGUF to run inference), and with LLMDB's own `ask` subcommand. This is the read/writer coordination layer. It sits adjacent to the math in [`compensation-design.md`](compensation-design.md) but addresses a different problem: compensation preserves *model quality across committed states*; this doc is about ensuring external readers never see partial or torn state.
+**Scope:** how LLMDB's mount path coexists with external readers of the cover file (other llama.cpp instances, `ollama`, `llmdb ask`, direct mmap consumers) while mutating the cover via stego writes.
 
-## 1. The problem
+**Companion:** [`compensation-design.md`](compensation-design.md) is the math side — how each write preserves model quality across committed states. This doc is the systems side — what a concurrent reader actually observes.
 
-The cover GGUF is simultaneously:
+## 1. The answer, short version
 
-- A valid standalone model file that external inference tools can `mmap(MAP_SHARED)` and load like any other GGUF.
-- The backing store for V2's filesystem. Every stego write mutates weights in the cover; every compensation update mutates more weights in the cover.
+Mount writes the cover in place, via `pwrite`. Readers `mmap(MAP_SHARED)` the cover the way they already do. The kernel's page cache is the shared medium between writer and reader — there is no copy, no snapshot, no buffer. Compensation math (`compensation-design.md` §1) bounds the magnitude of the per-write perturbation, so a reader mid-forward-pass during an active write sees weights that differ from either the pre-write or post-write stable state by a small, quantified amount.
 
-Individual stego + compensation operations touch multiple non-contiguous byte ranges. An external reader with `MAP_SHARED` can observe intermediate state between the payload flip and the compensation adjustment, or between layers of compensation. That intermediate state is an un-compensated perturbation of the model — not a valid LLMDB state, not a reasonable GGUF state.
+That's the whole design. No coordination protocol, no commit scheduler, no snapshot command, no filesystem-capability probes. The cover file on disk is always the current state, always a valid GGUF, always the stego invariant's at-rest artifact, always the same thing an external reader would see.
 
-`compensation-design.md` guarantees that *each committed state* preserves model quality. It makes no claim about transient states visible to an mmap reader mid-write. That's what this document fixes.
+## 2. What a concurrent reader actually observes
 
-## 2. Invariant
+### 2.1 Mechanism on Linux
 
-**The on-disk cover file always represents the last committed LLMDB state.** Writes during active mount never mutate the on-disk cover in place. Writes accumulate in an in-memory buffer (with scratch-disk spill for large batches, permitted by the at-rest stego invariant — see memory `project_stego_invariant_at_rest`). Commits flush the buffer into a new cover file and install it via `rename(2)`. External readers holding a prior fd continue to see their inode (Linux/POSIX preserve unlinked inodes with live fds); new opens see the new inode.
+1. `mmap(MAP_SHARED, PROT_READ)` creates a VMA pointing at the cover file.
+2. On first access to a page, the kernel faults it in from the page cache (reading from disk if not already cached) and maps the physical page into the reader's address space.
+3. `pwrite(fd, bytes, offset)` from LLMDB lands in the kernel: it updates the page cache page for that offset and marks it dirty. The reader's mapping shares that same physical page.
+4. CPU cache coherency (MESI on x86, equivalent on arm64) ensures the reader's next load from that weight address sees the new bytes. No re-fault, no syscall.
 
-Between commits, the on-disk cover lags the mount's in-memory state. That lag is the cost of reader-consistency. External readers who need the up-to-date state use `llmdb snapshot` (§4).
+There is exactly one physical memory location for each weight — the page-cache page — and both the reader's mapping and LLMDB's `pwrite` target it.
 
-## 3. Commit policy
+### 2.2 Atomicity of each byte
 
-Commit cost depends on the underlying filesystem's atomic-file-replacement primitives:
+- Single-byte writes are atomic at the CPU level.
+- Aligned 2/4/8-byte writes are atomic on x86 and on arm64 for aligned addresses.
+- A Q8_0 weight is one byte. Compensation updates to Q8_0 weights are one atomic byte write per weight. Nothing tears at the weight level.
+- For F16/F32/K-quant weights, the same alignment rule gives atomicity per quantized value.
 
-| Filesystem class | Examples | Atomic-replace cost | Commit cost |
-|---|---|---|---|
-| Reflink-capable | btrfs, XFS (with `reflink=1`), APFS, ZFS | `O(1)` file-clone + writes to the clone | `O(bytes_written_since_last_commit)` |
-| Non-reflink | ext4, FAT, plain XFS, most NTFS | Full file copy before modify | `O(cover_size)` regardless of how little changed |
+### 2.3 Where the wobble actually lives
 
-We probe for reflink capability at mount time, in the directory that holds the cover, via a `FICLONE` ioctl against a disposable probe file. Result drives the commit policy:
+A single compensation operation writes many weights in sequence (the compensation set `C` in `compensation-design.md §1.3`). Each individual write is atomic; the sequence is not. A reader can observe an intermediate state where some weights have the new values and others still have the old ones.
 
-### 3.1 Reflink-capable filesystem
+In a forward pass, llama.cpp's matmul kernels load weights into CPU registers for the dot product. Within a single matmul, the weight view is self-consistent — the kernel already read everything it needs. But across matmuls (different layers, different tokens), different ones may see different post-write states. A forward pass that straddles a compensation update produces logits as if the model were a "half-and-half" mix.
 
-- **Background commit thread** runs every `T` seconds (default 10s) flushing any buffered writes into a cloned-and-modified cover, atomic-rename.
-- **Commit on explicit `llmdb sync`**, bypassing the timer.
-- **Commit on unmount**, final flush of any trailing buffered state.
-- Because each commit is delta-bound, the background policy imposes ~O(writes-in-last-10s) of disk I/O — usually negligible.
+Both the pre-compensation-update state and the post-compensation-update state are quality-preserved by design (that's `compensation-design.md`'s whole job). The mixed state is close to both. Logits drift by a small bounded amount from either stable endpoint, for exactly the duration of the in-flight compensation — typically microseconds per write on a CPU-bound L1 hit, per `compensation-design.md §4`.
 
-### 3.2 Non-reflink filesystem
+### 2.4 Quantifying the bound
 
-- **No background commits.** Running a periodic O(cover_size) rewrite is a disk-I/O disaster on ext4 for gigabyte-scale covers.
-- **Commit on explicit `llmdb sync`.** Users who care about reader-freshness or crash-durability call this.
-- **Commit on unmount.** Bounded by one commit cycle; exactly once.
-- Staleness of the on-disk cover during active mount is proportional to time since last sync. External readers that accept stale state read the on-disk cover directly; readers that need fresh state use `llmdb snapshot` (next section).
+With 4 stolen bits per Q8_0 weight, the raw steal delta is ≤ 8/128 ≈ 6% of the weight's magnitude. Compensation cancels this to first order across the compensation set. During the window between "payload bits flipped" and "compensation applied," the un-compensated view shows a single-weight 6% perturbation in one layer — an O(1) weight out of billions, with first-order impact on one layer's matmul output, attenuated by normalization layers downstream. The resulting logit shift is a small fraction of typical logit magnitudes; tokens in near-ties may flip; anything with a clear margin doesn't.
 
-### 3.3 What commit does, precisely
+Over a burst of many writes, the wobble is proportional to the number of compensation updates currently in-flight simultaneously — bounded by whatever concurrency LLMDB's write path allows (currently single-threaded writes through the mount, so one in-flight compensation at a time).
 
-1. Acquire the write lock on the buffer (blocks new writes briefly).
-2. Clone or copy the current on-disk cover to `<cover>.commit-<gen>.new`:
-   - Reflink if available (`copy_file_range` / `FICLONE`).
-   - Full copy via `copy_file_range` with fallback to read-write loop otherwise.
-3. Apply every buffered `(offset, new_bytes)` delta to the new file.
-4. `fsync` the new file.
-5. `rename(2)` the new file over the original path. POSIX guarantees this is atomic at the directory-entry level: any reader with an open fd continues reading the old inode (which lives until their fd closes); any new open sees the new inode.
-6. Release the write lock. Discard buffered deltas.
+Between bursts, zero visible wobble.
 
-This never mutates the original on-disk inode. External readers with existing mmaps are undisturbed; they continue to see the pre-commit cover until they re-open.
+### 2.5 GPU backends
 
-## 4. `llmdb snapshot`
+llama.cpp with CUDA / Metal / Vulkan copies weights from the mmap'd page cache to GPU memory at load time. After the copy completes, weight tensors live in VRAM and the file is not re-read during inference. LLMDB writes to the file become invisible to the running GPU inference — zero wobble. The GPU's VRAM copy is effectively a snapshot, as a side effect of residency, not as an explicit design choice.
 
-A first-class CLI command that materializes the current (buffered + on-disk) cover state as a standalone GGUF at an explicit user-chosen path:
+Any wobble observed during the LOAD phase (weights streaming from file → CPU RAM → VRAM) is baked into the VRAM copy. The bound from §2.4 applies: the VRAM copy may reflect a mid-write moment, which is a bounded small perturbation from either stable state.
 
-```
-llmdb snapshot <cover-path> <out-path>
-```
+### 2.6 CPU inference without `--no-mmap`
 
-Semantics:
+Pure CPU inference with the default mmap path is the most-observable concurrency mode. The page cache is the shared medium; matmul kernels read directly from it; concurrent writes are visible on the next access. Wobble bounds from §2.4 apply in real time.
 
-- Output is a self-contained valid GGUF at `<out-path>`.
-- Reflects mount state as of snapshot time; subsequent writes to the mount don't affect it.
-- Independent inode from the cover's on-disk file — safe to point any external tool at it.
-- User-owned cleanup. Snapshots persist until the user deletes them.
+Users who specifically want zero wobble (and have the RAM for it) can pass `--no-mmap` to llama.cpp, which reads the whole model into process-owned memory at load and decouples subsequent inference from the file entirely. This is a tool, not a requirement. For a 7B Q4 on a 16 GB machine, `--no-mmap` costs ~4 GB RSS — fine. For a 70B F16 on a 32 GB machine, it OOMs. Users choose based on their hardware and tolerance.
 
-Cost mirrors commit:
-- Reflink-capable FS: clone + write buffered deltas to the clone. O(buffered_bytes).
-- Non-reflink FS: full cover copy + write buffered deltas. O(cover_size).
+## 3. What the design is *not* doing
 
-`snapshot` is the universal answer to "I want to run [llama.cpp / ollama / random external tool / my own code] against the current cover state while keeping mount active." Document this as *the* supported pattern.
+- **No buffer layer.** Writes go directly to the page cache via `pwrite`.
+- **No commit scheduler / rename-and-swap protocol.** The on-disk cover is always the current state, never "last committed."
+- **No `llmdb snapshot` command.** Not needed — readers that want a stable copy use `--no-mmap` (process-RAM copy), GPU backends (VRAM copy), or an ordinary `cp` if they want it on disk.
+- **No filesystem-capability probes (`FICLONE` / reflink detection).** No code path cares about the FS.
+- **No coordination protocol between mount and `ask`.** They both access the cover naturally; compensation bounds the overlap.
+- **No scratch-disk spill.** No buffer to spill.
 
-## 5. `llmdb ask` integration
+## 4. `llmdb ask`
 
-`ask` spawns `llama-server` against the cover. Under this design, it does so through a transparent snapshot:
+`ask` launches `llama-server` against the cover with default args — no `--no-mmap`, no snapshot, no special coordination. Mount keeps taking writes while the ask session runs; compensation bounds the visible wobble. For GPU-backend asks (the common production case), the load-time wobble is the only exposure, and it's itself bounded.
 
-1. `ask` runs `llmdb snapshot <cover> <session-tmp>/ask-cover.gguf` at session start.
-2. `ask` points `llama-server --model <session-tmp>/ask-cover.gguf`.
-3. Mount continues to accept writes as normal; they don't affect the `ask` session.
-4. `ask` deletes `<session-tmp>/ask-cover.gguf` on session exit (including signal/crash paths — guarded by a temp dir that the process unlinks in its signal handler).
+Users who want their ask session fully isolated from concurrent writes can pass `--no-mmap` to llama.cpp via whatever CLI plumbing `ask` exposes — but it's an opt-in, not a default, because on large models it's an OOM risk.
 
-No user ceremony, no flag-setting. The snapshot is invisible to the caller; they just see `ask` behaving correctly while mount remains usable.
+## 5. Crash durability
 
-## 6. Full outcome matrix
+`pwrite` writes land in the page cache immediately and in disk per the kernel's writeback schedule (default 30s dirty timer on Linux). A force-kill between a write and writeback leaves the cover file on disk missing the last few seconds of writes. That's standard POSIX buffered-write behavior.
 
-| Scenario | What happens | Cost dimension |
-|---|---|---|
-| `mount` alone, `unmount` | Buffer → commit via rename on unmount | One commit of last delta |
-| `mount` + `llmdb ask` concurrently | `ask` snapshots internally; mount keeps taking writes | Snapshot cost (`O(1)` reflink / `O(size)` non-reflink) |
-| `mount` + external tool, wants fresh state | User runs `llmdb snapshot`; points tool at output | Explicit snapshot cost |
-| `mount` + external tool, accepts stale state | Tool reads on-disk cover directly; sees last committed state | Zero |
-| `mount` + user wants durable write | `llmdb sync` flushes buffer to cover | One commit cost |
-| External tool, no mount active | Reads on-disk cover directly | Zero |
-| Force-kill during `mount` | On-disk cover unchanged (never mutated in place); uncommitted writes lost | Uncommitted writes lost (no WAL) |
-| Force-kill during commit | `rename(2)` is atomic: either old inode or new, never half | None; no corruption |
+Users who want durability call `llmdb sync` (a thin wrapper around `fsync` on the cover fd). Unmount calls `fsync` automatically before releasing the fd.
 
-Every row has a defined outcome. "Don't do X" doesn't appear because no external access pattern is undefined.
+No WAL, no journal, no write-ahead state. Same contract as any in-place POSIX writer. If we ever need crash-durable uncommitted state with the at-rest stego invariant preserved, that's a separate design thread (the WAL would need to live inside the cover itself via stego, which has a chicken-and-egg with calibration) — out of scope here.
 
-## 7. Relationship to `compensation-design.md`
+## 6. What external readers see at rest
 
-The compensation cache (L1 operators, L2 Cholesky factors, L3 recompute) operates on *in-memory model state*, not the on-disk cover. A write's sequence is:
+When LLMDB is unmounted, the on-disk cover is whatever it was at unmount time (last `pwrite` + `fsync`). External readers opening the cover at rest see a standalone valid GGUF — the stego-invariant-at-rest artifact. Nothing has changed about this from the original project framing.
 
-1. Apply the payload perturbation to the in-memory model state.
-2. Run the compensation math (§4 in compensation-design.md) against in-memory state.
-3. Append the resulting byte deltas to the commit buffer.
-4. Sherman-Morrison update the in-memory L1 cache.
+During active mount, the on-disk cover is the current state, mutating in real time. External readers see the same thing LLMDB sees: a valid GGUF whose weights are being perturbed at stego-write pace.
 
-The on-disk cover is touched only at commit time, and only via the rename protocol in §3.3. The in-memory state is always consistent (compensation completes atomically in RAM before the buffer entry is appended); the on-disk state is always consistent (changes only via atomic rename). No intermediate state is ever observable.
-
-Cold-start lazy recompute (compensation-design.md §9) reads from whatever on-disk cover exists at mount time — that's the last committed state by construction, which is exactly the correct input for recomputing `H_layer` and its Cholesky factor.
-
-## 8. Crash and durability
-
-LLMDB does not currently provide a write-ahead log for uncommitted writes. Force-kill during active mount loses any writes since the last commit (sync, unmount, or background commit on reflink-capable FS). This is consistent with "scratch spill is wiped on unmount" — uncommitted state is ephemeral by design.
-
-Users who want durability guarantees for bulk operations call `llmdb sync` explicitly at the appropriate checkpoint. This is the same contract any buffered filesystem offers; LLMDB just exposes the knob rather than hiding it.
-
-Durability-across-crashes with the at-rest stego invariant intact is a larger design question (the WAL would need to live inside the cover file itself via stego, which has its own chicken-and-egg — WAL writes are stego writes that need compensation that need H that needs calibration, etc.). Out of scope for this document; tracked separately.
-
-## 9. Non-goals and what's explicitly not required
-
-- **Synchronous-across-processes reader/writer locks.** External tools don't cooperate with LLMDB. We don't try to force them to; we just make the on-disk cover always look consistent to any reader that cares.
-- **Zero-staleness external reads without snapshot.** Not achievable without either (a) forcing external readers to use an LLMDB-provided path (they won't) or (b) committing on every write on non-reflink FS (prohibitive cost). Snapshot is the explicit escape hatch.
-- **WAL-backed durability.** Separate design thread. This document assumes sync-or-unmount-or-lose semantics.
-
-## 10. Summary of decisions
+## 7. Summary of decisions
 
 | Decision | Choice |
 |---|---|
-| On-disk cover mutation | Only via atomic rename from a modified clone/copy |
-| In-place edits to on-disk cover | Never, during mount |
-| Background commit on reflink FS | Every 10s (default), plus sync + unmount |
-| Background commit on non-reflink FS | Disabled; explicit sync + unmount only |
-| Snapshot command | First-class, `llmdb snapshot <cover> <out>` |
-| `ask` coupling to mount writes | Decoupled via internal snapshot at session start |
-| External tool contract | Read on-disk cover for stale-OK; `llmdb snapshot` for fresh |
-| Force-kill mid-mount | On-disk cover intact; uncommitted writes lost |
-| WAL / durability | Separate design thread, not in this doc |
+| On-disk cover during mount | Always current, mutated in place via `pwrite` |
+| Writer-side buffer | None |
+| Commit protocol | None — `pwrite` hits the page cache directly |
+| Snapshot mechanism | Whatever readers use anyway (`--no-mmap`, GPU residency, manual `cp`) |
+| `llmdb ask` default | Default mmap via `llama-server` |
+| Reader/writer coordination | None — compensation bounds the observable wobble |
+| Atomicity of individual writes | Per-byte / per-quantized-value, as given by CPU architecture |
+| Tolerable wobble bound | Compensation magnitude per in-flight update; quantified in §2.4 |
+| Crash durability | POSIX page-cache semantics; `llmdb sync` / unmount call `fsync` |
+| FS-dependent behavior | None |
