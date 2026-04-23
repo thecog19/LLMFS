@@ -405,104 +405,68 @@ a structured approximation based on data rather than guesses.
 
 ## Decision
 
-**Structure**: **low-rank via eigendecomposition**, with **site-specific K
-picked at calibration time to meet a target Frobenius-error budget**.
+Full compensation architecture is documented in
+[`docs/compensation-design.md`](compensation-design.md). D0's measurements
+back two specific choices in that architecture; the rest of this section
+is scoped to what D0's numbers actually justify.
 
-Rationale:
+### What D0 confirms
 
-- Low-rank dominates block-diagonal and top-K sparse by 3–20× on every
-  measured site (headline finding #3).
-- Eigendecomposition of a real symmetric PSD matrix is well-conditioned
-  and cheap to Cholesky-factorize downstream (Phase E needs `chol(H)` for
-  GPTQ; `chol(UΣU^T + εI)` is fine, even for `ε = 0` since all our H's
-  are PSD — headline #1).
-- A single fixed K across sites leaves fidelity or storage on the table
-  (headline #4). A per-site target-error calibration sidesteps this
-  cleanly: the calibrator picks `K_site = argmin_K {K : frob_err(K, H_site) ≤ ε}`.
+**1. Low-rank structure is real and uniform across sites.** Low-rank
+eigendecomposition of H dominates block-diagonal and top-K sparse by
+3–20× at every measured storage budget across all four observation sites.
+This justifies the "optionally low-rank Cholesky factor" clause in
+`compensation-design.md §2.2` — the L2 factor can compress with bounded
+loss, rather than being stored full-rank. Effective rank is site-specific
+(qkv ≈ 3% of N for 5% Frobenius, ffn_down ≈ 17% of N), so a low-rank
+factor representation will want per-site `K`, not a uniform one.
 
-### Parameters
+**2. F16 is sufficient for the factor.** F16 and Q8_0 dumps agree on
+every Frobenius metric to the third decimal. Q8_0 dequant noise
+contributes nothing observable to H structure, and (by the same token)
+F16 precision for the cached Cholesky factor is well inside the floor.
+The "fp16" clause in `compensation-design.md §3.1–3.2` lands.
 
-**Target Frobenius error budget**: **10% per site, configurable at
-calibrate time** (e.g., `--hessian-frob-error 0.10`). Rationale: 10% keeps
-SmolLM2 H storage at 43% of V2 stego capacity (workable for user data
-coexistence), and is well inside GPTQ's typical tolerance regime.
+**3. Frobenius is the right quality metric, not trace.** `K_95%_of_trace`
+overestimates the `K` needed for 5% Frobenius error by ~3× on the same
+matrix. Compensation quality is Frobenius-norm-bounded (from `‖δy‖² =
+Δᵀ H Δ`), so Frobenius is what the calibrator should target when
+choosing per-site factor rank.
 
-Picking smaller (tighter error, more capacity spent on H) or larger
-(looser error, more room for user data) is a calibration-time knob, not an
-architectural commitment.
+**4. Accumulator is correct.** Zero symmetry error and zero negative
+eigenvalues across 240 matrices. The `HessianAccumulator` in
+`src/forward/hessian.rs` produces matrices Cholesky-factorizable without
+regularization — no `εI` shim needed in the happy path.
 
-**Measured K to hit the 10% budget per site on SmolLM2 (Q8_0, identical
-on F16)**:
+### What D0 explicitly does *not* decide
 
-| Site | N | K (median, 10% err) | K/N |
-|------|--:|---------------------:|----:|
-| qkv_input | 576 | 16 | 0.028 |
-| attn_output_input | 576 | 32 | 0.056 |
-| ffn_gate_up_input | 576 | 32 | 0.056 |
-| ffn_down_input | 1536 | 128 | 0.083 |
+- **Where H or its factor lives.** Per `compensation-design.md §9` and
+  the at-rest stego invariant, nothing H-related is persistent. H and
+  the Cholesky factor are recomputed from the user-supplied calibration
+  corpus on cold start; the cost (seconds per layer on first write per
+  mount) is accepted. D0's earlier framing of a "V2-resident
+  `(λ, v)` codec" assumed on-disk persistence and is obsolete. The same
+  low-rank idea applies to the *in-RAM* L2 factor, not to V2 storage.
+- **What the salience inode stores.** The right placement metric is
+  OBS saliency `1/[H⁻¹]_ii` (see `compensation-design.md §1.2`), not
+  `diag(H)`. Computable from the Cholesky factor as `‖L⁻¹ e_i‖²`. D1
+  replaces AWQ's `mean(|x|)` with OBS saliency, not with `diag(H)`.
+- **Cross-architecture validation.** 240 matrices from one architecture
+  (SmolLM2) is a conclusive signal for structural choice, not for
+  specific `K` values at 3B/7B scale. Per-site `K` will be re-calibrated
+  per-cover at calibrate time — the structural decision stays put, the
+  parameters are data-driven per run.
+- **Streaming / randomized SVD accumulation.** D0's accumulator
+  materializes full H in RAM; fits SmolLM2 and up to ~3B. Phase D1+
+  may want a Lanczos or randomized-SVD variant for larger models that
+  bypasses full materialization. Out of D0's scope.
 
-And at 5% Frobenius for comparison:
+### Pointers into the architecture
 
-| Site | N | K (median, 5% err) | K/N |
-|------|--:|-------------------:|----:|
-| qkv_input | 576 | 16 | 0.028 |
-| attn_output_input | 576 | 64 | 0.111 |
-| ffn_gate_up_input | 576 | 64 | 0.111 |
-| ffn_down_input | 1536 | 256 | 0.167 |
-
-D1 will measure per-layer `K` dynamically at calibration — the table above
-just shows representative medians, not the hard-coded values D1 will use.
-
-### Storage cost
-
-Per-layer low-rank storage at target K is `(K + K·N) × 4` bytes = `K(N+1) × 4`
-bytes. Summed over sites and layers, against V2 stego capacity:
-
-| Cover | V2 capacity | H at 10% | H at 5% |
-|-------|------------:|---------:|--------:|
-| SmolLM2-135M | ~67 MB | ~29 MB (43%) | ~56 MB (84%) |
-
-For larger models, the fraction of V2 capacity consumed stays roughly
-constant across scales — both V2 capacity and H low-rank storage scale as
-`Σ hidden² × n_layers` when effective rank stays proportional to N, which
-the SmolLM2 data suggests it does. Concrete extrapolation pending actual
-measurement at 3B / 7B, which is D1's e2e gate.
-
-### What this means for D1+
-
-- **`HessianCollector` (D1)**: full-H F32 upper-triangle accumulator
-  (same shape as D0's F64 reference, downgraded to F32 at rest). At
-  finalize, eigendecompose each (site, layer) via `ndarray-linalg`
-  or equivalent, binary-search for the smallest K meeting the target
-  error, emit `(λ_1..λ_K, v_1..v_K)`. Fits in RAM for models up to
-  ~3B (same regime as D0's accumulator).
-- **Streaming variant (follow-up)**: Lanczos or randomized-SVD accumulator
-  that never materializes full H; needed for >3B where full H in RAM
-  becomes impractical. Scoped as a separate sub-phase; D1 MVP targets
-  SmolLM2/3B.
-- **V2 codec**: per-(site, layer) file containing `(K, N, λ_1..λ_K,
-  v_1..v_K)` in F32, with a small self-describing header. Lives inside V2
-  via the normal file API (salience_inode continues to hold `diag(H)`,
-  which is tiny; the low-rank H artifact is its own separate V2 file tree,
-  e.g., `/calibration/hessian/blk.N.<site>.eig`).
-- **Phase E (GPTQ compensation)**: reads the low-rank factors, reconstructs
-  `H_lowrank = UΣU^T`, adds `λ_min·I` for regularization if needed,
-  Cholesky-factorizes, solves for counter-adjustments. The Cholesky step
-  operates on the reconstructed full matrix at compensation time — cheap
-  enough to do per-write-batch since Phase E isn't called on a hot path.
-
-### What this does **not** decide
-
-- Cross-architecture validation beyond SmolLM2. The structural choice
-  (low-rank) is robust across the 240 matrices measured here, but the exact
-  K values will need re-measurement when broader arch support lands in
-  the forward pass.
-- The calibration corpus. All measurements use `wiki.test.raw`, which is
-  the same distribution perplexity gates already live on. If we ever care
-  about domain-specific covers (code models, etc.), H should be re-calibrated
-  on in-domain activations — a D1+ CLI surface, not a D0 commitment.
-- Streaming / online low-rank accumulation for models whose full H doesn't
-  fit in RAM. D1 MVP will cap at the RAM-bounded regime; streaming is
-  a follow-up.
+- Hot-path compensation operator `M_R`: `compensation-design.md §1.3, §3.1`.
+- Per-layer Cholesky factor (L2): `§3.2`.
+- Cold-start lazy recompute: `§9`.
+- Capacity cliff and the fidelity ceiling: `§7`.
+- Online maintenance and drift bounds: `§6`.
 
 
