@@ -78,17 +78,12 @@ impl LlamaWeights {
     /// Load + dequantize every tensor a llama-arch forward pass
     /// needs. Returns `WeightLoadError` if any expected tensor is
     /// missing or has a quant type Milestone A can't handle.
-    pub fn load<P: AsRef<Path>>(
-        path: P,
-        cfg: &LlamaConfig,
-    ) -> Result<Self, WeightLoadError> {
+    pub fn load<P: AsRef<Path>>(path: P, cfg: &LlamaConfig) -> Result<Self, WeightLoadError> {
         let gguf = parse_path(&path).map_err(|e| WeightLoadError::Parse(e.to_string()))?;
-        let file =
-            std::fs::File::open(&path).map_err(|e| WeightLoadError::Io(e.to_string()))?;
+        let file = std::fs::File::open(&path).map_err(|e| WeightLoadError::Io(e.to_string()))?;
         // SAFETY: the file is opened read-only and the mapping is
         // kept alive only for the dequant loop below.
-        let mmap =
-            unsafe { Mmap::map(&file).map_err(|e| WeightLoadError::Io(e.to_string()))? };
+        let mmap = unsafe { Mmap::map(&file).map_err(|e| WeightLoadError::Io(e.to_string()))? };
 
         let ctx = LoadCtx {
             gguf: &gguf,
@@ -96,10 +91,8 @@ impl LlamaWeights {
         };
 
         // Top-level tensors.
-        let embedding = Arc::new(ctx.dequant_tensor(
-            "token_embd.weight",
-            cfg.vocab_size * cfg.hidden_dim,
-        )?);
+        let embedding =
+            Arc::new(ctx.dequant_tensor("token_embd.weight", cfg.vocab_size * cfg.hidden_dim)?);
         let final_norm = ctx.dequant_tensor("output_norm.weight", cfg.hidden_dim)?;
 
         // LM head: either explicit `output.weight`, or tied to the
@@ -116,15 +109,32 @@ impl LlamaWeights {
         let mut blocks = Vec::with_capacity(cfg.n_layers);
         for n in 0..cfg.n_layers {
             blocks.push(BlockStorage {
-                attn_norm: ctx.dequant_tensor(&format!("blk.{n}.attn_norm.weight"), cfg.hidden_dim)?,
-                wq: ctx.dequant_tensor(&format!("blk.{n}.attn_q.weight"), q_width * cfg.hidden_dim)?,
-                wk: ctx.dequant_tensor(&format!("blk.{n}.attn_k.weight"), kv_width * cfg.hidden_dim)?,
-                wv: ctx.dequant_tensor(&format!("blk.{n}.attn_v.weight"), kv_width * cfg.hidden_dim)?,
-                wo: ctx.dequant_tensor(&format!("blk.{n}.attn_output.weight"), cfg.hidden_dim * q_width)?,
-                ffn_norm: ctx.dequant_tensor(&format!("blk.{n}.ffn_norm.weight"), cfg.hidden_dim)?,
-                w_gate: ctx.dequant_tensor(&format!("blk.{n}.ffn_gate.weight"), cfg.ffn_dim * cfg.hidden_dim)?,
-                w_up: ctx.dequant_tensor(&format!("blk.{n}.ffn_up.weight"), cfg.ffn_dim * cfg.hidden_dim)?,
-                w_down: ctx.dequant_tensor(&format!("blk.{n}.ffn_down.weight"), cfg.hidden_dim * cfg.ffn_dim)?,
+                attn_norm: ctx
+                    .dequant_tensor(&format!("blk.{n}.attn_norm.weight"), cfg.hidden_dim)?,
+                wq: ctx
+                    .dequant_tensor(&format!("blk.{n}.attn_q.weight"), q_width * cfg.hidden_dim)?,
+                wk: ctx
+                    .dequant_tensor(&format!("blk.{n}.attn_k.weight"), kv_width * cfg.hidden_dim)?,
+                wv: ctx
+                    .dequant_tensor(&format!("blk.{n}.attn_v.weight"), kv_width * cfg.hidden_dim)?,
+                wo: ctx.dequant_tensor(
+                    &format!("blk.{n}.attn_output.weight"),
+                    cfg.hidden_dim * q_width,
+                )?,
+                ffn_norm: ctx
+                    .dequant_tensor(&format!("blk.{n}.ffn_norm.weight"), cfg.hidden_dim)?,
+                w_gate: ctx.dequant_tensor(
+                    &format!("blk.{n}.ffn_gate.weight"),
+                    cfg.ffn_dim * cfg.hidden_dim,
+                )?,
+                w_up: ctx.dequant_tensor(
+                    &format!("blk.{n}.ffn_up.weight"),
+                    cfg.ffn_dim * cfg.hidden_dim,
+                )?,
+                w_down: ctx.dequant_tensor(
+                    &format!("blk.{n}.ffn_down.weight"),
+                    cfg.hidden_dim * cfg.ffn_dim,
+                )?,
             });
         }
 
@@ -172,10 +182,9 @@ impl LoadCtx<'_> {
             .ok_or_else(|| WeightLoadError::OffsetOverflow {
                 tensor: name.to_owned(),
             })? as usize;
-        let src_len = byte_length(tensor, quant)
-            .ok_or_else(|| WeightLoadError::SizeOverflow {
-                tensor: name.to_owned(),
-            })?;
+        let src_len = byte_length(tensor, quant).ok_or_else(|| WeightLoadError::SizeOverflow {
+            tensor: name.to_owned(),
+        })?;
         let end = abs
             .checked_add(src_len)
             .ok_or_else(|| WeightLoadError::OffsetOverflow {
@@ -190,8 +199,9 @@ impl LoadCtx<'_> {
         }
         let src = &self.mmap[abs..end];
 
-        let got_weights = dequant::weight_count(quant, src_len)
-            .ok_or(WeightLoadError::Dequant(DequantError::Unsupported { quant }))?;
+        let got_weights = dequant::weight_count(quant, src_len).ok_or(WeightLoadError::Dequant(
+            DequantError::Unsupported { quant },
+        ))?;
         if got_weights != expected_weights {
             return Err(WeightLoadError::WrongWeightCount {
                 tensor: name.to_owned(),
@@ -201,14 +211,14 @@ impl LoadCtx<'_> {
         }
 
         let mut dst = vec![0.0_f32; got_weights];
-        dequant::dequantize_row_into(quant, src, &mut dst)
-            .map_err(WeightLoadError::Dequant)?;
+        dequant::dequantize_row_into(quant, src, &mut dst).map_err(WeightLoadError::Dequant)?;
         Ok(dst)
     }
 }
 
 /// Byte length for one tensor's packed data.
 fn byte_length(tensor: &GgufTensorInfo, quant: GgufQuantType) -> Option<usize> {
+    use crate::stego::packing::{q3_k, q4_k, q5_k, q6_k};
     let elems = usize::try_from(tensor.element_count()).ok()?;
     match quant {
         GgufQuantType::F32 => elems.checked_mul(4),
@@ -221,8 +231,22 @@ fn byte_length(tensor: &GgufTensorInfo, quant: GgufQuantType) -> Option<usize> {
             let blocks = elems / 32;
             blocks.checked_mul(34)
         }
+        GgufQuantType::Q3K => k_quant_byte_length(elems, q3_k::BLOCK_BYTES),
+        GgufQuantType::Q4K => k_quant_byte_length(elems, q4_k::BLOCK_BYTES),
+        GgufQuantType::Q5K => k_quant_byte_length(elems, q5_k::BLOCK_BYTES),
+        GgufQuantType::Q6K => k_quant_byte_length(elems, q6_k::BLOCK_BYTES),
         _ => None,
     }
+}
+
+/// K-quant super-block is always 256 weights; byte size varies by
+/// quant type.
+fn k_quant_byte_length(elems: usize, block_bytes: usize) -> Option<usize> {
+    if !elems.is_multiple_of(256) {
+        return None;
+    }
+    let blocks = elems / 256;
+    blocks.checked_mul(block_bytes)
 }
 
 #[derive(Debug, Error)]
