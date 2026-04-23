@@ -1,6 +1,6 @@
 # Compensation math and caching — design
 
-**Scope:** the math framework and caching architecture for error-compensated stego writes on int-quantized covers. Filesystem-layer concerns (inode design, metadata placement, write ordering) are documented separately in `DESIGN-NEW.MD §15` and the V2 module docs.
+**Scope:** the math framework and caching architecture for error-compensated stego writes on int-quantized covers. Filesystem-layer concerns (inode design, metadata placement, write ordering) are documented separately in `DESIGN-NEW.MD §15` and the V2 module docs. External-reader concurrency (how an mmap'd llama.cpp coexists with an active LLMDB mount) is covered in [`concurrency-design.md`](concurrency-design.md) — this doc guarantees quality *across committed states*, the concurrency doc guarantees external readers never observe intermediate ones.
 
 **Status:** architecture for Phase E onward. Phase D0 (`docs/phase-d-measurement.md`) measured the per-layer Hessian structure that this design relies on; the low-rank Cholesky option in §2.2 and the F16 factor precision in §3.2 are both backed by that measurement. Phase D1 (not yet built) implements the lazy per-layer Hessian-and-factor computation this design assumes is available.
 
