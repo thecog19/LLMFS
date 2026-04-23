@@ -59,6 +59,7 @@ use crate::v2::directory::{DirEntry, Directory, DirectoryError, EntryKind, MAX_N
 use crate::v2::dirty::{DirtyBitmap, DirtyBitmapError};
 use crate::v2::inode::{INODE_BYTES, Inode, InodeError, NUM_DIRECT};
 use crate::v2::pointer::{Pointer, PointerError};
+use crate::v2::salience::{SalienceError, SalienceTable};
 use crate::v2::super_root::{SUPER_ROOT_BYTES, SuperRoot, SuperRootError};
 
 /// Top-level V2 filesystem. Owns the cover storage for the lifetime
@@ -107,6 +108,9 @@ pub enum FsError {
 
     #[error("super-root codec: {0}")]
     SuperRoot(#[from] SuperRootError),
+
+    #[error("salience codec: {0}")]
+    Salience(#[from] SalienceError),
 
     #[error("pointer codec: {0}")]
     Pointer(#[from] PointerError),
@@ -285,10 +289,6 @@ impl Filesystem {
         let anchor_outcome =
             anchor::read_anchor_with_placement(cover.bytes(), &map, &anchor_placement)?;
 
-        let ceiling = CeilingSummary::build(cover.bytes(), &map);
-        let mut allocator = Allocator::new_for_map(&map, ceiling)?;
-        allocator.reserve_weights(unique_weights(&anchor_placement))?;
-
         let super_root_ptr = anchor_outcome.active.super_root;
         // The super-root chunk may be v1 (100B) or v2 (116B). Size
         // the read to the pointer's stored length so either lands.
@@ -310,6 +310,22 @@ impl Filesystem {
                 super_root: super_root.generation,
             });
         }
+
+        // Load the calibration salience (if any) *before* building
+        // the allocator, so every initial free run's `max_salience`
+        // reflects the real per-weight data. Load failures surface
+        // through `FsError::Salience`.
+        let salience_table = if super_root.salience_inode.is_null() {
+            SalienceTable::empty()
+        } else {
+            let bytes = load_byte_stream(cover.bytes(), &map, super_root.salience_inode)?;
+            SalienceTable::decode(&bytes).map_err(FsError::Salience)?
+        };
+
+        let ceiling = CeilingSummary::build(cover.bytes(), &map);
+        let mut allocator =
+            Allocator::new_for_map_with_salience(&map, ceiling, salience_table)?;
+        allocator.reserve_weights(unique_weights(&anchor_placement))?;
 
         reserve_pointer(&mut allocator, &map, super_root_ptr)?;
 
@@ -791,14 +807,16 @@ impl Filesystem {
         self.commit_snapshot(new_root_dir_inode, salience)
     }
 
-    /// Persist `data` as a new salience inode and commit a super-root
+    /// Persist `table` as a new salience inode and commit a super-root
     /// that points at it. The directory tree is unchanged; only the
     /// salience slot moves. Returns the new salience inode pointer.
     ///
-    /// Minimal shape for Phase B3: the caller supplies a plain byte
-    /// blob — the Phase B4 allocator consumer will wrap this with
-    /// a typed `SalienceTable` codec.
-    pub fn commit_salience(&mut self, data: &[u8]) -> Result<Pointer, FsError> {
+    /// The allocator doesn't reload from the new table until the next
+    /// mount — B4 intentionally scopes re-indexing to the mount path
+    /// to keep commits cheap. Tests that want to observe the new
+    /// placement bias cycle through unmount + mount.
+    pub fn commit_salience(&mut self, table: &SalienceTable) -> Result<Pointer, FsError> {
+        let data = table.encode();
         let new_salience_inode = persist_as_byte_stream(
             self.cover.bytes_mut(),
             &self.map,
@@ -806,16 +824,16 @@ impl Filesystem {
             &mut self.dirty_bitmap,
             &mut self.dedup_index,
             &self.cdc_params,
-            data,
+            &data,
         )?;
         let root = self.root_inode_ptr;
         self.commit_snapshot(root, new_salience_inode)?;
         Ok(new_salience_inode)
     }
 
-    /// Load the serialized salience bytes from the salience inode.
-    /// Returns `None` when the cover hasn't been calibrated yet.
-    pub fn load_salience(&self) -> Result<Option<Vec<u8>>, FsError> {
+    /// Load the salience table from the salience inode. Returns
+    /// `None` when the cover hasn't been calibrated yet.
+    pub fn load_salience(&self) -> Result<Option<SalienceTable>, FsError> {
         if self.super_root.salience_inode.is_null() {
             return Ok(None);
         }
@@ -824,7 +842,8 @@ impl Filesystem {
             &self.map,
             self.super_root.salience_inode,
         )?;
-        Ok(Some(bytes))
+        let table = SalienceTable::decode(&bytes).map_err(FsError::Salience)?;
+        Ok(Some(table))
     }
 
     /// Shared commit pipeline: persist bitmap, write super-root,

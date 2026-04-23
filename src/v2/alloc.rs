@@ -40,12 +40,16 @@ use crate::stego::tensor_map::TensorMap;
 use crate::v2::ceiling::CeilingSummary;
 use crate::v2::freelist::{FreeRun, FreeRunSet, ReserveError};
 use crate::v2::pointer::Pointer;
+use crate::v2::salience::SalienceTable;
 
 /// Pristine-path allocator over a cover's free-run set.
 #[derive(Debug)]
 pub struct Allocator {
     freelist: FreeRunSet,
     ceiling: CeilingSummary,
+    /// Per-weight salience (B4). Empty on un-calibrated covers; the
+    /// allocator's FitKey degenerates to ceiling-only in that case.
+    salience: SalienceTable,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -95,7 +99,23 @@ impl Allocator {
     /// Build an allocator over a fresh cover: each eligible slot
     /// contributes one initial free run spanning its full weight
     /// range. Non-stealable slots are skipped.
+    ///
+    /// The allocator starts with an empty [`SalienceTable`] —
+    /// [`Self::set_salience`] populates it at mount time on
+    /// calibrated covers.
     pub fn new_for_map(map: &TensorMap, ceiling: CeilingSummary) -> Result<Self, AllocError> {
+        Self::new_for_map_with_salience(map, ceiling, SalienceTable::empty())
+    }
+
+    /// Like [`Self::new_for_map`] but seeds the salience table at
+    /// construction. Used by mount paths that decode `salience_inode`
+    /// before installing free runs, so every run's initial
+    /// `max_salience` reflects the per-weight data.
+    pub fn new_for_map_with_salience(
+        map: &TensorMap,
+        ceiling: CeilingSummary,
+        salience: SalienceTable,
+    ) -> Result<Self, AllocError> {
         const MAX_SLOTS: usize = u16::MAX as usize + 1;
         const MAX_WEIGHTS_PER_SLOT: u64 = u32::MAX as u64;
 
@@ -120,14 +140,21 @@ impl Allocator {
                 });
             }
             let max_ceiling = ceiling.max_over_range(slot_idx as u32, 0, slot.weight_count);
+            let max_salience =
+                salience.max_over_range(slot_idx as u32, 0, slot.weight_count);
             freelist.insert(FreeRun {
                 slot: slot_idx as u16,
                 start_weight: 0,
                 length_in_weights: slot.weight_count as u32,
                 max_ceiling,
+                max_salience,
             });
         }
-        Ok(Self { freelist, ceiling })
+        Ok(Self {
+            freelist,
+            ceiling,
+            salience,
+        })
     }
 
     /// Remove every `(slot, weight_index)` in `weights` from the free
@@ -142,7 +169,7 @@ impl Allocator {
     {
         for (slot, weight_index) in weights {
             self.freelist
-                .reserve_weight(slot, weight_index, &self.ceiling)?;
+                .reserve_weight(slot, weight_index, &self.ceiling, &self.salience)?;
         }
         Ok(())
     }
@@ -152,6 +179,12 @@ impl Allocator {
     /// view.
     pub fn ceiling(&self) -> &CeilingSummary {
         &self.ceiling
+    }
+
+    /// Borrow the per-weight salience table. Empty on un-calibrated
+    /// covers.
+    pub fn salience(&self) -> &SalienceTable {
+        &self.salience
     }
 
     /// Count of free runs, for diagnostics and tests.
@@ -242,11 +275,17 @@ impl Allocator {
                 remainder_start as u64,
                 remainder_len as u64,
             );
+            let remainder_salience = self.salience.max_over_range(
+                picked.slot as u32,
+                remainder_start as u64,
+                remainder_len as u64,
+            );
             self.freelist.insert(FreeRun {
                 slot: picked.slot,
                 start_weight: remainder_start,
                 length_in_weights: remainder_len,
                 max_ceiling: remainder_ceiling,
+                max_salience: remainder_salience,
             });
         }
 
@@ -294,11 +333,17 @@ impl Allocator {
             pointer.start_weight as u64,
             length_in_weights as u64,
         );
+        let max_salience = self.salience.max_over_range(
+            pointer.slot as u32,
+            pointer.start_weight as u64,
+            length_in_weights as u64,
+        );
         self.freelist.insert_with_merge(FreeRun {
             slot: pointer.slot,
             start_weight: pointer.start_weight,
             length_in_weights,
             max_ceiling,
+            max_salience,
         });
         Ok(())
     }

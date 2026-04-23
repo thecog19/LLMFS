@@ -4,32 +4,38 @@
 //! and answers two queries:
 //!
 //! - `pop_best_fit(min_len)` — remove and return the free run with
-//!   the smallest `max_ceiling` among those whose length is `≥
-//!   min_len`. O(log N) in the number of free runs.
+//!   the smallest `(max_ceiling, max_salience)` among those whose
+//!   length is `≥ min_len`. O(log N) in the number of free runs.
 //! - `insert_with_merge(run)` — add a free run; if it abuts existing
-//!   free run(s) in the same slot, coalesce them. Merged max is
-//!   `max(neighbour.max_ceiling, run.max_ceiling)` — splitting a run
-//!   can only reduce max, so combining two runs whose originals were
-//!   correctly sized means the merged max is an exact upper bound.
+//!   free run(s) in the same slot, coalesce them. Merged maxes are
+//!   `max(neighbour.max_{ceiling,salience}, run.max_{ceiling,salience})`
+//!   — splitting a run can only reduce max, so combining two runs
+//!   whose originals were correctly sized means the merged max is
+//!   an exact upper bound.
 //!
 //! The dual-index scheme:
 //!
 //! - `by_position: BTreeMap<(slot, start_weight), FreeRunEntry>` —
 //!   primary storage, answers the adjacency queries used in
 //!   merge-on-free in O(log N).
-//! - `by_fit: BTreeSet<(max_ceiling_bits, length_in_weights, slot,
-//!   start_weight)>` — keyed to make "smallest-max with length ≥ L"
-//!   a lower-bound range query in O(log N).
+//! - `by_fit: BTreeSet<(max_ceiling_bits, max_salience_bits,
+//!   length_in_weights, slot, start_weight)>` — keyed to make
+//!   "smallest-cost with length ≥ L" a lower-bound range query in
+//!   O(log N). Ceiling-primary, salience-secondary. When the cover
+//!   isn't calibrated every run has `max_salience = 0.0` and the
+//!   salience component is a no-op, so behavior matches
+//!   pre-B4 exactly.
 //!
-//! `max_ceiling` is stored as `f32::to_bits() as u32` for the Ord
-//! key; this preserves ordering for non-negative non-NaN floats
-//! (ceiling magnitudes are always non-negative and a debug_assert
-//! catches NaN).
+//! Both `max_ceiling` and `max_salience` are stored as `f32::to_bits
+//! () as u32` for the Ord key; this preserves ordering for
+//! non-negative non-NaN floats (both are non-negative by
+//! construction, and a `debug_assert` catches NaN).
 
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
 use crate::v2::ceiling::CeilingSummary;
+use crate::v2::salience::SalienceTable;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ReserveError {
@@ -38,10 +44,11 @@ pub enum ReserveError {
 }
 
 /// Key type for the `by_fit` index. Packed tuple for lexicographic
-/// ordering: `(max_ceiling_bits, length_in_weights, slot,
-/// start_weight)` — smaller max_ceiling comes first, then shorter
-/// runs, then canonical `(slot, start_weight)` tiebreak.
-type FitKey = (u32, u32, u16, u32);
+/// ordering: `(max_ceiling_bits, max_salience_bits,
+/// length_in_weights, slot, start_weight)`. Ceiling-primary,
+/// salience-secondary; ties then prefer shorter runs + canonical
+/// `(slot, start_weight)`.
+type FitKey = (u32, u32, u32, u16, u32);
 
 /// Unallocated contiguous run of WeightRef positions in a single slot.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -52,6 +59,11 @@ pub struct FreeRun {
     /// `max(ceiling_magnitude(w))` over weights `[start..start+length)`.
     /// Invariant: non-negative and not NaN.
     pub max_ceiling: f32,
+    /// `max(salience(w))` over weights `[start..start+length)`.
+    /// `0.0` for runs on un-calibrated covers (the neutral value in
+    /// the compound FitKey — ordering degenerates to ceiling-only).
+    /// Invariant: non-negative and not NaN.
+    pub max_salience: f32,
 }
 
 impl FreeRun {
@@ -69,8 +81,18 @@ impl FreeRun {
             "FreeRun.max_ceiling must be non-negative, got {}",
             self.max_ceiling,
         );
+        debug_assert!(
+            !self.max_salience.is_nan(),
+            "FreeRun.max_salience must not be NaN",
+        );
+        debug_assert!(
+            self.max_salience >= 0.0,
+            "FreeRun.max_salience must be non-negative, got {}",
+            self.max_salience,
+        );
         (
             self.max_ceiling.to_bits(),
+            self.max_salience.to_bits(),
             self.length_in_weights,
             self.slot,
             self.start_weight,
@@ -89,6 +111,7 @@ pub struct FreeRunSet {
 struct FreeRunEntry {
     length_in_weights: u32,
     max_ceiling: f32,
+    max_salience: f32,
 }
 
 impl FreeRunSet {
@@ -115,8 +138,9 @@ impl FreeRunSet {
 
     /// Remove the single weight `(slot, weight_index)` from the free
     /// set, splitting the containing run if necessary. Left and
-    /// right halves' `max_ceiling` are recomputed via `ceiling` so
-    /// the allocator's fit-ordering stays accurate after the split.
+    /// right halves' `max_ceiling` and `max_salience` are recomputed
+    /// over the sub-range so the allocator's fit-ordering stays
+    /// accurate after the split.
     ///
     /// Used at init to carve out the anchor positions so the
     /// allocator never hands them back as data chunks.
@@ -128,6 +152,7 @@ impl FreeRunSet {
         slot: u16,
         weight_index: u32,
         ceiling: &CeilingSummary,
+        salience: &SalienceTable,
     ) -> Result<(), ReserveError> {
         // Containing run: rightmost entry whose key is ≤ (slot, weight_index).
         let containing_key = self
@@ -153,11 +178,14 @@ impl FreeRunSet {
         if weight_index > run_start {
             let left_len = weight_index - run_start;
             let left_max = ceiling.max_over_range(slot as u32, run_start as u64, left_len as u64);
+            let left_sal =
+                salience.max_over_range(slot as u32, run_start as u64, left_len as u64);
             self.insert_raw(FreeRun {
                 slot,
                 start_weight: run_start,
                 length_in_weights: left_len,
                 max_ceiling: left_max,
+                max_salience: left_sal,
             });
         }
 
@@ -167,11 +195,14 @@ impl FreeRunSet {
             let right_len = run_end - right_start;
             let right_max =
                 ceiling.max_over_range(slot as u32, right_start as u64, right_len as u64);
+            let right_sal =
+                salience.max_over_range(slot as u32, right_start as u64, right_len as u64);
             self.insert_raw(FreeRun {
                 slot,
                 start_weight: right_start,
                 length_in_weights: right_len,
                 max_ceiling: right_max,
+                max_salience: right_sal,
             });
         }
 
@@ -212,7 +243,8 @@ impl FreeRunSet {
 
     /// Insert a free run and coalesce with adjacent runs in the same
     /// slot. This is the correct operation when freeing a chunk.
-    /// Merged max_ceiling = max(neighbour.max_ceiling, run.max_ceiling).
+    /// Merged `max_ceiling` / `max_salience` are the pairwise max
+    /// of the combining runs' values.
     pub fn insert_with_merge(&mut self, mut run: FreeRun) {
         // Look left: run ending at run.start_weight?
         let left_key = self
@@ -230,6 +262,7 @@ impl FreeRunSet {
                     start_weight: prev.start_weight,
                     length_in_weights: prev.length_in_weights + run.length_in_weights,
                     max_ceiling: prev.max_ceiling.max(run.max_ceiling),
+                    max_salience: prev.max_salience.max(run.max_salience),
                 };
             }
         }
@@ -244,6 +277,7 @@ impl FreeRunSet {
                 start_weight: run.start_weight,
                 length_in_weights: run.length_in_weights + next.length_in_weights,
                 max_ceiling: run.max_ceiling.max(next.max_ceiling),
+                max_salience: run.max_salience.max(next.max_salience),
             };
         }
 
@@ -270,7 +304,7 @@ impl FreeRunSet {
     ) -> Option<FreeRun> {
         let mut winner_key: Option<FitKey> = None;
         for key in &self.by_fit {
-            let (_max_bits, length, slot, start) = *key;
+            let (_ceiling_bits, _salience_bits, length, slot, start) = *key;
             let entry = match self.by_position.get(&(slot, start)).copied() {
                 Some(e) => e,
                 None => continue, // by_fit / by_position invariant violated; skip
@@ -281,13 +315,14 @@ impl FreeRunSet {
                 start_weight: start,
                 length_in_weights: entry.length_in_weights,
                 max_ceiling: entry.max_ceiling,
+                max_salience: entry.max_salience,
             };
             if predicate(&run) {
                 winner_key = Some(*key);
                 break;
             }
         }
-        let (_max, _len, slot, start) = winner_key?;
+        let (_c, _s, _len, slot, start) = winner_key?;
         self.remove_raw((slot, start))
     }
 
@@ -308,6 +343,7 @@ impl FreeRunSet {
             FreeRunEntry {
                 length_in_weights: run.length_in_weights,
                 max_ceiling: run.max_ceiling,
+                max_salience: run.max_salience,
             },
         );
     }
@@ -319,6 +355,7 @@ impl FreeRunSet {
             start_weight: key.1,
             length_in_weights: entry.length_in_weights,
             max_ceiling: entry.max_ceiling,
+            max_salience: entry.max_salience,
         };
         self.by_fit.remove(&run.fit_key());
         Some(run)
@@ -329,64 +366,63 @@ impl FreeRunSet {
 mod tests {
     use super::*;
 
+    fn run(slot: u16, start: u32, len: u32, ceiling: f32, salience: f32) -> FreeRun {
+        FreeRun {
+            slot,
+            start_weight: start,
+            length_in_weights: len,
+            max_ceiling: ceiling,
+            max_salience: salience,
+        }
+    }
+
     #[test]
-    fn fit_key_orders_by_max_then_length() {
+    fn fit_key_orders_by_ceiling_then_salience_then_length() {
         // Same max_ceiling → shorter length sorts first (so best-fit
         // prefers tighter-fitting runs when multiple satisfy the
         // min_length threshold).
-        let longer = FreeRun {
-            slot: 0,
-            start_weight: 0,
-            length_in_weights: 100,
-            max_ceiling: 0.1,
-        };
-        let shorter = FreeRun {
-            slot: 0,
-            start_weight: 200,
-            length_in_weights: 50,
-            max_ceiling: 0.1,
-        };
+        let longer = run(0, 0, 100, 0.1, 0.0);
+        let shorter = run(0, 200, 50, 0.1, 0.0);
         assert!(
             shorter.fit_key() < longer.fit_key(),
             "tie-broken by shorter-first"
         );
 
         // Higher max_ceiling sorts after lower regardless of length.
-        let low_max = FreeRun {
-            max_ceiling: 0.05,
-            ..longer
-        };
-        let high_max = FreeRun {
-            max_ceiling: 0.5,
-            ..shorter
-        };
+        let low_max = FreeRun { max_ceiling: 0.05, ..longer };
+        let high_max = FreeRun { max_ceiling: 0.5, ..shorter };
         assert!(low_max.fit_key() < high_max.fit_key());
     }
 
     #[test]
+    fn fit_key_salience_is_secondary_tiebreaker() {
+        // Same ceiling, same length, different salience → lower
+        // salience sorts first.
+        let low = run(0, 0, 100, 0.2, 0.05);
+        let high = run(0, 500, 100, 0.2, 0.5);
+        assert!(low.fit_key() < high.fit_key());
+
+        // Ceiling wins over salience: low ceiling + high salience
+        // still sorts before high ceiling + zero salience.
+        let low_ceiling_high_sal = run(0, 0, 100, 0.1, 1.0);
+        let high_ceiling_zero_sal = run(0, 500, 100, 0.9, 0.0);
+        assert!(low_ceiling_high_sal.fit_key() < high_ceiling_zero_sal.fit_key());
+    }
+
+    #[test]
     fn end_weight_computation() {
-        let r = FreeRun {
-            slot: 0,
-            start_weight: 100,
-            length_in_weights: 50,
-            max_ceiling: 0.0,
-        };
+        let r = run(0, 100, 50, 0.0, 0.0);
         assert_eq!(r.end_weight(), 150);
     }
 
     #[test]
     fn internal_insert_and_remove() {
         let mut fl = FreeRunSet::new();
-        let run = FreeRun {
-            slot: 0,
-            start_weight: 0,
-            length_in_weights: 10,
-            max_ceiling: 1.0,
-        };
-        fl.insert_raw(run);
+        let r = run(0, 0, 10, 1.0, 0.0);
+        fl.insert_raw(r);
         assert_eq!(fl.len(), 1);
         let removed = fl.remove_raw((0, 0)).unwrap();
-        assert_eq!(removed, run);
+        assert_eq!(removed, r);
         assert!(fl.is_empty());
     }
 }

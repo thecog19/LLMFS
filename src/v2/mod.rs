@@ -28,4 +28,5 @@ pub mod fs;
 pub mod fuse;
 pub mod inode;
 pub mod pointer;
+pub mod salience;
 pub mod super_root;
