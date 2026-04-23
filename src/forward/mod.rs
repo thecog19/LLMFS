@@ -17,6 +17,7 @@ pub mod awq;
 pub mod block;
 pub mod config;
 pub mod dequant;
+pub mod hessian;
 pub mod kv_cache;
 pub mod model;
 pub mod ops;
@@ -33,6 +34,7 @@ pub mod weights;
 // external-API shape.
 pub use awq::{ActivationSite, AwqCollector};
 pub use block::{BlockObserver, NoopObserver};
+pub use hessian::HessianAccumulator;
 pub use config::{ConfigError, LlamaConfig};
 pub use kv_cache::{KvCache, LayerKvCache};
 pub use model::{ForwardModel, ModelLoadError, ModelScratch};
