@@ -186,6 +186,10 @@ For `F = 32`, `δ = 10⁻⁵`, `<H_ii> = 10⁻¹`: `ΔL ≈ 1.6 × 10⁻¹⁰`. 
 
 Placement recommendation: choose pointer location at init from among the flattest-`H_ii` weights in layer 0. One-time optimization, zero runtime cost, strictly better than an arbitrary fixed location.
 
+**Interaction with V2's anchor invariance.** The `H_ii`-minimal rule as stated is incompatible with V2's self-locating anchor (`DESIGN-NEW.MD §15.2`, `src/v2/anchor.rs`). The anchor must be findable on any reopen without reading any persisted metadata, so its placement rule must be **invariant under any stealable-bit write**. V2 uses ceiling magnitude — `|w|` with stealable bits at their worst-case value — which is invariant by construction because writes can only touch those bits. `H_ii = E[x_i²]` depends on activations, which depend on weights, which change under writes; so a rule that ranks weights by `H_ii` would land at different positions after any write, breaking the anchor's self-location.
+
+The loss we'd save by switching is already `~10⁻¹⁰` (above). We keep the ceiling-magnitude rule, accept the residual perturbation, and treat this section's recommendation as applying only to contexts where persistence lets us remember a one-off placement (none exists in V2 today). If a future design introduces such a context (e.g., a persistent anchor-location table stored via some other invariant-preserving rule), the `H_ii` optimization becomes available then.
+
 ## 9. Cold-start behavior
 
 No cache state is persistent. On restart:

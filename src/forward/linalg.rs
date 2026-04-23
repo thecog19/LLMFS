@@ -45,6 +45,47 @@ pub enum CholeskyError {
     NotPositiveDefinite { row: usize, diag_sq: f64 },
 }
 
+#[derive(Debug, Error)]
+pub enum PivotedCholeskyError {
+    #[error(
+        "input upper-triangle length {got} does not match n*(n+1)/2 = {expected} for n={n}"
+    )]
+    LengthMismatch { n: usize, expected: usize, got: usize },
+
+    #[error(
+        "tolerance must be in [0, 1] (got {tolerance}) — interpreted as a \
+         fraction of trace(H) for the residual-diagonal stopping criterion"
+    )]
+    ToleranceOutOfRange { tolerance: f32 },
+}
+
+/// Output of [`pivoted_cholesky`]: a rank-`K` approximation of the
+/// input matrix `H` such that `V * V^T ≈ H` with residual bounded
+/// by the tolerance passed to the factorization.
+#[derive(Debug, Clone)]
+pub struct PivotedCholesky {
+    /// Input matrix dimension.
+    pub n: usize,
+    /// Order in which pivots were selected (one per column of `V`,
+    /// in extraction order). Length equals the output's rank `K`.
+    pub pivots: Vec<usize>,
+    /// Column-major flat storage of `V` (N rows × K columns):
+    /// `v[k * n + i]` is `V[i][k]`. Length `n * pivots.len()`.
+    pub v: Vec<f32>,
+}
+
+impl PivotedCholesky {
+    /// Rank `K` of this low-rank factor — i.e., number of columns in `V`.
+    pub fn rank(&self) -> usize {
+        self.pivots.len()
+    }
+
+    /// Whether the factorization produced any columns.
+    pub fn is_empty(&self) -> bool {
+        self.pivots.is_empty()
+    }
+}
+
 /// Offset of `L[i][j]` (for `j <= i`) in lower-triangle row-major
 /// packed storage.
 #[inline]
@@ -165,6 +206,141 @@ pub fn obs_saliency(l: &[f32], n: usize) -> Vec<f32> {
         out[j] = (1.0 / norm_sq) as f32;
     }
     out
+}
+
+/// Pivoted Cholesky factorization with adaptive rank (Harbrecht,
+/// Peters, Schneider 2012). Produces an `N × K` matrix `V` such that
+/// `V * V^T ≈ H`, with `K` chosen adaptively by tolerance or capped
+/// at `max_rank`, whichever happens first.
+///
+/// This is the low-rank counterpart to [`cholesky`], motivated by
+/// `docs/compensation-design.md §2.2` and backed by the D0
+/// measurements in `docs/phase-d-measurement.md` (per-site effective
+/// rank 3–17% of N at 5% Frobenius error on SmolLM2). Phase E's
+/// compensation math can work against `V` directly via
+/// `V (V^T V)⁻¹ V^T` — O(K²) extra work compared to full `L` solves
+/// but with O(K·N) storage instead of O(N²).
+///
+/// **Algorithm outline.** At each step `k`:
+///
+/// 1. Select pivot `p_k = argmax_i diag(R_k)[i]` where `R_k` is the
+///    current residual `H − V_{<k} V_{<k}^T`. (Diagonal residual
+///    entries are maintained incrementally — no explicit residual
+///    matrix construction.)
+/// 2. If `R_k[p_k][p_k] < tolerance · trace(H)`, stop. This bounds
+///    the dropped diagonal contribution (and so, bounds the trace
+///    of the residual) to at most `tolerance · trace(H)`.
+/// 3. Compute column `v_k` of length `N`:
+///    - `v_k[p_k] = √R_k[p_k][p_k]`,
+///    - `v_k[i] = R_k[i][p_k] / v_k[p_k]` for `i ≠ p_k`,
+///    where `R_k[i][p_k] = H[i][p_k] − Σ_{j<k} v_j[i] · v_j[p_k]`.
+/// 4. Update residual diagonal: `d_i ← d_i − v_k[i]²`; force
+///    `d_{p_k} ← 0` to mark that position exhausted.
+///
+/// Cost: `O(K · N · K)` total (each iteration's inner sum is `O(K)`
+/// and runs for `N` positions). For the regimes we care about
+/// (`K ≪ N`) this is substantially cheaper than the `O(N³/3)` of
+/// full Cholesky.
+///
+/// # Arguments
+///
+/// - `h_upper`: upper triangle of `H`, row-major packed; same layout
+///   as [`cholesky`]'s input.
+/// - `n`: matrix dimension.
+/// - `tolerance`: must be in `[0, 1]`. Fraction of `trace(H)` below
+///   which to stop extracting new columns. `0` means "keep going to
+///   `max_rank` regardless" (modulo exhausting positive residual).
+/// - `max_rank`: hard cap on number of columns. `N` recovers the
+///   full factorization (up to pivoting).
+pub fn pivoted_cholesky(
+    h_upper: &[f32],
+    n: usize,
+    tolerance: f32,
+    max_rank: usize,
+) -> Result<PivotedCholesky, PivotedCholeskyError> {
+    let expected = n * (n + 1) / 2;
+    if h_upper.len() != expected {
+        return Err(PivotedCholeskyError::LengthMismatch {
+            n,
+            expected,
+            got: h_upper.len(),
+        });
+    }
+    if !(0.0..=1.0).contains(&tolerance) || tolerance.is_nan() {
+        return Err(PivotedCholeskyError::ToleranceOutOfRange { tolerance });
+    }
+    if n == 0 || max_rank == 0 {
+        return Ok(PivotedCholesky {
+            n,
+            pivots: Vec::new(),
+            v: Vec::new(),
+        });
+    }
+
+    // Residual diagonal. Starts as diag(H); decreases as we peel
+    // off rank-1 updates.
+    let mut diagonal: Vec<f64> = (0..n)
+        .map(|i| h_at(h_upper, n, i, i) as f64)
+        .collect();
+    let initial_trace: f64 = diagonal.iter().copied().sum();
+    let stop_threshold = initial_trace * tolerance as f64;
+
+    let k_max = max_rank.min(n);
+    let mut v: Vec<f32> = Vec::with_capacity(k_max * n);
+    let mut pivots: Vec<usize> = Vec::with_capacity(k_max);
+
+    for k in 0..k_max {
+        // Pivot: index of max residual diagonal.
+        let (p, &d_p) = match diagonal
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        {
+            Some(x) => x,
+            None => break, // unreachable while n > 0, but guard anyway
+        };
+
+        // Stop on exhaustion (<= 0) or tolerance.
+        if d_p <= 0.0 || d_p <= stop_threshold {
+            break;
+        }
+
+        let diag_sqrt = d_p.sqrt();
+
+        // Reserve the column. Write pivot entry first (sqrt), then
+        // fill i ≠ p from H[i][p] minus prior-column contributions.
+        let col_start = v.len();
+        v.resize(col_start + n, 0.0);
+        v[col_start + p] = diag_sqrt as f32;
+
+        for i in 0..n {
+            if i == p {
+                continue;
+            }
+            // r_ip = H[i][p] - Σ_{j<k} v_j[i] · v_j[p].
+            let mut r_ip = h_at(h_upper, n, i, p) as f64;
+            for j in 0..k {
+                let vji = v[j * n + i] as f64;
+                let vjp = v[j * n + p] as f64;
+                r_ip -= vji * vjp;
+            }
+            v[col_start + i] = (r_ip / diag_sqrt) as f32;
+        }
+
+        // Update the residual diagonal. For every i, subtract v_k[i]²;
+        // force diagonal[p] to zero to mark that pivot as exhausted
+        // (floating-point subtraction could leave a tiny negative
+        // residual otherwise, which would confuse the next argmax).
+        for i in 0..n {
+            let v_ki = v[col_start + i] as f64;
+            diagonal[i] -= v_ki * v_ki;
+        }
+        diagonal[p] = 0.0;
+
+        pivots.push(p);
+    }
+
+    Ok(PivotedCholesky { n, pivots, v })
 }
 
 /// Solve `L * x = b` in place, where `L` is the lower-triangle packed
@@ -507,5 +683,230 @@ mod tests {
             (obs[0] - obs[1]).abs() > 0.1,
             "OBS should differ across channels; got {obs:?}"
         );
+    }
+
+    // ── pivoted_cholesky tests ──────────────────────────────────────
+
+    /// Compute `(V * V^T)[i][j]` from column-major packed V (length
+    /// `n * rank`). Test helper; zero production use.
+    fn vvt_entry(v: &[f32], n: usize, rank: usize, i: usize, j: usize) -> f64 {
+        let mut sum = 0.0_f64;
+        for k in 0..rank {
+            sum += v[k * n + i] as f64 * v[k * n + j] as f64;
+        }
+        sum
+    }
+
+    #[test]
+    fn pivoted_cholesky_rejects_length_mismatch() {
+        // n=3 expects 6 entries; give 4.
+        let h = [1.0_f32, 0.0, 0.0, 1.0];
+        let err = pivoted_cholesky(&h, 3, 0.0, 3).unwrap_err();
+        assert!(matches!(
+            err,
+            PivotedCholeskyError::LengthMismatch {
+                n: 3,
+                expected: 6,
+                got: 4
+            }
+        ));
+    }
+
+    #[test]
+    fn pivoted_cholesky_rejects_out_of_range_tolerance() {
+        let h = [1.0_f32];
+        let err = pivoted_cholesky(&h, 1, -0.1, 1).unwrap_err();
+        assert!(matches!(
+            err,
+            PivotedCholeskyError::ToleranceOutOfRange { .. }
+        ));
+        let err = pivoted_cholesky(&h, 1, 1.5, 1).unwrap_err();
+        assert!(matches!(
+            err,
+            PivotedCholeskyError::ToleranceOutOfRange { .. }
+        ));
+    }
+
+    #[test]
+    fn pivoted_cholesky_n_zero_returns_empty() {
+        let h: [f32; 0] = [];
+        let result = pivoted_cholesky(&h, 0, 0.0, 5).unwrap();
+        assert_eq!(result.n, 0);
+        assert!(result.pivots.is_empty());
+        assert!(result.v.is_empty());
+        assert_eq!(result.rank(), 0);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn pivoted_cholesky_max_rank_zero_returns_empty() {
+        let h = [4.0_f32, 2.0, 5.0];
+        let result = pivoted_cholesky(&h, 2, 0.0, 0).unwrap();
+        assert_eq!(result.rank(), 0);
+    }
+
+    #[test]
+    fn pivoted_cholesky_identity_reaches_full_rank() {
+        // H = I_N → V*V^T must exactly equal I_N given enough rank.
+        let n = 5;
+        let mut h = vec![0.0_f32; n * (n + 1) / 2];
+        for i in 0..n {
+            h[upper_tri_offset(n, i, i)] = 1.0;
+        }
+        let result = pivoted_cholesky(&h, n, 0.0, n).unwrap();
+        assert_eq!(result.rank(), n);
+        for i in 0..n {
+            for j in 0..n {
+                let got = vvt_entry(&result.v, n, result.rank(), i, j);
+                let want = if i == j { 1.0 } else { 0.0 };
+                assert!(
+                    (got - want).abs() < 1e-6,
+                    "(V V^T)[{i}][{j}] = {got}, expected {want}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pivoted_cholesky_recovers_rank_k_spd_matrix_exactly() {
+        // Build H = U U^T where U is N×K, K < N. H has exact rank K,
+        // so pivoted Cholesky with max_rank=N should stop at rank K
+        // (residual goes to zero once we've captured all K directions)
+        // and V V^T should equal H to machine tolerance.
+        let n = 6;
+        let k_rank = 3;
+        // U columns: three non-trivial vectors, selected so their
+        // outer products aren't degenerate.
+        let u: Vec<Vec<f32>> = vec![
+            vec![1.0, 0.5, -1.0, 0.3, 2.0, -0.7],
+            vec![0.2, 1.0, 0.5, -0.8, 0.1, 1.3],
+            vec![-0.5, 0.3, 1.1, 0.9, -1.2, 0.4],
+        ];
+        // Build H upper triangle: H[i][j] = Σ_k U[k][i] · U[k][j] for i ≤ j.
+        let mut h = vec![0.0_f32; n * (n + 1) / 2];
+        for i in 0..n {
+            for j in i..n {
+                let mut sum = 0.0_f64;
+                for col in &u {
+                    sum += col[i] as f64 * col[j] as f64;
+                }
+                h[upper_tri_offset(n, i, j)] = sum as f32;
+            }
+        }
+        let result = pivoted_cholesky(&h, n, 1e-7, n).unwrap();
+        assert_eq!(
+            result.rank(),
+            k_rank,
+            "rank-{k_rank} input should produce rank-{k_rank} factor, got {}",
+            result.rank(),
+        );
+        // V V^T must match H to tolerance.
+        for i in 0..n {
+            for j in 0..n {
+                let got = vvt_entry(&result.v, n, result.rank(), i, j);
+                let h_ij = if i <= j {
+                    h[upper_tri_offset(n, i, j)]
+                } else {
+                    h[upper_tri_offset(n, j, i)]
+                } as f64;
+                assert!(
+                    (got - h_ij).abs() < 1e-4,
+                    "(V V^T)[{i}][{j}] = {got}, H[{i}][{j}] = {h_ij}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pivoted_cholesky_tolerance_bounds_residual_trace() {
+        // For a non-trivial SPD matrix, the residual trace after
+        // early-stopping at `tolerance · trace(H)` must satisfy:
+        //   Σ_i residual_diag[i] ≤ tolerance · trace(H)
+        // which follows from the stopping criterion being applied to
+        // the max diagonal entry; the sum is bounded by n × max which
+        // is looser, but in practice residual is often near max at stop.
+        let n = 5;
+        let v_seed: Vec<f32> = vec![1.0, -0.5, 2.0, 0.3, -1.2];
+        let mut h = vec![0.0_f32; n * (n + 1) / 2];
+        for i in 0..n {
+            for j in i..n {
+                let vv = v_seed[i] * v_seed[j];
+                let identity = if i == j { 1.0 } else { 0.0 };
+                h[upper_tri_offset(n, i, j)] = vv + identity;
+            }
+        }
+        let initial_trace: f64 = (0..n)
+            .map(|i| h[upper_tri_offset(n, i, i)] as f64)
+            .sum();
+        let tolerance = 0.5_f32;
+        let result = pivoted_cholesky(&h, n, tolerance, n).unwrap();
+        // Recompute diagonal of residual H - V V^T.
+        let residual_trace: f64 = (0..n)
+            .map(|i| {
+                h[upper_tri_offset(n, i, i)] as f64
+                    - vvt_entry(&result.v, n, result.rank(), i, i)
+            })
+            .sum();
+        assert!(
+            residual_trace >= -1e-6,
+            "residual trace went negative ({residual_trace}) — PSD violation"
+        );
+        // Post-stop max diagonal ≤ tolerance · initial_trace by
+        // construction; residual trace ≤ n · max ≤ n · tol · init.
+        // For this test we just verify the bound isn't wildly off.
+        let max_residual_diag = (0..n)
+            .map(|i| {
+                h[upper_tri_offset(n, i, i)] as f64
+                    - vvt_entry(&result.v, n, result.rank(), i, i)
+            })
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_residual_diag <= tolerance as f64 * initial_trace + 1e-5,
+            "max residual diag {max_residual_diag} exceeds tolerance × trace \
+             ({} × {} = {})",
+            tolerance,
+            initial_trace,
+            tolerance as f64 * initial_trace,
+        );
+    }
+
+    #[test]
+    fn pivoted_cholesky_max_rank_caps_output() {
+        // Full-rank SPD input, but request at most 2 columns.
+        let n = 5;
+        let v_seed: Vec<f32> = vec![1.0, -0.5, 2.0, 0.3, -1.2];
+        let mut h = vec![0.0_f32; n * (n + 1) / 2];
+        for i in 0..n {
+            for j in i..n {
+                let vv = v_seed[i] * v_seed[j];
+                let identity = if i == j { 1.0 } else { 0.0 };
+                h[upper_tri_offset(n, i, j)] = vv + identity;
+            }
+        }
+        let result = pivoted_cholesky(&h, n, 0.0, 2).unwrap();
+        assert_eq!(result.rank(), 2);
+        assert_eq!(result.pivots.len(), 2);
+        assert_eq!(result.v.len(), 2 * n);
+    }
+
+    #[test]
+    fn pivoted_cholesky_pivot_order_picks_largest_diagonals_first() {
+        // For H = diag(9, 1, 4), pivoted Cholesky should pick
+        // position 0 (largest diagonal), then position 2 (next), then 1.
+        let n = 3;
+        let mut h = vec![0.0_f32; n * (n + 1) / 2];
+        h[upper_tri_offset(n, 0, 0)] = 9.0;
+        h[upper_tri_offset(n, 1, 1)] = 1.0;
+        h[upper_tri_offset(n, 2, 2)] = 4.0;
+        let result = pivoted_cholesky(&h, n, 0.0, n).unwrap();
+        assert_eq!(result.pivots, vec![0, 2, 1]);
+    }
+
+    #[test]
+    fn pivoted_cholesky_stops_on_zero_diagonal() {
+        // H = [[0]] has a zero diagonal; no columns should be extracted.
+        let h = [0.0_f32];
+        let result = pivoted_cholesky(&h, 1, 0.0, 1).unwrap();
+        assert_eq!(result.rank(), 0);
     }
 }

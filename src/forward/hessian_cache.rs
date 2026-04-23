@@ -30,6 +30,7 @@
 use std::collections::HashMap;
 
 use crate::forward::awq::ActivationSite;
+use crate::forward::linalg::PivotedCholesky;
 
 /// Cholesky factor of a single `(site, layer)` Hessian. `l` is the
 /// lower triangle of `L` in row-major packed form (length
@@ -63,6 +64,74 @@ impl CholeskyFactor {
     #[inline]
     pub fn bytes_resident(&self) -> usize {
         self.l.capacity() * std::mem::size_of::<f32>()
+    }
+}
+
+/// Low-rank approximation of a `(site, layer)` Hessian such that
+/// `V * V^T ≈ H`, produced by
+/// [`crate::forward::linalg::pivoted_cholesky`]. Storage complement
+/// to [`CholeskyFactor`]: when the full factor is too large to
+/// keep resident (big covers, 7B+), callers keep `LowRankFactor`
+/// instead — `O(N·K)` entries where K is the per-site effective
+/// rank (3–17% of N per the D0 measurements in
+/// `docs/phase-d-measurement.md`).
+///
+/// Phase E's compensation math can solve against this directly via
+/// the pseudoinverse identity `H⁺ = V (V^T V)⁻¹ V^T` (see
+/// `docs/compensation-design.md §2.2`).
+#[derive(Debug, Clone)]
+pub struct LowRankFactor {
+    /// Matrix dimension of the approximated H.
+    pub n: usize,
+    /// Pivot indices in selection order. Length = rank `K`.
+    pub pivots: Vec<usize>,
+    /// Column-major flat storage of V (N rows × K columns):
+    /// `v[k * n + i]` is `V[i][k]`. Length `n * rank`.
+    pub v: Vec<f32>,
+}
+
+impl LowRankFactor {
+    /// Construct from raw components. Asserts the relationships
+    /// `v.len() == n * pivots.len()`. Panics otherwise — a mismatch
+    /// means the caller constructed bogus data.
+    pub fn new(n: usize, pivots: Vec<usize>, v: Vec<f32>) -> Self {
+        assert_eq!(
+            v.len(),
+            n * pivots.len(),
+            "LowRankFactor::new: v length {} does not match n * rank = {n} * {} = {}",
+            v.len(),
+            pivots.len(),
+            n * pivots.len(),
+        );
+        Self { n, pivots, v }
+    }
+
+    /// Rank `K` of the approximation.
+    pub fn rank(&self) -> usize {
+        self.pivots.len()
+    }
+
+    /// Whether the factor has zero columns — meaningful after a
+    /// tolerance-based early-stop of pivoted Cholesky.
+    pub fn is_empty(&self) -> bool {
+        self.pivots.is_empty()
+    }
+
+    /// RAM bytes this factor occupies, including pivots.
+    #[inline]
+    pub fn bytes_resident(&self) -> usize {
+        self.v.capacity() * std::mem::size_of::<f32>()
+            + self.pivots.capacity() * std::mem::size_of::<usize>()
+    }
+}
+
+impl From<PivotedCholesky> for LowRankFactor {
+    fn from(pc: PivotedCholesky) -> Self {
+        Self {
+            n: pc.n,
+            pivots: pc.pivots,
+            v: pc.v,
+        }
     }
 }
 
@@ -245,5 +314,64 @@ mod tests {
         assert_eq!(seen.len(), 2);
         assert!(seen.contains(&(ActivationSite::QkvInput, 0)));
         assert!(seen.contains(&(ActivationSite::FfnDownInput, 5)));
+    }
+
+    // ── LowRankFactor tests ─────────────────────────────────────────
+
+    #[test]
+    fn low_rank_factor_new_round_trips_fields() {
+        let f = LowRankFactor::new(4, vec![1, 3], vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]);
+        assert_eq!(f.n, 4);
+        assert_eq!(f.rank(), 2);
+        assert_eq!(f.pivots, vec![1, 3]);
+        assert_eq!(f.v.len(), 8);
+        assert!(!f.is_empty());
+    }
+
+    #[test]
+    fn low_rank_factor_empty_reports_zero_rank() {
+        let f = LowRankFactor::new(4, Vec::new(), Vec::new());
+        assert_eq!(f.rank(), 0);
+        assert!(f.is_empty());
+        // v.capacity() is 0 for a fresh empty Vec, so bytes_resident
+        // is just the pivots' backing (also 0).
+        assert_eq!(f.bytes_resident(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "v length")]
+    fn low_rank_factor_new_rejects_length_mismatch() {
+        // n=4, rank=2 expects v.len() == 8; give 6.
+        let _ = LowRankFactor::new(4, vec![0, 1], vec![0.0; 6]);
+    }
+
+    #[test]
+    fn low_rank_factor_bytes_resident_counts_both_storages() {
+        // n=4, rank=2 → 8 f32 entries in v + 2 usize entries in pivots.
+        let f = LowRankFactor::new(4, vec![0, 1], vec![0.0_f32; 8]);
+        let expected =
+            8 * std::mem::size_of::<f32>() + 2 * std::mem::size_of::<usize>();
+        assert_eq!(f.bytes_resident(), expected);
+    }
+
+    #[test]
+    fn low_rank_factor_from_pivoted_cholesky_preserves_fields() {
+        // Drive pivoted_cholesky on a small SPD matrix, convert,
+        // and verify the LowRankFactor sees the same data.
+        use crate::forward::hessian::upper_tri_offset;
+        use crate::forward::linalg::pivoted_cholesky;
+
+        let n = 3;
+        let mut h = vec![0.0_f32; n * (n + 1) / 2];
+        h[upper_tri_offset(n, 0, 0)] = 9.0;
+        h[upper_tri_offset(n, 1, 1)] = 1.0;
+        h[upper_tri_offset(n, 2, 2)] = 4.0;
+        let pc = pivoted_cholesky(&h, n, 0.0, n).unwrap();
+        let factor = LowRankFactor::from(pc.clone());
+
+        assert_eq!(factor.n, pc.n);
+        assert_eq!(factor.pivots, pc.pivots);
+        assert_eq!(factor.v, pc.v);
+        assert_eq!(factor.rank(), pc.rank());
     }
 }

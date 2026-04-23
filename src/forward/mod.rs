@@ -37,7 +37,7 @@ pub mod weights;
 pub use awq::{ActivationSite, AwqCollector};
 pub use block::{BlockObserver, NoopObserver};
 pub use hessian::HessianAccumulator;
-pub use hessian_cache::{CholeskyFactor, HessianFactorCache};
+pub use hessian_cache::{CholeskyFactor, HessianFactorCache, LowRankFactor};
 pub use config::{ConfigError, LlamaConfig};
 pub use kv_cache::{KvCache, LayerKvCache};
 pub use model::{ForwardModel, ModelLoadError, ModelScratch};
