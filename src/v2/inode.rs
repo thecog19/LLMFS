@@ -13,13 +13,12 @@
 //! 248
 //! ```
 //!
-//! This milestone (DESIGN-NEW §15.3, step 5 of
-//! `/home/suero/.claude/plans/why-masked-to-zero-velvet-nova.md`)
-//! defines the codec and constants. Direct-pointer traversal for
-//! reads and writes lands in step 6; the single / double / triple
-//! indirect forms are placeholders now — wired up in step 7. The
-//! full 248-byte layout is established immediately so neither of
-//! those later milestones needs to bump the on-disk format.
+//! This milestone (DESIGN-NEW §15.3) defines the codec and
+//! constants. Direct-pointer traversal for reads and writes lands
+//! in a later milestone; the single / double / triple indirect
+//! forms are placeholders until then. The full 248-byte layout is
+//! established immediately so neither of those later milestones
+//! needs to bump the on-disk format.
 
 use thiserror::Error;
 

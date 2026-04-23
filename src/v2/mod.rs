@@ -6,9 +6,7 @@
 //! content-defined chunking, and a two-slot generational root pointer
 //! for atomic CoW commits.
 //!
-//! This module is being built up incrementally; see the implementation
-//! plan at `/home/suero/.claude/plans/why-masked-to-zero-velvet-nova.md`
-//! for the sequence of milestones. First landed:
+//! This module is being built up incrementally. First landed:
 //!
 //! - [`ceiling`] — persisted 256-weight-bucket summary of ceiling
 //!   magnitudes, used by the allocator to find low-max-ceiling free

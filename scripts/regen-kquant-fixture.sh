@@ -25,15 +25,7 @@ OUT_Q3="${OUT_DIR}/smollm2-135m-q3_k_s.gguf"
 OUT_Q4="${OUT_DIR}/smollm2-135m-q4_k_m.gguf"
 OUT_Q5="${OUT_DIR}/smollm2-135m-q5_k_m.gguf"
 
-QBIN="${LLMDB_LLAMA_QUANTIZE:-}"
-if [ -z "$QBIN" ]; then
-    for c in \
-        "/mnt/c/Users/suero/Documents/code/llama.cpp/build-llmdb/bin/llama-quantize" \
-        "/mnt/c/Users/suero/Documents/code/llama.cpp/build/bin/llama-quantize" \
-        "$(command -v llama-quantize 2>/dev/null || true)"; do
-        if [ -n "$c" ] && [ -x "$c" ]; then QBIN="$c"; break; fi
-    done
-fi
+QBIN="${LLMDB_LLAMA_QUANTIZE:-$(command -v llama-quantize 2>/dev/null || true)}"
 [ -x "$QBIN" ] || { echo "llama-quantize not found; set LLMDB_LLAMA_QUANTIZE" >&2; exit 1; }
 [ -f "$SRC" ] || { echo "missing source: $SRC" >&2; exit 1; }
 

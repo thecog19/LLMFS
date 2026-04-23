@@ -12,9 +12,6 @@
 //! collection + the `llmdb calibrate` CLI + the V2 salience inode
 //! into it. Milestones C+ (quantized inference, Hessian / GPTQ, V3
 //! GPU) are separate plans.
-//!
-//! See `/home/suero/.claude/plans/lets-do-4-tool-harmonic-glade.md`
-//! for the phased build.
 
 pub mod awq;
 pub mod block;

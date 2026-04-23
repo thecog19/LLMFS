@@ -74,18 +74,7 @@ if [ ! -x "$LLMDB" ]; then
     exit 1
 fi
 
-PPL_BIN="${LLMDB_LLAMA_PERPLEXITY:-}"
-if [ -z "$PPL_BIN" ]; then
-    for candidate in \
-        "/mnt/c/Users/suero/Documents/code/llama.cpp/build-llmdb/bin/llama-perplexity" \
-        "/mnt/c/Users/suero/Documents/code/llama.cpp/build/bin/llama-perplexity" \
-        "$(command -v llama-perplexity 2>/dev/null || true)"; do
-        if [ -n "$candidate" ] && [ -x "$candidate" ]; then
-            PPL_BIN="$candidate"
-            break
-        fi
-    done
-fi
+PPL_BIN="${LLMDB_LLAMA_PERPLEXITY:-$(command -v llama-perplexity 2>/dev/null || true)}"
 [ -x "$PPL_BIN" ] || {
     echo "llama-perplexity not found. Set LLMDB_LLAMA_PERPLEXITY or build llama.cpp." >&2
     exit 1
