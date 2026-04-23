@@ -179,10 +179,52 @@ fn format_human_output_names_every_field() {
         "allocator:",
         "dedup entries:",
         "quant profile:",
+        "calibrated:",
     ] {
         assert!(
             report.contains(label),
             "format_human missing `{label}`:\n{report}"
         );
     }
+}
+
+#[test]
+fn uncalibrated_cover_reports_calibrated_false() {
+    let (cover, map) = make_cover(20_000);
+    let fs = Filesystem::init_with_cdc_params(cover, map.clone(), small_cdc()).expect("init");
+    let status = gather(&fs, &map).expect("gather");
+    assert!(!status.calibrated);
+    assert_eq!(status.salience_slot_count, 0);
+
+    let report = format_human(&status);
+    assert!(
+        report.contains("calibrated:         false"),
+        "format_human should report calibrated: false:\n{report}",
+    );
+}
+
+#[test]
+fn calibrated_cover_reports_salience_slot_count() {
+    use llmdb::v2::salience::SalienceTable;
+
+    let (cover, map) = make_cover(20_000);
+    let mut fs = Filesystem::init_with_cdc_params(cover, map.clone(), small_cdc()).expect("init");
+
+    // Two populated slot entries out of three total.
+    let table = SalienceTable::new(vec![
+        Some(vec![0.1_f32, 0.2, 0.3]),
+        None,
+        Some(vec![0.5_f32, 0.5]),
+    ]);
+    fs.commit_salience(&table).expect("commit");
+
+    let status = gather(&fs, &map).expect("gather");
+    assert!(status.calibrated);
+    assert_eq!(status.salience_slot_count, 2);
+
+    let report = format_human(&status);
+    assert!(
+        report.contains("calibrated:         true (2 slot(s))"),
+        "format_human should report 2 populated slots:\n{report}",
+    );
 }

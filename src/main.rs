@@ -107,6 +107,19 @@ enum Command {
     /// REPL where the model can answer questions about its own
     /// stored files.
     Ask { model: PathBuf },
+
+    /// Run B1 AWQ calibration: forward-pass the built-in corpus
+    /// (or a user-provided text file) through the model, collect
+    /// per-channel salience, and commit it as a salience inode.
+    /// Subsequent writes use the salience as a secondary placement
+    /// signal via the allocator's compound FitKey (B4a).
+    Calibrate {
+        model: PathBuf,
+        /// Optional corpus file. Defaults to the bundled paragraph
+        /// in `llmdb::calibrate::DEFAULT_CALIBRATION_CORPUS`.
+        #[arg(long)]
+        corpus: Option<PathBuf>,
+    },
 }
 
 fn main() {
@@ -156,6 +169,7 @@ fn dispatch(cmd: Command) -> Result<(), CliError> {
             yes,
         } => cmd_rm(&model, &stego_path, yes),
         Command::Ask { model } => cmd_ask(&model),
+        Command::Calibrate { model, corpus } => cmd_calibrate(&model, corpus.as_deref()),
     }
 }
 
@@ -399,6 +413,35 @@ fn cmd_get(model: &Path, stego_path: &str, output: Option<PathBuf>) -> Result<()
     std::fs::write(&out_path, &bytes)
         .map_err(|e| CliError::internal(format!("writing {}: {e}", out_path.display())))?;
     println!("wrote {}", out_path.display());
+    Ok(())
+}
+
+fn cmd_calibrate(model: &Path, corpus: Option<&Path>) -> Result<(), CliError> {
+    let map = build_tensor_map(model)?;
+    let cover = open_cover_mmap(model)?;
+    let mut fs = V2Filesystem::mount(cover, map.clone()).map_err(|e| {
+        CliError::user(format!("V2 mount (no anchor? run `llmdb init` first): {e}"))
+    })?;
+
+    let corpus_text: String = match corpus {
+        Some(path) => std::fs::read_to_string(path).map_err(|e| {
+            CliError::user(format!("read corpus {}: {e}", path.display()))
+        })?,
+        None => llmdb::calibrate::DEFAULT_CALIBRATION_CORPUS.to_owned(),
+    };
+
+    println!("calibrating {} ({} corpus chars)", model.display(), corpus_text.len());
+    let summary = llmdb::calibrate::run_calibration(&mut fs, model, &map, &corpus_text)
+        .map_err(|e| CliError::user(format!("calibrate: {e}")))?;
+    flush_and_close(model, fs)?;
+
+    println!(
+        "calibrated: {} tokens, {}/{} slots populated",
+        summary.token_count, summary.populated_slot_count, summary.total_slot_count,
+    );
+    if !summary.new_salience_inode_nonzero {
+        println!("warning: commit produced a null salience inode");
+    }
     Ok(())
 }
 

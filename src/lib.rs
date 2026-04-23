@@ -1,4 +1,5 @@
 pub mod ask;
+pub mod calibrate;
 pub mod diagnostics;
 pub mod forward;
 pub mod gguf;

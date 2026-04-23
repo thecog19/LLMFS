@@ -41,6 +41,14 @@ pub struct DeviceStatus {
     pub dirty_bits_total: u64,
     /// Distinct quant types contributed by stealable slots.
     pub quant_profile: Vec<GgufQuantType>,
+    /// True if the cover has a committed salience inode (B1 AWQ
+    /// calibration has run at least once).
+    pub calibrated: bool,
+    /// Number of `TensorMap` slots that have populated salience
+    /// data. 0 when `calibrated` is false; may be less than the
+    /// total slot count when only some slots (e.g. only the linear
+    /// layers) were calibrated.
+    pub salience_slot_count: u32,
 }
 
 /// Walk the V2 filesystem + accessors and produce a [`DeviceStatus`].
@@ -82,6 +90,12 @@ pub fn gather(fs: &Filesystem, map: &TensorMap) -> Result<DeviceStatus, FsError>
         }
     }
 
+    let salience = fs.load_salience()?;
+    let (calibrated, salience_slot_count) = match &salience {
+        Some(table) => (true, table.populated_slot_count() as u32),
+        None => (false, 0),
+    };
+
     Ok(DeviceStatus {
         generation: fs.generation(),
         file_count,
@@ -93,6 +107,8 @@ pub fn gather(fs: &Filesystem, map: &TensorMap) -> Result<DeviceStatus, FsError>
         dirty_bits_set: dirty.set_count(),
         dirty_bits_total: dirty.total_bits(),
         quant_profile,
+        calibrated,
+        salience_slot_count,
     })
 }
 
@@ -165,5 +181,16 @@ pub fn format_human(status: &DeviceStatus) -> String {
             .join(", ")
     };
     let _ = writeln!(out, "quant profile:      {quant_str}");
+
+    let _ = writeln!(
+        out,
+        "calibrated:         {}{}",
+        status.calibrated,
+        if status.calibrated {
+            format!(" ({} slot(s))", status.salience_slot_count)
+        } else {
+            String::new()
+        }
+    );
     out
 }
