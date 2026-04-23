@@ -108,17 +108,28 @@ enum Command {
     /// stored files.
     Ask { model: PathBuf },
 
-    /// Run B1 AWQ calibration: forward-pass the built-in corpus
-    /// (or a user-provided text file) through the model, collect
+    /// Run calibration: forward-pass the built-in corpus (or a
+    /// user-provided text file) through the model, compute
     /// per-channel salience, and commit it as a salience inode.
     /// Subsequent writes use the salience as a secondary placement
     /// signal via the allocator's compound FitKey (B4a).
+    ///
+    /// Without `--full`: runs AWQ (`mean(|x|)` per channel), seconds
+    /// on CPU. With `--full`: runs the Hessian + OBS path
+    /// (`1 / diag(H⁻¹)` per channel), minutes on CPU but
+    /// captures cross-channel coupling — see
+    /// `docs/compensation-design.md §1.2`.
     Calibrate {
         model: PathBuf,
-        /// Optional corpus file. Defaults to the bundled paragraph
-        /// in `llmdb::calibrate::DEFAULT_CALIBRATION_CORPUS`.
+        /// Optional corpus file. Defaults to the bundled excerpt of
+        /// wiki.test.raw in `llmdb::calibrate::DEFAULT_CALIBRATION_CORPUS`.
         #[arg(long)]
         corpus: Option<PathBuf>,
+        /// Run full Hessian + OBS calibration. Multi-minute on CPU;
+        /// produces a strictly better placement signal than the
+        /// default AWQ path.
+        #[arg(long)]
+        full: bool,
     },
 }
 
@@ -169,7 +180,11 @@ fn dispatch(cmd: Command) -> Result<(), CliError> {
             yes,
         } => cmd_rm(&model, &stego_path, yes),
         Command::Ask { model } => cmd_ask(&model),
-        Command::Calibrate { model, corpus } => cmd_calibrate(&model, corpus.as_deref()),
+        Command::Calibrate {
+            model,
+            corpus,
+            full,
+        } => cmd_calibrate(&model, corpus.as_deref(), full),
     }
 }
 
@@ -416,7 +431,7 @@ fn cmd_get(model: &Path, stego_path: &str, output: Option<PathBuf>) -> Result<()
     Ok(())
 }
 
-fn cmd_calibrate(model: &Path, corpus: Option<&Path>) -> Result<(), CliError> {
+fn cmd_calibrate(model: &Path, corpus: Option<&Path>, full: bool) -> Result<(), CliError> {
     let map = build_tensor_map(model)?;
     let cover = open_cover_mmap(model)?;
     let mut fs = V2Filesystem::mount(cover, map.clone()).map_err(|e| {
@@ -429,12 +444,18 @@ fn cmd_calibrate(model: &Path, corpus: Option<&Path>) -> Result<(), CliError> {
         None => llmdb::calibrate::DEFAULT_CALIBRATION_CORPUS.to_owned(),
     };
 
+    let mode = if full {
+        llmdb::calibrate::CalibrationMode::Full
+    } else {
+        llmdb::calibrate::CalibrationMode::Fast
+    };
     println!(
-        "calibrating {} ({} corpus chars)",
+        "calibrating {} ({} corpus chars, mode = {:?})",
         model.display(),
-        corpus_text.len()
+        corpus_text.len(),
+        mode,
     );
-    let summary = llmdb::calibrate::run_calibration(&mut fs, model, &map, &corpus_text)
+    let summary = llmdb::calibrate::run_calibration(&mut fs, model, &map, &corpus_text, mode)
         .map_err(|e| CliError::user(format!("calibrate: {e}")))?;
     flush_and_close(model, fs)?;
 

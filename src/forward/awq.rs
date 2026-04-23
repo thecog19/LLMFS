@@ -96,7 +96,7 @@ impl AwqCollector {
     }
 }
 
-fn tensor_names_for(site: ActivationSite, layer: usize) -> Vec<String> {
+pub(crate) fn tensor_names_for(site: ActivationSite, layer: usize) -> Vec<String> {
     match site {
         ActivationSite::QkvInput => vec![
             format!("blk.{layer}.attn_q.weight"),

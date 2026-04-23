@@ -15,7 +15,7 @@
 
 use std::path::{Path, PathBuf};
 
-use llmdb::calibrate::{DEFAULT_CALIBRATION_CORPUS, run_calibration};
+use llmdb::calibrate::{CalibrationMode, DEFAULT_CALIBRATION_CORPUS, run_calibration};
 use llmdb::diagnostics::gather;
 use llmdb::gguf::parser::parse_path;
 use llmdb::stego::planner::{AllocationMode, build_allocation_plan};
@@ -45,8 +45,14 @@ fn tensor_map_for(path: &Path) -> TensorMap {
 }
 
 /// Run the full calibrate-then-status cycle on a staged cover and
-/// assert the structural gates. Shared between F16 and Q8_0 tests.
-fn calibrate_and_assert(path: &Path, min_populated_slots: usize, max_salience_bytes: usize) {
+/// assert the structural gates. Shared between F16 / Q8_0 and
+/// Fast / Full tests.
+fn calibrate_and_assert(
+    path: &Path,
+    min_populated_slots: usize,
+    max_salience_bytes: usize,
+    mode: CalibrationMode,
+) {
     let map = tensor_map_for(path);
 
     // Init on a fresh copy.
@@ -86,8 +92,14 @@ fn calibrate_and_assert(path: &Path, min_populated_slots: usize, max_salience_by
     );
     assert_eq!(pre.salience_slot_count, 0);
 
-    let summary =
-        run_calibration(&mut fs, path, &map, DEFAULT_CALIBRATION_CORPUS).expect("calibrate");
+    let summary = run_calibration(
+        &mut fs,
+        path,
+        &map,
+        DEFAULT_CALIBRATION_CORPUS,
+        mode,
+    )
+    .expect("calibrate");
     eprintln!(
         "calibration: {} tokens, {}/{} slots",
         summary.token_count, summary.populated_slot_count, summary.total_slot_count,
@@ -129,7 +141,7 @@ fn calibrate_f16_populates_salience_inode_and_status_reflects_it() {
         return;
     };
     // 30 blocks × 7 linear tensors each = 210 populated slots.
-    calibrate_and_assert(&path, 200, 1 << 20);
+    calibrate_and_assert(&path, 200, 1 << 20, CalibrationMode::Fast);
     let _ = std::fs::remove_file(&path);
 }
 
@@ -146,6 +158,27 @@ fn calibrate_q8_0_populates_salience_inode_and_status_reflects_it() {
     let Some(path) = stage_model(SMOLLM2_Q8_0, "q8_0") else {
         return;
     };
-    calibrate_and_assert(&path, 200, 1 << 20);
+    calibrate_and_assert(&path, 200, 1 << 20, CalibrationMode::Fast);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+#[ignore = "slow: D1-a gate — full-Hessian calibration on SmolLM2-Q8_0. \
+            Runs a 2048-token forward pass, accumulates per-site full H \
+            in RAM, Cholesky-factorizes, extracts OBS saliency \
+            (1/diag(H⁻¹)) per channel, commits to salience inode. \
+            ~7 min on CPU plus Cholesky+OBS extraction work. Run with \
+            --ignored when validating D1-a."]
+fn calibrate_full_q8_0_populates_salience_inode() {
+    // D1-a gate: the Full calibration path runs end-to-end on a
+    // real Q8_0 cover. Same structural expectations as the Fast
+    // path (200+ populated slots for the 210 linears, <1 MiB
+    // encoded salience — the inode's PeriodicSlotSalience encoder
+    // is value-agnostic), but the values inside are OBS saliencies
+    // per `compensation-design.md §1.2` rather than AWQ means.
+    let Some(path) = stage_model(SMOLLM2_Q8_0, "q8_0_full") else {
+        return;
+    };
+    calibrate_and_assert(&path, 200, 1 << 20, CalibrationMode::Full);
     let _ = std::fs::remove_file(&path);
 }

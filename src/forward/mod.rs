@@ -19,6 +19,7 @@ pub mod config;
 pub mod dequant;
 pub mod hessian;
 pub mod kv_cache;
+pub mod linalg;
 pub mod model;
 pub mod ops;
 pub mod perplexity;

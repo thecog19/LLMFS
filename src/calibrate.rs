@@ -14,41 +14,75 @@
 //! 5. Build a [`SalienceTable`] keyed by slot index.
 //! 6. Commit it via [`crate::v2::fs::Filesystem::commit_salience`].
 //!
-//! The default corpus is a short English prose paragraph
-//! ([`DEFAULT_CALIBRATION_CORPUS`]) — enough for the allocator to
-//! pick up a meaningful salience signal on SmolLM2-sized models.
-//! Callers who want more can pass their own string.
+//! The default corpus is an excerpt from the wiki.test.raw benchmark
+//! ([`DEFAULT_CALIBRATION_CORPUS`]) — long enough to tokenize past
+//! `N_max` at every observation site on SmolLM2 (and comfortably past
+//! it on 3B-class models), so [`CalibrationMode::Full`] produces a
+//! non-singular Hessian at every site. Callers who want a different
+//! corpus can pass their own string.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use thiserror::Error;
 
-use crate::forward::{AwqCollector, ForwardModel, KvCache, ModelLoadError, ModelScratch};
+use crate::forward::awq::{ActivationSite, tensor_names_for};
+use crate::forward::linalg::{self, CholeskyError};
+use crate::forward::{
+    AwqCollector, ForwardModel, HessianAccumulator, KvCache, ModelLoadError, ModelScratch,
+};
 use crate::gguf::parser::parse_path;
 use crate::stego::tensor_map::TensorMap;
 use crate::v2::fs::{Filesystem as V2Filesystem, FsError as V2FsError};
 use crate::v2::salience::{PeriodicSlotSalience, SalienceError, SalienceTable};
 
-/// Calibration corpus bundled with the CLI. Chosen to be short
-/// enough to run in seconds on CPU but long enough to produce a
-/// non-degenerate salience signal across the standard linear
-/// layers.
-pub const DEFAULT_CALIBRATION_CORPUS: &str = concat!(
-    "The invention of the printing press in the middle of the fifteenth century ",
-    "is often described as one of the most consequential technological changes ",
-    "in the history of communication. By replacing manuscript copying with a ",
-    "mechanical process, the press reduced the cost and raised the reliability ",
-    "of making identical copies of a text. This, in turn, helped standardise ",
-    "spelling and vocabulary across regions that had previously used local ",
-    "variants, because printers tended to draw on a smaller set of exemplars ",
-    "when setting type. Scholars, administrators, and merchants all found new ",
-    "uses for printed documents, and within a few decades the technology had ",
-    "spread across Europe and begun to reshape education, religion, and trade.",
-);
+/// Calibration corpus bundled with the binary. Currently the first
+/// 50 KB of `wiki.test.raw`, which tokenizes to roughly 12 k tokens
+/// under SmolLM2's BPE — comfortably past the `N_max = ffn_dim =
+/// 1536` bound needed for a non-singular Hessian on SmolLM2, and
+/// enough headroom for [`CalibrationMode::Full`] on 3B-class
+/// architectures (`N_max ~ 8192`) before the corpus becomes the
+/// binding constraint.
+pub const DEFAULT_CALIBRATION_CORPUS: &str = include_str!("data/calibration-corpus.txt");
 
-/// Max tokens to feed through the forward pass — caps runtime on
-/// long corpora and keeps the scratch buffers bounded.
-pub const MAX_CALIBRATION_TOKENS: usize = 512;
+/// Token cap for [`CalibrationMode::Fast`] (AWQ). First-moment
+/// statistics stabilize quickly; ~500 tokens is plenty and keeps
+/// Fast calibration in the seconds regime.
+pub const MAX_AWQ_TOKENS: usize = 512;
+
+/// Token cap for [`CalibrationMode::Full`] (Hessian + OBS). Needs
+/// `T >= N_max` for the per-site Hessians to be non-singular. 2048
+/// covers SmolLM2 (N_max = 1536); for larger covers the Full path
+/// will produce rank-deficient Hessians and Cholesky will fail with
+/// [`CalibrateError::Cholesky`], which is the correct failure mode
+/// — callers should bump this or provide a longer corpus.
+pub const MAX_HESSIAN_TOKENS: usize = 2048;
+
+/// Which calibration algorithm to run. [`CalibrationMode::Fast`] is
+/// the existing AWQ path (first-moment mean(|x_c|) per channel);
+/// [`CalibrationMode::Full`] is the Hessian + OBS path that
+/// `docs/compensation-design.md §1.2` specifies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CalibrationMode {
+    /// AWQ — per-channel `mean(|x_c|)`. Seconds on CPU, low memory,
+    /// first-moment approximation to saliency. Default.
+    Fast,
+    /// Hessian + OBS — per-channel `1 / diag(H^-1)_c`. Minutes on CPU
+    /// (dominated by `X^T X` accumulation; quantified in
+    /// `docs/phase-d-measurement.md`), ~hundreds of MB for the full
+    /// H matrices held in RAM during finalize. Full second-moment
+    /// saliency with cross-channel coupling accounted for.
+    Full,
+}
+
+impl CalibrationMode {
+    fn max_tokens(self) -> usize {
+        match self {
+            Self::Fast => MAX_AWQ_TOKENS,
+            Self::Full => MAX_HESSIAN_TOKENS,
+        }
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum CalibrateError {
@@ -61,6 +95,16 @@ pub enum CalibrateError {
     #[error("corpus tokenizes to 0 tokens — need at least 1")]
     EmptyCorpus,
 
+    #[error(
+        "corpus tokenizes to {got} tokens; Full calibration needs at least {need} \
+         (N_max = {n_max}) for H to be non-singular. Provide a longer corpus."
+    )]
+    CorpusTooShortForFull {
+        got: usize,
+        need: usize,
+        n_max: usize,
+    },
+
     #[error("gguf parse: {0}")]
     GgufParse(String),
 
@@ -69,6 +113,14 @@ pub enum CalibrateError {
 
     #[error("salience: {0}")]
     Salience(#[from] SalienceError),
+
+    #[error("cholesky on H at ({site:?}, layer {layer}): {source}")]
+    Cholesky {
+        site: ActivationSite,
+        layer: usize,
+        #[source]
+        source: CholeskyError,
+    },
 
     #[error(
         "tensor {tensor}: weight_count mismatch between TensorMap ({map_count}) \
@@ -96,47 +148,50 @@ pub struct CalibrationSummary {
 ///
 /// Steps:
 ///   1. Load the model from `model_path` (same file the cover lives in).
-///   2. Tokenize `corpus`, clip to `MAX_CALIBRATION_TOKENS`.
-///   3. Run one forward pass with an `AwqCollector` observer.
-///   4. Finalize salience, map tensor names → TensorMap slot indices,
-///      expand per-channel to per-weight.
-///   5. `commit_salience(&table)` on `fs`.
+///   2. Tokenize `corpus`, clip to `mode.max_tokens()`.
+///   3. Run one forward pass. In `Fast` mode the observer is
+///      [`AwqCollector`]; in `Full` mode it is [`HessianAccumulator`].
+///   4. Derive per-tensor salience:
+///        - Fast: `mean(|x_c|)` from AWQ, directly per-channel.
+///        - Full: factor each site's H → Cholesky → extract
+///          `1 / diag(H^-1)` via forward-substitution on unit
+///          vectors (see `docs/compensation-design.md §1.2`).
+///   5. Map tensor names → TensorMap slot indices; expand
+///      per-channel to per-weight via the periodic encoder.
+///   6. `commit_salience(&table)` on `fs`.
 pub fn run_calibration(
     fs: &mut V2Filesystem,
     model_path: &Path,
     tensor_map: &TensorMap,
     corpus: &str,
+    mode: CalibrationMode,
 ) -> Result<CalibrationSummary, CalibrateError> {
     // 1. Load the model.
     let model = ForwardModel::load(model_path)?;
 
-    // 2. Tokenize.
+    // 2. Tokenize and clip.
     let mut tokens = model
         .encode(corpus)
         .map_err(|e| CalibrateError::Tokenize(e.to_string()))?;
     if tokens.is_empty() {
         return Err(CalibrateError::EmptyCorpus);
     }
-    tokens.truncate(MAX_CALIBRATION_TOKENS);
+    tokens.truncate(mode.max_tokens());
     let token_count = tokens.len();
 
-    // 3. Forward pass with observer.
-    let ctx_len = tokens.len();
-    let mut cache = KvCache::new(&model.config, ctx_len);
-    let mut scratch = ModelScratch::new(&model.config, ctx_len, ctx_len);
-    let mut collector = AwqCollector::new();
-    let _ =
-        model.forward_all_logits_with_observer(&tokens, &mut cache, &mut scratch, &mut collector);
-    let per_tensor_salience = collector.finalize();
+    // 3 + 4. Forward pass + per-tensor salience, mode-dependent.
+    let per_tensor_salience = match mode {
+        CalibrationMode::Fast => run_fast_forward(&model, &tokens),
+        CalibrationMode::Full => run_full_forward(&model, &tokens, token_count)?,
+    };
 
-    // 4. Parse GGUF to get tensor shapes (for per-channel→per-weight
-    //    expansion we need the input dimension).
+    // 5. Parse GGUF for tensor shapes and build the salience table.
     let gguf = parse_path(model_path).map_err(|e| CalibrateError::GgufParse(e.to_string()))?;
     let table = build_salience_table(tensor_map, &gguf.tensors, &per_tensor_salience)?;
     let populated_slot_count = table.populated_slot_count();
     let total_slot_count = table.slot_count();
 
-    // 5. Commit.
+    // 6. Commit.
     let ptr = fs.commit_salience(&table)?;
     let new_salience_inode_nonzero = !ptr.is_null();
 
@@ -146,6 +201,70 @@ pub fn run_calibration(
         total_slot_count,
         new_salience_inode_nonzero,
     })
+}
+
+/// AWQ pass: one forward through the model with an
+/// [`AwqCollector`] observer; finalize to per-channel `mean(|x_c|)`.
+fn run_fast_forward(model: &ForwardModel, tokens: &[u32]) -> HashMap<String, Vec<f32>> {
+    let ctx_len = tokens.len();
+    let mut cache = KvCache::new(&model.config, ctx_len);
+    let mut scratch = ModelScratch::new(&model.config, ctx_len, ctx_len);
+    let mut collector = AwqCollector::new();
+    let _ =
+        model.forward_all_logits_with_observer(tokens, &mut cache, &mut scratch, &mut collector);
+    collector.finalize()
+}
+
+/// Full pass: one forward through the model with a
+/// [`HessianAccumulator`] observer; for every observed
+/// `(site, layer)` Cholesky-factorize H and extract OBS saliency
+/// `1 / diag(H^-1)`; fan out per-site-layer values to each weight
+/// tensor that shares that input (same convention as AWQ's
+/// [`tensor_names_for`]).
+fn run_full_forward(
+    model: &ForwardModel,
+    tokens: &[u32],
+    token_count: usize,
+) -> Result<HashMap<String, Vec<f32>>, CalibrateError> {
+    let ctx_len = tokens.len();
+    let mut cache = KvCache::new(&model.config, ctx_len);
+    let mut scratch = ModelScratch::new(&model.config, ctx_len, ctx_len);
+    let mut acc = HessianAccumulator::new();
+    let _ = model.forward_all_logits_with_observer(tokens, &mut cache, &mut scratch, &mut acc);
+    let finalized = acc.finalize();
+
+    // Sanity: every (site, layer) Hessian must have N <= token_count
+    // for non-singular factorization. If it doesn't, surface a clear
+    // error instead of letting Cholesky detect the failure deeper in
+    // the pipeline.
+    if let Some(((site, layer), (n_max, _))) = finalized
+        .iter()
+        .max_by_key(|(_, (n, _))| *n)
+    {
+        if *n_max > token_count {
+            return Err(CalibrateError::CorpusTooShortForFull {
+                got: token_count,
+                need: *n_max,
+                n_max: *n_max,
+            });
+        }
+        // Prevent "unused" warnings on the key when no failure.
+        let _ = (site, layer);
+    }
+
+    let mut per_tensor = HashMap::new();
+    for ((site, layer), (n, h_upper)) in finalized {
+        let l = linalg::cholesky(&h_upper, n).map_err(|e| CalibrateError::Cholesky {
+            site,
+            layer,
+            source: e,
+        })?;
+        let obs = linalg::obs_saliency(&l, n);
+        for name in tensor_names_for(site, layer) {
+            per_tensor.insert(name, obs.clone());
+        }
+    }
+    Ok(per_tensor)
 }
 
 /// Convert AWQ's `HashMap<tensor_name, per_channel_salience>` into
