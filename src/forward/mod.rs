@@ -15,6 +15,7 @@
 
 pub mod awq;
 pub mod block;
+pub mod compensation;
 pub mod config;
 pub mod dequant;
 pub mod hessian;

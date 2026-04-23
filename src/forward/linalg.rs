@@ -376,6 +376,75 @@ pub fn solve_lower(l: &[f32], n: usize, x: &mut [f32]) {
     }
 }
 
+/// Solve `L^T * x = b` in place, where `L` is the lower-triangle
+/// packed factor produced by [`cholesky`]. Replaces `x` (initially
+/// `b`) with the solution.
+///
+/// `L^T` is upper-triangular, so this is back-substitution. Walking
+/// the packed lower triangle, `L[k][i]` (for `k >= i`) sits at
+/// offset `lower_tri_offset(k, i)`:
+///
+/// ```text
+/// x[n-1] = b[n-1] / L[n-1][n-1]
+/// x[i] = (b[i] - Σ_{k>i} L[k][i] * x[k]) / L[i][i]   for i < n-1
+/// ```
+///
+/// Paired with [`solve_lower`] to solve `H * x = b` in two steps
+/// against the Cholesky factor: forward-solve `L y = b`, then
+/// back-solve `L^T x = y`.
+pub fn solve_lower_transposed(l: &[f32], n: usize, x: &mut [f32]) {
+    assert_eq!(
+        x.len(),
+        n,
+        "solve_lower_transposed: x length {} != n {}",
+        x.len(),
+        n,
+    );
+    assert_eq!(
+        l.len(),
+        n * (n + 1) / 2,
+        "solve_lower_transposed: L length {} != n*(n+1)/2 = {}",
+        l.len(),
+        n * (n + 1) / 2,
+    );
+
+    // Iterate i from n-1 down to 0. Using a range with rev() avoids
+    // the signed-index gymnastics.
+    for i in (0..n).rev() {
+        let mut sum = 0.0_f64;
+        for k in (i + 1)..n {
+            sum += l[lower_tri_offset(k, i)] as f64 * x[k] as f64;
+        }
+        let diag = l[lower_tri_offset(i, i)] as f64;
+        x[i] = ((x[i] as f64 - sum) / diag) as f32;
+    }
+}
+
+/// Column `j` of `H⁻¹`, given the lower-triangle packed Cholesky
+/// factor `L` of `H`. Uses the identity `H⁻¹ e_j = L⁻ᵀ L⁻¹ e_j`:
+/// forward-solve `L y = e_j`, then back-solve `L^T x = y`. Result
+/// is an N-vector.
+///
+/// `O(n²)` total. Core primitive under
+/// [`obs_saliency`] (which needs only `‖y‖² = (H⁻¹)_{jj}`) and
+/// under Phase E's compensation-operator extraction (which needs
+/// the full column).
+pub fn h_inv_column(l: &[f32], n: usize, j: usize) -> Vec<f32> {
+    assert!(j < n, "h_inv_column: j ({j}) out of range for n = {n}");
+    assert_eq!(
+        l.len(),
+        n * (n + 1) / 2,
+        "h_inv_column: L length {} != n*(n+1)/2 = {}",
+        l.len(),
+        n * (n + 1) / 2,
+    );
+    let mut x = vec![0.0_f32; n];
+    x[j] = 1.0;
+    solve_lower(l, n, &mut x);
+    solve_lower_transposed(l, n, &mut x);
+    x
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -908,5 +977,162 @@ mod tests {
         let h = [0.0_f32];
         let result = pivoted_cholesky(&h, 1, 0.0, 1).unwrap();
         assert_eq!(result.rank(), 0);
+    }
+
+    // ── solve_lower_transposed + h_inv_column tests ────────────────
+
+    #[test]
+    fn solve_lower_transposed_identity_passes_b_through() {
+        let n = 4;
+        let mut l = vec![0.0_f32; n * (n + 1) / 2];
+        for i in 0..n {
+            l[lower_tri_offset(i, i)] = 1.0;
+        }
+        let mut x = vec![1.0_f32, 2.0, 3.0, 4.0];
+        solve_lower_transposed(&l, n, &mut x);
+        assert_eq!(x, vec![1.0_f32, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn solve_lower_transposed_known_2x2() {
+        // L = [[2, 0], [1, 2]] → L^T = [[2, 1], [0, 2]]
+        // L^T x = [1, 0] → x = [0.5, 0]
+        // L^T x = [0, 1] → x = [-0.25, 0.5]
+        let l = vec![2.0_f32, 1.0, 2.0];
+        let n = 2;
+
+        let mut x0 = vec![1.0_f32, 0.0];
+        solve_lower_transposed(&l, n, &mut x0);
+        assert!((x0[0] - 0.5).abs() < 1e-6, "x0[0] = {}", x0[0]);
+        assert!((x0[1] - 0.0).abs() < 1e-6, "x0[1] = {}", x0[1]);
+
+        let mut x1 = vec![0.0_f32, 1.0];
+        solve_lower_transposed(&l, n, &mut x1);
+        assert!((x1[0] - (-0.25)).abs() < 1e-6, "x1[0] = {}", x1[0]);
+        assert!((x1[1] - 0.5).abs() < 1e-6, "x1[1] = {}", x1[1]);
+    }
+
+    #[test]
+    fn solve_full_system_via_lower_then_transposed() {
+        // Solve H x = b where H = L L^T: first L y = b (forward sub),
+        // then L^T x = y (back sub). Verify H x ≈ b to tolerance.
+        let n = 4;
+        let v = [1.0_f32, -0.5, 2.0, 0.3];
+        let mut h = vec![0.0_f32; n * (n + 1) / 2];
+        for i in 0..n {
+            for j in i..n {
+                let vv = v[i] * v[j];
+                let identity = if i == j { 1.0 } else { 0.0 };
+                h[upper_tri_offset(n, i, j)] = vv + identity;
+            }
+        }
+        let l = cholesky(&h, n).unwrap();
+        let b = vec![1.0_f32, 2.0, -1.5, 0.7];
+        let mut x = b.clone();
+        solve_lower(&l, n, &mut x);
+        solve_lower_transposed(&l, n, &mut x);
+
+        // Reconstruct H x and compare to b.
+        for i in 0..n {
+            let mut sum = 0.0_f64;
+            for j in 0..n {
+                let h_ij = if i <= j {
+                    h[upper_tri_offset(n, i, j)]
+                } else {
+                    h[upper_tri_offset(n, j, i)]
+                } as f64;
+                sum += h_ij * x[j] as f64;
+            }
+            assert!(
+                (sum - b[i] as f64).abs() < 1e-4,
+                "H x [{i}] = {sum}, expected {}",
+                b[i]
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "solve_lower_transposed: x length")]
+    fn solve_lower_transposed_panics_on_length_mismatch() {
+        let l = vec![1.0_f32, 0.0, 1.0];
+        let mut x = vec![1.0_f32]; // wrong length for n=2
+        solve_lower_transposed(&l, 2, &mut x);
+    }
+
+    #[test]
+    fn h_inv_column_identity_returns_unit_vector() {
+        // H = I → H⁻¹ = I → column j is e_j.
+        let n = 4;
+        let mut l = vec![0.0_f32; n * (n + 1) / 2];
+        for i in 0..n {
+            l[lower_tri_offset(i, i)] = 1.0;
+        }
+        for j in 0..n {
+            let col = h_inv_column(&l, n, j);
+            for (i, &v) in col.iter().enumerate() {
+                let want = if i == j { 1.0 } else { 0.0 };
+                assert!(
+                    (v - want).abs() < 1e-6,
+                    "H⁻¹[{i}, {j}] = {v}, expected {want}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn h_inv_column_matches_closed_form_2x2() {
+        // H = [[4, 2], [2, 5]] → det = 16 → H⁻¹ = (1/16) [[5, -2], [-2, 4]]
+        // column 0 = [5/16, -2/16] = [0.3125, -0.125]
+        // column 1 = [-2/16, 4/16] = [-0.125, 0.25]
+        let h = [4.0_f32, 2.0, 5.0];
+        let l = cholesky(&h, 2).unwrap();
+        let c0 = h_inv_column(&l, 2, 0);
+        let c1 = h_inv_column(&l, 2, 1);
+        assert!((c0[0] - 0.3125).abs() < 1e-4, "c0[0] = {}", c0[0]);
+        assert!((c0[1] - (-0.125)).abs() < 1e-4, "c0[1] = {}", c0[1]);
+        assert!((c1[0] - (-0.125)).abs() < 1e-4, "c1[0] = {}", c1[0]);
+        assert!((c1[1] - 0.25).abs() < 1e-4, "c1[1] = {}", c1[1]);
+    }
+
+    #[test]
+    fn h_inv_column_satisfies_h_times_col_equals_unit() {
+        // H @ (H⁻¹ e_j) must equal e_j for any j. Use a known SPD H.
+        let n = 5;
+        let v = [1.0_f32, -0.5, 2.0, 0.3, -1.2];
+        let mut h = vec![0.0_f32; n * (n + 1) / 2];
+        for i in 0..n {
+            for j in i..n {
+                let vv = v[i] * v[j];
+                let identity = if i == j { 1.0 } else { 0.0 };
+                h[upper_tri_offset(n, i, j)] = vv + identity;
+            }
+        }
+        let l = cholesky(&h, n).unwrap();
+        for j in 0..n {
+            let col = h_inv_column(&l, n, j);
+            for i in 0..n {
+                let mut sum = 0.0_f64;
+                for k in 0..n {
+                    let h_ik = if i <= k {
+                        h[upper_tri_offset(n, i, k)]
+                    } else {
+                        h[upper_tri_offset(n, k, i)]
+                    } as f64;
+                    sum += h_ik * col[k] as f64;
+                }
+                let want = if i == j { 1.0 } else { 0.0 };
+                assert!(
+                    (sum - want).abs() < 1e-3,
+                    "(H H⁻¹ e_{j})[{i}] = {sum}, expected {want}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "j (")]
+    fn h_inv_column_panics_on_out_of_range_j() {
+        let l = vec![1.0_f32, 0.0, 1.0];
+        let _ = h_inv_column(&l, 2, 5);
     }
 }
