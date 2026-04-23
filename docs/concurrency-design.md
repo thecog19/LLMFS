@@ -10,6 +10,14 @@ Mount writes the cover in place, via `pwrite`. Readers `mmap(MAP_SHARED)` the co
 
 That's the whole design. No coordination protocol, no commit scheduler, no snapshot command, no filesystem-capability probes. The cover file on disk is always the current state, always a valid GGUF, always the stego invariant's at-rest artifact, always the same thing an external reader would see.
 
+## 1.1 Priority: GPU inference is primary; CPU tearing is an accepted cost
+
+Production inference runs on GPU backends (llama.cpp with CUDA / Metal / Vulkan). These copy weights into VRAM at load; the cover file is not re-read during inference; **concurrent mount writes are completely invisible to a running GPU inference session**. This is the common case and it just works.
+
+Pure CPU inference with default `mmap(MAP_SHARED)` is supported but observes the compensation-bounded wobble described in §2. This is an accepted cost of that configuration, not a failure mode we're trying to engineer around — the wobble is small by construction (§2.4), and users who want zero wobble can opt into `--no-mmap` (§2.6) on hardware that has the RAM for it.
+
+Design implication: do not add coordination machinery, snapshot mechanisms, or default-flag changes whose primary effect is reducing CPU-path wobble. The common case (GPU) already has zero, and the uncommon case (CPU mmap) has a bounded acceptable cost.
+
 ## 2. What a concurrent reader actually observes
 
 ### 2.1 Mechanism on Linux
