@@ -29,7 +29,8 @@ use thiserror::Error;
 use crate::forward::awq::{ActivationSite, tensor_names_for};
 use crate::forward::linalg::{self, CholeskyError};
 use crate::forward::{
-    AwqCollector, ForwardModel, HessianAccumulator, KvCache, ModelLoadError, ModelScratch,
+    AwqCollector, CholeskyFactor, ForwardModel, HessianAccumulator, HessianFactorCache, KvCache,
+    ModelLoadError, ModelScratch,
 };
 use crate::gguf::parser::parse_path;
 use crate::stego::tensor_map::TensorMap;
@@ -182,7 +183,13 @@ pub fn run_calibration(
     // 3 + 4. Forward pass + per-tensor salience, mode-dependent.
     let per_tensor_salience = match mode {
         CalibrationMode::Fast => run_fast_forward(&model, &tokens),
-        CalibrationMode::Full => run_full_forward(&model, &tokens, token_count)?,
+        CalibrationMode::Full => {
+            // Discard the factor cache here; `run_calibration`'s
+            // job ends at salience commit. Callers that want to
+            // keep factors for Phase E compensation call
+            // `run_full_forward` directly.
+            run_full_forward(&model, &tokens, token_count)?.per_tensor_obs
+        }
     };
 
     // 5. Parse GGUF for tensor shapes and build the salience table.
@@ -215,17 +222,39 @@ fn run_fast_forward(model: &ForwardModel, tokens: &[u32]) -> HashMap<String, Vec
     collector.finalize()
 }
 
+/// Result of a Full-mode forward pass: everything derivable from
+/// the per-(site, layer) Hessians in one shot. Callers that only
+/// want placement salience use `per_tensor_obs`; callers that want
+/// to seed Phase E's compensation machinery also keep
+/// `factors` (the L2 tier from `docs/compensation-design.md §3.2`).
+///
+/// Returning both from a single forward pass keeps the expensive
+/// `X^T X` accumulation off the hot path — the ~7-minute CPU cost
+/// at SmolLM2 scale (per `docs/phase-d-measurement.md`) is paid
+/// exactly once per Full calibration.
+pub struct FullCalibrationResult {
+    /// Per-weight-tensor OBS saliency (`1 / diag(H⁻¹)` per input
+    /// channel, fanned out to every tensor sharing an observation
+    /// site). Ready to feed to [`build_salience_table`].
+    pub per_tensor_obs: HashMap<String, Vec<f32>>,
+    /// Per-(site, layer) Cholesky factors of the accumulated H.
+    /// Same keys as [`HessianAccumulator::finalize`]; populated for
+    /// every site/layer the observer saw during the forward pass.
+    /// Phase E consumes these for compensation solves.
+    pub factors: HessianFactorCache,
+}
+
 /// Full pass: one forward through the model with a
 /// [`HessianAccumulator`] observer; for every observed
-/// `(site, layer)` Cholesky-factorize H and extract OBS saliency
-/// `1 / diag(H^-1)`; fan out per-site-layer values to each weight
-/// tensor that shares that input (same convention as AWQ's
-/// [`tensor_names_for`]).
-fn run_full_forward(
+/// `(site, layer)` Cholesky-factorize H, extract OBS saliency
+/// `1 / diag(H⁻¹)`, and stash both the per-tensor saliency map and
+/// the factor cache. Fan-out from `(site, layer)` to per-tensor
+/// matches AWQ's [`tensor_names_for`] convention.
+pub fn run_full_forward(
     model: &ForwardModel,
     tokens: &[u32],
     token_count: usize,
-) -> Result<HashMap<String, Vec<f32>>, CalibrateError> {
+) -> Result<FullCalibrationResult, CalibrateError> {
     let ctx_len = tokens.len();
     let mut cache = KvCache::new(&model.config, ctx_len);
     let mut scratch = ModelScratch::new(&model.config, ctx_len, ctx_len);
@@ -237,10 +266,7 @@ fn run_full_forward(
     // for non-singular factorization. If it doesn't, surface a clear
     // error instead of letting Cholesky detect the failure deeper in
     // the pipeline.
-    if let Some(((site, layer), (n_max, _))) = finalized
-        .iter()
-        .max_by_key(|(_, (n, _))| *n)
-    {
+    if let Some(((_, _), (n_max, _))) = finalized.iter().max_by_key(|(_, (n, _))| *n) {
         if *n_max > token_count {
             return Err(CalibrateError::CorpusTooShortForFull {
                 got: token_count,
@@ -248,11 +274,10 @@ fn run_full_forward(
                 n_max: *n_max,
             });
         }
-        // Prevent "unused" warnings on the key when no failure.
-        let _ = (site, layer);
     }
 
     let mut per_tensor = HashMap::new();
+    let mut factors = HessianFactorCache::new();
     for ((site, layer), (n, h_upper)) in finalized {
         let l = linalg::cholesky(&h_upper, n).map_err(|e| CalibrateError::Cholesky {
             site,
@@ -263,8 +288,12 @@ fn run_full_forward(
         for name in tensor_names_for(site, layer) {
             per_tensor.insert(name, obs.clone());
         }
+        factors.insert(site, layer, CholeskyFactor::new(n, l));
     }
-    Ok(per_tensor)
+    Ok(FullCalibrationResult {
+        per_tensor_obs: per_tensor,
+        factors,
+    })
 }
 
 /// Convert AWQ's `HashMap<tensor_name, per_channel_salience>` into

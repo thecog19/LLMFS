@@ -15,8 +15,12 @@
 
 use std::path::{Path, PathBuf};
 
-use llmdb::calibrate::{CalibrationMode, DEFAULT_CALIBRATION_CORPUS, run_calibration};
+use llmdb::calibrate::{
+    CalibrationMode, DEFAULT_CALIBRATION_CORPUS, MAX_HESSIAN_TOKENS, run_calibration,
+    run_full_forward,
+};
 use llmdb::diagnostics::gather;
+use llmdb::forward::{ActivationSite, ForwardModel};
 use llmdb::gguf::parser::parse_path;
 use llmdb::stego::planner::{AllocationMode, build_allocation_plan};
 use llmdb::stego::tensor_map::TensorMap;
@@ -181,4 +185,88 @@ fn calibrate_full_q8_0_populates_salience_inode() {
     };
     calibrate_and_assert(&path, 200, 1 << 20, CalibrationMode::Full);
     let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+#[ignore = "slow: D1-b gate — verifies run_full_forward exposes the \
+            per-(site, layer) Cholesky factor cache (compensation-design.md \
+            §3.2) alongside OBS saliency. Same ~7-min forward pass as the \
+            D1-a gate; no filesystem mutation. Run with --ignored when \
+            validating D1-b."]
+fn full_forward_returns_populated_factor_cache_on_smollm2_q8_0() {
+    // D1-b gate: confirms that Phase E consumers can read the L2
+    // tier factors straight off a Full calibration run — no
+    // re-computation, no re-factorization. Read-only against the
+    // source fixture (no init/mount), so staging a copy is
+    // unnecessary.
+    if !Path::new(SMOLLM2_Q8_0).exists() {
+        eprintln!("skipping: {SMOLLM2_Q8_0} not present");
+        return;
+    }
+    let model = ForwardModel::load(SMOLLM2_Q8_0).expect("load q8_0 model");
+    let hidden = model.config.hidden_dim;
+    let ffn_dim = model.config.ffn_dim;
+    let n_layers = model.config.n_layers;
+
+    let mut tokens = model
+        .encode(DEFAULT_CALIBRATION_CORPUS)
+        .expect("encode default corpus");
+    tokens.truncate(MAX_HESSIAN_TOKENS);
+    assert!(
+        tokens.len() >= ffn_dim,
+        "corpus produced {} tokens; need ≥ ffn_dim ({ffn_dim}) for full-rank H",
+        tokens.len(),
+    );
+    let token_count = tokens.len();
+
+    let result = run_full_forward(&model, &tokens, token_count).expect("full forward");
+    let factors = result.factors;
+
+    // Four observation sites × n_layers blocks = expected cache size.
+    let expected_entries = 4 * n_layers;
+    assert_eq!(
+        factors.len(),
+        expected_entries,
+        "expected {expected_entries} cached (site, layer) factors, got {}",
+        factors.len(),
+    );
+    assert!(!factors.is_empty());
+    assert!(factors.bytes_resident() > 0);
+
+    // Each factor's N matches the site's input dim; each has a
+    // valid lower-triangle length; the Cholesky invariant (positive
+    // diagonal) must hold on every row.
+    for (site, layer, factor) in factors.iter() {
+        let expected_n = match site {
+            ActivationSite::FfnDownInput => ffn_dim,
+            _ => hidden,
+        };
+        assert_eq!(
+            factor.n, expected_n,
+            "factor for ({site:?}, layer {layer}): n = {}, expected {expected_n}",
+            factor.n,
+        );
+        assert_eq!(
+            factor.l.len(),
+            expected_n * (expected_n + 1) / 2,
+            "factor for ({site:?}, layer {layer}): wrong packed length",
+        );
+        for i in 0..factor.n {
+            let diag = factor.l[i * (i + 1) / 2 + i];
+            assert!(
+                diag > 0.0 && diag.is_finite(),
+                "factor for ({site:?}, layer {layer}): diag[{i}] = {diag} \
+                 violates Cholesky invariant (expected > 0, finite)",
+            );
+        }
+    }
+
+    // And OBS came along too, keyed per tensor (7 linears per block).
+    let expected_tensor_entries = 7 * n_layers;
+    assert_eq!(
+        result.per_tensor_obs.len(),
+        expected_tensor_entries,
+        "expected {expected_tensor_entries} per-tensor OBS entries, got {}",
+        result.per_tensor_obs.len(),
+    );
 }
