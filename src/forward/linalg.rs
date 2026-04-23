@@ -223,19 +223,22 @@ pub fn obs_saliency(l: &[f32], n: usize) -> Vec<f32> {
 ///
 /// **Algorithm outline.** At each step `k`:
 ///
-/// 1. Select pivot `p_k = argmax_i diag(R_k)[i]` where `R_k` is the
+/// 1. If `trace(R_k) ≤ tolerance · trace(H)`, stop. This bounds the
+///    dropped diagonal contribution (the residual trace) to at most
+///    `tolerance · trace(H)` — a direct quality guarantee on the
+///    approximation.
+/// 2. Select pivot `p_k = argmax_i diag(R_k)[i]` where `R_k` is the
 ///    current residual `H − V_{<k} V_{<k}^T`. (Diagonal residual
 ///    entries are maintained incrementally — no explicit residual
 ///    matrix construction.)
-/// 2. If `R_k[p_k][p_k] < tolerance · trace(H)`, stop. This bounds
-///    the dropped diagonal contribution (and so, bounds the trace
-///    of the residual) to at most `tolerance · trace(H)`.
 /// 3. Compute column `v_k` of length `N`:
 ///    - `v_k[p_k] = √R_k[p_k][p_k]`,
 ///    - `v_k[i] = R_k[i][p_k] / v_k[p_k]` for `i ≠ p_k`,
 ///    where `R_k[i][p_k] = H[i][p_k] − Σ_{j<k} v_j[i] · v_j[p_k]`.
 /// 4. Update residual diagonal: `d_i ← d_i − v_k[i]²`; force
-///    `d_{p_k} ← 0` to mark that position exhausted.
+///    `d_{p_k} ← 0` to mark that position exhausted. Track the
+///    incremental trace reduction `‖v_k‖²` for the next iteration's
+///    stopping check.
 ///
 /// Cost: `O(K · N · K)` total (each iteration's inner sum is `O(K)`
 /// and runs for `N` positions). For the regimes we care about
@@ -247,9 +250,11 @@ pub fn obs_saliency(l: &[f32], n: usize) -> Vec<f32> {
 /// - `h_upper`: upper triangle of `H`, row-major packed; same layout
 ///   as [`cholesky`]'s input.
 /// - `n`: matrix dimension.
-/// - `tolerance`: must be in `[0, 1]`. Fraction of `trace(H)` below
-///   which to stop extracting new columns. `0` means "keep going to
-///   `max_rank` regardless" (modulo exhausting positive residual).
+/// - `tolerance`: must be in `[0, 1]`. Stop once the residual trace
+///   has dropped to this fraction of `trace(H)` or below. `0` means
+///   "keep going to `max_rank` regardless" (modulo exhausting
+///   positive residual). Equivalently, the approximation captures at
+///   least `(1 - tolerance) · trace(H)` of the trace.
 /// - `max_rank`: hard cap on number of columns. `N` recovers the
 ///   full factorization (up to pivoting).
 pub fn pivoted_cholesky(
@@ -283,6 +288,18 @@ pub fn pivoted_cholesky(
         .map(|i| h_at(h_upper, n, i, i) as f64)
         .collect();
     let initial_trace: f64 = diagonal.iter().copied().sum();
+    // Track residual trace = sum of residual diagonal. Bound the
+    // approximation error directly: `sum ≤ tolerance · initial_trace`
+    // means the rank-K approximation captures at least
+    // `1 - tolerance` of the original trace (and, since H is PSD,
+    // at least that fraction of the Frobenius mass attributable to
+    // the diagonal). Per-iteration: the pivot takes d_p off the
+    // trace; so we track it incrementally and compare the sum, not
+    // the max, to the threshold. (Earlier revisions used a max-
+    // diagonal stopping rule, which scales with `trace / N` for
+    // uniform matrices and so produces premature stopping on large-N
+    // inputs — caught during the first real-data validation run.)
+    let mut residual_trace = initial_trace;
     let stop_threshold = initial_trace * tolerance as f64;
 
     let k_max = max_rank.min(n);
@@ -290,6 +307,11 @@ pub fn pivoted_cholesky(
     let mut pivots: Vec<usize> = Vec::with_capacity(k_max);
 
     for k in 0..k_max {
+        // Stop when residual trace has dropped below tolerance × initial trace.
+        if residual_trace <= stop_threshold {
+            break;
+        }
+
         // Pivot: index of max residual diagonal.
         let (p, &d_p) = match diagonal
             .iter()
@@ -300,8 +322,9 @@ pub fn pivoted_cholesky(
             None => break, // unreachable while n > 0, but guard anyway
         };
 
-        // Stop on exhaustion (<= 0) or tolerance.
-        if d_p <= 0.0 || d_p <= stop_threshold {
+        // Also stop on exhaustion — max diagonal at zero means all
+        // remaining directions are already in the span of V.
+        if d_p <= 0.0 {
             break;
         }
 
@@ -328,13 +351,23 @@ pub fn pivoted_cholesky(
         }
 
         // Update the residual diagonal. For every i, subtract v_k[i]²;
-        // force diagonal[p] to zero to mark that pivot as exhausted
-        // (floating-point subtraction could leave a tiny negative
-        // residual otherwise, which would confuse the next argmax).
+        // force diagonal[p] to zero afterward to mark that pivot as
+        // exhausted (floating-point subtraction could otherwise leave
+        // a tiny negative residual that would confuse the next
+        // argmax).
+        //
+        // Accumulate the total subtracted — this is ‖v_k‖², which
+        // equals `trace(v_k v_k^T)`, which is exactly the trace
+        // reduction from this rank-1 update. Feeds the tolerance
+        // stopping criterion above.
+        let mut subtracted = 0.0_f64;
         for i in 0..n {
             let v_ki = v[col_start + i] as f64;
-            diagonal[i] -= v_ki * v_ki;
+            let d = v_ki * v_ki;
+            diagonal[i] -= d;
+            subtracted += d;
         }
+        residual_trace -= subtracted;
         diagonal[p] = 0.0;
 
         pivots.push(p);
@@ -888,12 +921,12 @@ mod tests {
 
     #[test]
     fn pivoted_cholesky_tolerance_bounds_residual_trace() {
-        // For a non-trivial SPD matrix, the residual trace after
-        // early-stopping at `tolerance · trace(H)` must satisfy:
-        //   Σ_i residual_diag[i] ≤ tolerance · trace(H)
-        // which follows from the stopping criterion being applied to
-        // the max diagonal entry; the sum is bounded by n × max which
-        // is looser, but in practice residual is often near max at stop.
+        // The stopping criterion is `residual_trace ≤ tolerance ·
+        // initial_trace`. After stopping, `residual_trace ≤
+        // tolerance · initial_trace` must hold — and we actually
+        // stop exactly when this crosses, so the residual trace at
+        // termination is very close to `tolerance · initial_trace`
+        // (bounded by one column's contribution on the last step).
         let n = 5;
         let v_seed: Vec<f32> = vec![1.0, -0.5, 2.0, 0.3, -1.2];
         let mut h = vec![0.0_f32; n * (n + 1) / 2];
@@ -907,9 +940,9 @@ mod tests {
         let initial_trace: f64 = (0..n)
             .map(|i| h[upper_tri_offset(n, i, i)] as f64)
             .sum();
-        let tolerance = 0.5_f32;
+        let tolerance = 0.1_f32;
         let result = pivoted_cholesky(&h, n, tolerance, n).unwrap();
-        // Recompute diagonal of residual H - V V^T.
+        // Residual trace = trace(H - V V^T) = Σ_i (H_ii - (V V^T)_ii).
         let residual_trace: f64 = (0..n)
             .map(|i| {
                 h[upper_tri_offset(n, i, i)] as f64
@@ -917,22 +950,16 @@ mod tests {
             })
             .sum();
         assert!(
-            residual_trace >= -1e-6,
+            residual_trace >= -1e-4,
             "residual trace went negative ({residual_trace}) — PSD violation"
         );
-        // Post-stop max diagonal ≤ tolerance · initial_trace by
-        // construction; residual trace ≤ n · max ≤ n · tol · init.
-        // For this test we just verify the bound isn't wildly off.
-        let max_residual_diag = (0..n)
-            .map(|i| {
-                h[upper_tri_offset(n, i, i)] as f64
-                    - vvt_entry(&result.v, n, result.rank(), i, i)
-            })
-            .fold(0.0_f64, f64::max);
+        // Direct bound: residual_trace ≤ tolerance · initial_trace
+        // (with small FP slack for f32 arithmetic).
+        let bound = tolerance as f64 * initial_trace + 1e-4;
         assert!(
-            max_residual_diag <= tolerance as f64 * initial_trace + 1e-5,
-            "max residual diag {max_residual_diag} exceeds tolerance × trace \
-             ({} × {} = {})",
+            residual_trace <= bound,
+            "residual trace {residual_trace} exceeds tolerance · initial trace \
+             ({} · {} = {})",
             tolerance,
             initial_trace,
             tolerance as f64 * initial_trace,
