@@ -35,18 +35,26 @@ use llmdb::forward::{
 };
 
 const SMOLLM2_Q8_0: &str = "models/smollm2-135m-q8_0.gguf";
-const QWEN_0_5B_F16: &str = "models/qwen2.5-0.5b-instruct-f16.gguf";
+const SMOLLM2_F16: &str = "models/smollm2-135m-f16.gguf";
 const CORPUS_PATH: &str = "benches/fixtures/wiki.test.raw";
 const DUMP_ROOT: &str = "target/hessian-dump";
 
-/// Target token count per cover. Picked to exceed `N_max` at every
-/// observation site so H is full-rank — i.e., the eigenvalue tail
-/// reflects real structure rather than rank truncation.
+/// Target token count. Picked to exceed `N_max` at every observation
+/// site so H is full-rank — i.e., the eigenvalue tail reflects real
+/// structure rather than rank truncation. SmolLM2-135M: `N_max =
+/// ffn_dim = 1536`, target 2048.
 ///
-/// - SmolLM2-135M: `N_max = ffn_dim = 1536`. Target 2048.
-/// - Qwen2.5-0.5B: `N_max = ffn_dim = 4864`. Target 5120.
-const SMOLLM2_TARGET_TOKENS: usize = 2048;
-const QWEN_TARGET_TOKENS: usize = 5120;
+/// Note on scope: D0 originally planned to also dump Qwen-2.5-0.5B
+/// for a cross-architecture sanity check, but the forward pass only
+/// supports llama-arch GGUFs with gpt2-style tokenizers (see
+/// `src/forward/config.rs:UnsupportedArch` and the matching
+/// tokenizer guard). Of the locally available models, only SmolLM2
+/// satisfies both. The two SmolLM2 quantizations (F16 + Q8_0)
+/// stand in as a second data point: they share architecture but
+/// differ in the per-weight quantization noise, so identical H
+/// structure across the two also validates that the dequant path
+/// preserves the activation second-moment statistic.
+const TARGET_TOKENS: usize = 2048;
 
 fn site_tag(site: ActivationSite) -> &'static str {
     match site {
@@ -205,18 +213,18 @@ fn run_dump(model_path: &str, cover_tag: &str, target_tokens: usize) {
 
 #[test]
 #[ignore = "D0 measurement: loads smollm2-135m-q8_0 + wiki.test.raw, runs a \
-            2048-token forward pass with full-H accumulator, dumps ~65 MB \
-            of F32 upper triangles to target/hessian-dump/smollm2/. \
-            Minutes on CPU. Run explicitly via --ignored --nocapture."]
-fn dump_smollm2_hessians() {
-    run_dump(SMOLLM2_Q8_0, "smollm2-135m-q8_0", SMOLLM2_TARGET_TOKENS);
+            2048-token forward pass with full-H accumulator, dumps ~190 MB \
+            of F32 upper triangles to target/hessian-dump/smollm2-135m-q8_0/. \
+            ~7 min on CPU. Run explicitly via --ignored --nocapture."]
+fn dump_smollm2_q8_0_hessians() {
+    run_dump(SMOLLM2_Q8_0, "smollm2-135m-q8_0", TARGET_TOKENS);
 }
 
 #[test]
-#[ignore = "D0 measurement: loads qwen2.5-0.5b-instruct-f16 + wiki.test.raw, \
-            runs a 5120-token forward pass with full-H accumulator, dumps \
-            ~1.3 GB of F32 upper triangles to target/hessian-dump/qwen0_5b/. \
-            Tens of minutes on CPU. Run explicitly via --ignored --nocapture."]
-fn dump_qwen0_5b_hessians() {
-    run_dump(QWEN_0_5B_F16, "qwen2.5-0.5b-instruct-f16", QWEN_TARGET_TOKENS);
+#[ignore = "D0 measurement: loads smollm2-135m-f16 + wiki.test.raw, runs the \
+            same 2048-token forward pass on the F16 cover. Used as a \
+            quantization-stability check — H structure should match the \
+            Q8_0 dump within dequant-noise tolerance. ~7 min on CPU."]
+fn dump_smollm2_f16_hessians() {
+    run_dump(SMOLLM2_F16, "smollm2-135m-f16", TARGET_TOKENS);
 }
