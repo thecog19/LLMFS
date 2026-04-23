@@ -77,11 +77,14 @@ fn calibrate_populates_salience_inode_and_status_reflects_it() {
 
     // Pre-calibration: diagnostics report calibrated=false.
     let pre = gather(&fs, &map).expect("gather pre");
-    assert!(!pre.calibrated, "cover is calibrated before we ran calibrate");
+    assert!(
+        !pre.calibrated,
+        "cover is calibrated before we ran calibrate"
+    );
     assert_eq!(pre.salience_slot_count, 0);
 
-    let summary = run_calibration(&mut fs, &path, &map, DEFAULT_CALIBRATION_CORPUS)
-        .expect("calibrate");
+    let summary =
+        run_calibration(&mut fs, &path, &map, DEFAULT_CALIBRATION_CORPUS).expect("calibrate");
     eprintln!(
         "calibration: {} tokens, {}/{} slots",
         summary.token_count, summary.populated_slot_count, summary.total_slot_count,
@@ -102,7 +105,19 @@ fn calibrate_populates_salience_inode_and_status_reflects_it() {
     // Post-calibration: diagnostics report calibrated=true.
     let post = gather(&fs, &map).expect("gather post");
     assert!(post.calibrated);
-    assert_eq!(post.salience_slot_count as usize, summary.populated_slot_count);
+    assert_eq!(
+        post.salience_slot_count as usize,
+        summary.populated_slot_count
+    );
+    let persisted = fs
+        .load_salience()
+        .expect("load salience")
+        .expect("some salience");
+    assert!(
+        persisted.encode().len() < (1 << 20),
+        "smollm2 salience should stay under 1 MiB, got {} bytes",
+        persisted.encode().len(),
+    );
 
     // Cleanup: drop + remove the staged copy.
     drop(fs);

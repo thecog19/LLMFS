@@ -27,7 +27,11 @@ fn smollm2_tokenizer_parses_with_expected_shape() {
     let Some(tk) = parse_or_skip(SMOLLM2) else {
         return;
     };
-    assert_eq!(tk.model, TokenizerModel::Gpt2, "smollm2 uses gpt2 tokenizer");
+    assert_eq!(
+        tk.model,
+        TokenizerModel::Gpt2,
+        "smollm2 uses gpt2 tokenizer"
+    );
     assert_eq!(tk.pre_tokenizer.as_deref(), Some("smollm"));
     assert_eq!(
         tk.vocab_size(),
@@ -151,9 +155,7 @@ fn smollm2_decode_single_printable_ascii_byte_tokens_round_trip() {
     for b in 33u8..=126 {
         let char_str: String = std::iter::once(byte_to_char_test(b)).collect();
         let Some(id) = t.token_id(&char_str) else {
-            panic!(
-                "printable-ASCII byte {b} ({char_str:?}) missing from smollm2 vocab",
-            );
+            panic!("printable-ASCII byte {b} ({char_str:?}) missing from smollm2 vocab",);
         };
         let decoded = t
             .decode(&[id])
@@ -203,9 +205,7 @@ fn byte_to_char_test(b: u8) -> char {
     let remapped: Vec<u8> = (0u16..256)
         .map(|x| x as u8)
         .filter(|byte| {
-            !((33..=126).contains(byte)
-                || (161..=172).contains(byte)
-                || (174..=255).contains(byte))
+            !((33..=126).contains(byte) || (161..=172).contains(byte) || (174..=255).contains(byte))
         })
         .collect();
     let idx = remapped.iter().position(|&x| x == b).unwrap();

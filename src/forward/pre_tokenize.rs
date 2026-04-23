@@ -51,9 +51,7 @@ pub struct PreTokenizer {
 
 #[derive(Debug, Error)]
 pub enum PreTokenizerError {
-    #[error(
-        "unsupported pre-tokenizer variant `{0}` — Milestone A implements `smollm` only"
-    )]
+    #[error("unsupported pre-tokenizer variant `{0}` — Milestone A implements `smollm` only")]
     UnsupportedVariant(String),
 
     // `fancy_regex::Error` is a large enum (hundreds of bytes); box
@@ -212,10 +210,7 @@ mod tests {
         // trailing-whitespace pre-token (\s+(?!\S) at the slice
         // boundary before "world"), the third attaches to
         // " world" as the optional-leading-space of `?\p{L}+`.
-        assert_eq!(
-            smollm_split("hello   world"),
-            vec!["hello", "  ", " world"]
-        );
+        assert_eq!(smollm_split("hello   world"), vec!["hello", "  ", " world"]);
     }
 
     #[test]
@@ -256,8 +251,7 @@ mod tests {
         // slice_ptr + slice_len fits inside input_ptr + input_len.
         let text = "abc123";
         let tokens = PreTokenizer::new("smollm").unwrap().split(text).unwrap();
-        let text_range =
-            text.as_ptr() as usize..text.as_ptr() as usize + text.len();
+        let text_range = text.as_ptr() as usize..text.as_ptr() as usize + text.len();
         for tok in tokens {
             let tok_start = tok.as_ptr() as usize;
             let tok_end = tok_start + tok.len();

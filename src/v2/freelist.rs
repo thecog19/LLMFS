@@ -178,8 +178,7 @@ impl FreeRunSet {
         if weight_index > run_start {
             let left_len = weight_index - run_start;
             let left_max = ceiling.max_over_range(slot as u32, run_start as u64, left_len as u64);
-            let left_sal =
-                salience.max_over_range(slot as u32, run_start as u64, left_len as u64);
+            let left_sal = salience.max_over_range(slot as u32, run_start as u64, left_len as u64);
             self.insert_raw(FreeRun {
                 slot,
                 start_weight: run_start,
@@ -389,8 +388,14 @@ mod tests {
         );
 
         // Higher max_ceiling sorts after lower regardless of length.
-        let low_max = FreeRun { max_ceiling: 0.05, ..longer };
-        let high_max = FreeRun { max_ceiling: 0.5, ..shorter };
+        let low_max = FreeRun {
+            max_ceiling: 0.05,
+            ..longer
+        };
+        let high_max = FreeRun {
+            max_ceiling: 0.5,
+            ..shorter
+        };
         assert!(low_max.fit_key() < high_max.fit_key());
     }
 

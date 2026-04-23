@@ -56,9 +56,7 @@ pub enum ConfigError {
     #[error("unsupported architecture: {arch:?} (Milestone A implements `llama` only)")]
     UnsupportedArch { arch: String },
 
-    #[error(
-        "config inconsistency: hidden_dim {hidden} not divisible by n_heads {n_heads}"
-    )]
+    #[error("config inconsistency: hidden_dim {hidden} not divisible by n_heads {n_heads}")]
     HeadDimIndivisible { hidden: usize, n_heads: usize },
 
     #[error("tokenizer vocab is empty (expected `tokenizer.ggml.tokens` array)")]
@@ -79,8 +77,8 @@ impl LlamaConfig {
         let ffn_dim = read_u64_as_usize(gguf, "llama.feed_forward_length")?;
         let n_layers = read_u64_as_usize(gguf, "llama.block_count")?;
         let n_heads = read_u64_as_usize(gguf, "llama.attention.head_count")?;
-        let n_kv_heads = read_u64_as_usize_opt(gguf, "llama.attention.head_count_kv")
-            .unwrap_or(n_heads);
+        let n_kv_heads =
+            read_u64_as_usize_opt(gguf, "llama.attention.head_count_kv").unwrap_or(n_heads);
 
         if !hidden_dim.is_multiple_of(n_heads) {
             return Err(ConfigError::HeadDimIndivisible {
@@ -92,12 +90,9 @@ impl LlamaConfig {
 
         let rope_dim =
             read_u64_as_usize_opt(gguf, "llama.rope.dimension_count").unwrap_or(head_dim);
-        let rope_freq_base =
-            read_f32_opt(gguf, "llama.rope.freq_base").unwrap_or(10_000.0);
-        let norm_eps =
-            read_f32_opt(gguf, "llama.attention.layer_norm_rms_epsilon").unwrap_or(1e-5);
-        let context_length =
-            read_u64_as_usize_opt(gguf, "llama.context_length").unwrap_or(0);
+        let rope_freq_base = read_f32_opt(gguf, "llama.rope.freq_base").unwrap_or(10_000.0);
+        let norm_eps = read_f32_opt(gguf, "llama.attention.layer_norm_rms_epsilon").unwrap_or(1e-5);
+        let context_length = read_u64_as_usize_opt(gguf, "llama.context_length").unwrap_or(0);
 
         // Vocab size comes from the tokenizer, not the arch section —
         // `llama.vocab_size` is sometimes omitted.

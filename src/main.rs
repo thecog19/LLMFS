@@ -424,13 +424,16 @@ fn cmd_calibrate(model: &Path, corpus: Option<&Path>) -> Result<(), CliError> {
     })?;
 
     let corpus_text: String = match corpus {
-        Some(path) => std::fs::read_to_string(path).map_err(|e| {
-            CliError::user(format!("read corpus {}: {e}", path.display()))
-        })?,
+        Some(path) => std::fs::read_to_string(path)
+            .map_err(|e| CliError::user(format!("read corpus {}: {e}", path.display())))?,
         None => llmdb::calibrate::DEFAULT_CALIBRATION_CORPUS.to_owned(),
     };
 
-    println!("calibrating {} ({} corpus chars)", model.display(), corpus_text.len());
+    println!(
+        "calibrating {} ({} corpus chars)",
+        model.display(),
+        corpus_text.len()
+    );
     let summary = llmdb::calibrate::run_calibration(&mut fs, model, &map, &corpus_text)
         .map_err(|e| CliError::user(format!("calibrate: {e}")))?;
     flush_and_close(model, fs)?;

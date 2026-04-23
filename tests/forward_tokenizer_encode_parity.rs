@@ -29,8 +29,7 @@ use serde::{Deserialize, Serialize};
 const SMOLLM2_GGUF: &str = "models/smollm2-135m-f16.gguf";
 
 fn fixture_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/tokenizer/smollm2_encode.json")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tokenizer/smollm2_encode.json")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -123,7 +122,10 @@ const REGEN_INPUTS: &[(&str, &str)] = &[
     ("tab_char", "a\tb"),
     ("newline", "a\nb"),
     ("multi_line", "first line\nsecond line"),
-    ("long_sentence", "The quick brown fox jumps over the lazy dog"),
+    (
+        "long_sentence",
+        "The quick brown fox jumps over the lazy dog",
+    ),
     ("double_quotes", "She said, \"hello\"."),
     ("code_let", "let x = 42;"),
     ("url_http", "https://example.com"),
@@ -142,8 +144,8 @@ fn regen_smollm2_encode_fixtures() {
         eprintln!("skipping regen: {SMOLLM2_GGUF} not present");
         return;
     }
-    let binary = std::env::var("LLMDB_LLAMA_TOKENIZE")
-        .unwrap_or_else(|_| "llama-tokenize".to_owned());
+    let binary =
+        std::env::var("LLMDB_LLAMA_TOKENIZE").unwrap_or_else(|_| "llama-tokenize".to_owned());
 
     let mut cases: Vec<Case> = Vec::with_capacity(REGEN_INPUTS.len());
     for (label, input) in REGEN_INPUTS {

@@ -58,7 +58,13 @@ pub fn matmul(x: &[f32], w: &[f32], y: &mut [f32], m: usize, k: usize, n: usize)
 /// The mean is taken over all `x.len()` entries (per-row norm;
 /// caller tiles it by row for batched inputs).
 pub fn rmsnorm(x: &mut [f32], w: &[f32], eps: f32) {
-    assert_eq!(x.len(), w.len(), "rmsnorm: x len {} ≠ w len {}", x.len(), w.len());
+    assert_eq!(
+        x.len(),
+        w.len(),
+        "rmsnorm: x len {} ≠ w len {}",
+        x.len(),
+        w.len()
+    );
     let n = x.len();
     if n == 0 {
         return;
@@ -101,8 +107,14 @@ pub fn rope(
         x.len(),
         n_heads * head_dim,
     );
-    assert!(rope_dim <= head_dim, "rope: rope_dim {rope_dim} > head_dim {head_dim}");
-    assert!(rope_dim.is_multiple_of(2), "rope: rope_dim {rope_dim} must be even");
+    assert!(
+        rope_dim <= head_dim,
+        "rope: rope_dim {rope_dim} > head_dim {head_dim}"
+    );
+    assert!(
+        rope_dim.is_multiple_of(2),
+        "rope: rope_dim {rope_dim} must be even"
+    );
     let p = pos as f32;
     let half = rope_dim / 2;
     for h in 0..n_heads {
@@ -214,10 +226,10 @@ mod tests {
     fn matmul_identity_weight_is_copy() {
         // Identity: w = I (n=k), y = x.
         let x = [1.0_f32, 2.0, 3.0, 4.0];
-        let w = [1.0_f32, 0.0, 0.0, 0.0,
-                 0.0_f32, 1.0, 0.0, 0.0,
-                 0.0_f32, 0.0, 1.0, 0.0,
-                 0.0_f32, 0.0, 0.0, 1.0];
+        let w = [
+            1.0_f32, 0.0, 0.0, 0.0, 0.0_f32, 1.0, 0.0, 0.0, 0.0_f32, 0.0, 1.0, 0.0, 0.0_f32, 0.0,
+            0.0, 1.0,
+        ];
         let mut y = [0.0_f32; 4];
         matmul(&x, &w, &mut y, 1, 4, 4);
         assert_eq!(y, x);
@@ -425,9 +437,7 @@ mod tests {
 
     #[test]
     fn embed_copies_the_requested_row() {
-        let table = [0.0_f32, 0.1, 0.2,
-                     1.0_f32, 1.1, 1.2,
-                     2.0_f32, 2.1, 2.2];
+        let table = [0.0_f32, 0.1, 0.2, 1.0_f32, 1.1, 1.2, 2.0_f32, 2.1, 2.2];
         let mut out = [0.0_f32; 3];
         embed(1, &table, 3, &mut out);
         assert_eq!(out, [1.0, 1.1, 1.2]);

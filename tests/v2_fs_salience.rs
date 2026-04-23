@@ -21,7 +21,7 @@ use llmdb::stego::tensor_map::{TensorMap, TensorSlot};
 use llmdb::v2::cdc::FastCdcParams;
 use llmdb::v2::dedup::hash_chunk;
 use llmdb::v2::fs::Filesystem;
-use llmdb::v2::salience::SalienceTable;
+use llmdb::v2::salience::{PeriodicSlotSalience, SalienceTable};
 
 fn f32_to_f16_bits(value: f32) -> u16 {
     let bits = value.to_bits();
@@ -100,7 +100,7 @@ fn large_salience_table() -> SalienceTable {
                 let v = ((state >> 16) & 0xFF) as f32 * 0.001; // positive f32
                 values.push(v);
             }
-            per_slot.push(Some(values));
+            per_slot.push(Some(PeriodicSlotSalience::new(256, values).unwrap()));
         } else {
             per_slot.push(None);
         }
@@ -113,7 +113,10 @@ fn init_commit_salience_load_round_trips_table() {
     // Gate (c): init → commit_salience → load_salience bytes identical.
     let (cover, map) = make_cover();
     let mut fs = Filesystem::init_with_cdc_params(cover, map, small_cdc()).expect("init");
-    assert!(fs.load_salience().unwrap().is_none(), "no salience pre-commit");
+    assert!(
+        fs.load_salience().unwrap().is_none(),
+        "no salience pre-commit"
+    );
 
     let table = large_salience_table();
     let ptr = fs.commit_salience(&table).expect("commit_salience");
@@ -130,13 +133,11 @@ fn salience_survives_unmount_and_remount() {
     // its chunks; `load_salience` returns the original table.
     let (cover, map) = make_cover();
     let table = large_salience_table();
-    let mut fs = Filesystem::init_with_cdc_params(cover, map.clone(), small_cdc())
-        .expect("init");
+    let mut fs = Filesystem::init_with_cdc_params(cover, map.clone(), small_cdc()).expect("init");
     fs.commit_salience(&table).expect("commit");
     let cover1 = fs.unmount().expect("unmount");
 
-    let fs2 = Filesystem::mount_with_cdc_params(cover1, map, small_cdc())
-        .expect("mount");
+    let fs2 = Filesystem::mount_with_cdc_params(cover1, map, small_cdc()).expect("mount");
     let loaded = fs2.load_salience().expect("load").expect("some");
     assert_eq!(loaded, table, "salience table changed across remount");
 }
@@ -169,13 +170,11 @@ fn dedup_index_picks_up_salience_chunks_after_mount() {
     let (cover, map) = make_cover();
     let table = large_salience_table();
     let encoded = table.encode();
-    let mut fs = Filesystem::init_with_cdc_params(cover, map.clone(), small_cdc())
-        .expect("init");
+    let mut fs = Filesystem::init_with_cdc_params(cover, map.clone(), small_cdc()).expect("init");
     fs.commit_salience(&table).expect("commit");
     let cover1 = fs.unmount().expect("unmount");
 
-    let fs2 = Filesystem::mount_with_cdc_params(cover1, map, small_cdc())
-        .expect("mount");
+    let fs2 = Filesystem::mount_with_cdc_params(cover1, map, small_cdc()).expect("mount");
     let dedup = fs2.dedup_index();
     assert!(
         !dedup.is_empty(),
@@ -250,7 +249,9 @@ fn calibrated_cover_avoids_high_salience_region_for_new_writes() {
     for v in values.iter_mut().take(high_hi).skip(high_lo) {
         *v = 1.0;
     }
-    let table = SalienceTable::new(vec![Some(values)]);
+    let table = SalienceTable::new(vec![Some(
+        PeriodicSlotSalience::new(populated_len as u64, values).unwrap(),
+    )]);
 
     let mut fs = Filesystem::init(cover, map.clone()).expect("init");
     fs.commit_salience(&table).expect("calibrate");

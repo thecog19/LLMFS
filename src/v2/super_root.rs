@@ -175,9 +175,7 @@ fn decode_v1(bytes: &[u8]) -> Result<SuperRoot, SuperRootError> {
     if bytes.len() < SUPER_ROOT_V1_BYTES {
         return Err(SuperRootError::Truncated { got: bytes.len() });
     }
-    let stored_crc = u32::from_le_bytes(
-        bytes[V1_GENERATION_END..V1_CRC_END].try_into().unwrap(),
-    );
+    let stored_crc = u32::from_le_bytes(bytes[V1_GENERATION_END..V1_CRC_END].try_into().unwrap());
     let computed_crc = crc_of(&bytes[0..V1_GENERATION_END]);
     if computed_crc != stored_crc {
         return Err(SuperRootError::BadChecksum {
@@ -190,9 +188,7 @@ fn decode_v1(bytes: &[u8]) -> Result<SuperRoot, SuperRootError> {
     let dirty_bitmap_inode = Pointer::decode(&bytes[DEDUP_END..DIRTY_END])?;
     let free_run_state_inode = Pointer::decode(&bytes[DIRTY_END..FREELIST_END])?;
     let ceiling_summary_inode = Pointer::decode(&bytes[FREELIST_END..CEILING_END])?;
-    let generation = u64::from_le_bytes(
-        bytes[CEILING_END..V1_GENERATION_END].try_into().unwrap(),
-    );
+    let generation = u64::from_le_bytes(bytes[CEILING_END..V1_GENERATION_END].try_into().unwrap());
     Ok(SuperRoot {
         root_dir_inode,
         dedup_index_inode,
@@ -208,8 +204,7 @@ fn decode_v2(bytes: &[u8]) -> Result<SuperRoot, SuperRootError> {
     if bytes.len() < SUPER_ROOT_BYTES {
         return Err(SuperRootError::Truncated { got: bytes.len() });
     }
-    let stored_crc =
-        u32::from_le_bytes(bytes[GENERATION_END..CRC_END].try_into().unwrap());
+    let stored_crc = u32::from_le_bytes(bytes[GENERATION_END..CRC_END].try_into().unwrap());
     let computed_crc = crc_of(&bytes[0..GENERATION_END]);
     if computed_crc != stored_crc {
         return Err(SuperRootError::BadChecksum {
@@ -223,8 +218,7 @@ fn decode_v2(bytes: &[u8]) -> Result<SuperRoot, SuperRootError> {
     let free_run_state_inode = Pointer::decode(&bytes[DIRTY_END..FREELIST_END])?;
     let ceiling_summary_inode = Pointer::decode(&bytes[FREELIST_END..CEILING_END])?;
     let salience_inode = Pointer::decode(&bytes[CEILING_END..SALIENCE_END])?;
-    let generation =
-        u64::from_le_bytes(bytes[SALIENCE_END..GENERATION_END].try_into().unwrap());
+    let generation = u64::from_le_bytes(bytes[SALIENCE_END..GENERATION_END].try_into().unwrap());
     Ok(SuperRoot {
         root_dir_inode,
         dedup_index_inode,
@@ -433,8 +427,7 @@ mod tests {
         bytes[DIRTY_END..FREELIST_END].copy_from_slice(&Pointer::NULL.encode());
         bytes[FREELIST_END..CEILING_END].copy_from_slice(&Pointer::NULL.encode());
         bytes[CEILING_END..V1_GENERATION_END].copy_from_slice(&0_u64.to_le_bytes());
-        bytes[V1_GENERATION_END..V1_CRC_END]
-            .copy_from_slice(&0xDEADBEEFu32.to_le_bytes());
+        bytes[V1_GENERATION_END..V1_CRC_END].copy_from_slice(&0xDEADBEEFu32.to_le_bytes());
         assert!(matches!(
             SuperRoot::decode(&bytes),
             Err(SuperRootError::BadChecksum { .. }),

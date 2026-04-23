@@ -195,7 +195,8 @@ fn reserve_weight_in_middle_splits_into_two_halves() {
     fl.insert(make_run(0, 0, 100, 0.5));
     let summary = flat_summary(&[1]); // 1 slot, 1 bucket covering ≥ 100 weights
 
-    fl.reserve_weight(0, 42, &summary, &SalienceTable::empty()).expect("reserve");
+    fl.reserve_weight(0, 42, &summary, &SalienceTable::empty())
+        .expect("reserve");
     assert_eq!(fl.len(), 2, "run split into left + right");
     // Left half: [0, 42). Right half: [43, 100).
     let left = fl.pop_best_fit(40).expect("left fits");
@@ -220,7 +221,8 @@ fn reserve_weight_at_run_start_shrinks_from_left() {
     fl.insert(make_run(0, 0, 100, 0.5));
     let summary = flat_summary(&[1]);
 
-    fl.reserve_weight(0, 0, &summary, &SalienceTable::empty()).expect("reserve");
+    fl.reserve_weight(0, 0, &summary, &SalienceTable::empty())
+        .expect("reserve");
     assert_eq!(fl.len(), 1);
     let got = fl.pop_best_fit(1).unwrap();
     assert_eq!(got.start_weight, 1);
@@ -233,7 +235,8 @@ fn reserve_weight_at_run_end_shrinks_from_right() {
     fl.insert(make_run(0, 0, 100, 0.5));
     let summary = flat_summary(&[1]);
 
-    fl.reserve_weight(0, 99, &summary, &SalienceTable::empty()).expect("reserve");
+    fl.reserve_weight(0, 99, &summary, &SalienceTable::empty())
+        .expect("reserve");
     assert_eq!(fl.len(), 1);
     let got = fl.pop_best_fit(1).unwrap();
     assert_eq!(got.start_weight, 0);
@@ -246,7 +249,8 @@ fn reserve_weight_on_single_weight_run_empties_it() {
     fl.insert(make_run(0, 10, 1, 0.5));
     let summary = flat_summary(&[1]);
 
-    fl.reserve_weight(0, 10, &summary, &SalienceTable::empty()).expect("reserve");
+    fl.reserve_weight(0, 10, &summary, &SalienceTable::empty())
+        .expect("reserve");
     assert!(fl.is_empty());
 }
 
@@ -257,7 +261,9 @@ fn reserve_weight_not_in_any_run_errors() {
     let summary = flat_summary(&[1]);
 
     // Before the run.
-    let err = fl.reserve_weight(0, 50, &summary, &SalienceTable::empty()).expect_err("not free");
+    let err = fl
+        .reserve_weight(0, 50, &summary, &SalienceTable::empty())
+        .expect_err("not free");
     assert_eq!(
         err,
         ReserveError::NotFree {
@@ -266,7 +272,9 @@ fn reserve_weight_not_in_any_run_errors() {
         }
     );
     // After the run.
-    let err = fl.reserve_weight(0, 200, &summary, &SalienceTable::empty()).expect_err("not free");
+    let err = fl
+        .reserve_weight(0, 200, &summary, &SalienceTable::empty())
+        .expect_err("not free");
     assert_eq!(
         err,
         ReserveError::NotFree {
@@ -275,7 +283,9 @@ fn reserve_weight_not_in_any_run_errors() {
         }
     );
     // Wrong slot.
-    let err = fl.reserve_weight(1, 100, &summary, &SalienceTable::empty()).expect_err("not free");
+    let err = fl
+        .reserve_weight(1, 100, &summary, &SalienceTable::empty())
+        .expect_err("not free");
     assert_eq!(
         err,
         ReserveError::NotFree {
@@ -294,7 +304,8 @@ fn reserve_many_weights_produces_many_small_runs() {
     let summary = flat_summary(&[4]); // 4 buckets × 256 = 1024 weights covered
 
     for w in [5_u32, 100, 200, 300, 400, 500, 600, 700, 800, 900] {
-        fl.reserve_weight(0, w, &summary, &SalienceTable::empty()).expect("reserve");
+        fl.reserve_weight(0, w, &summary, &SalienceTable::empty())
+            .expect("reserve");
     }
     assert_eq!(
         fl.len(),

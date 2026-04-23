@@ -323,8 +323,7 @@ impl Filesystem {
         };
 
         let ceiling = CeilingSummary::build(cover.bytes(), &map);
-        let mut allocator =
-            Allocator::new_for_map_with_salience(&map, ceiling, salience_table)?;
+        let mut allocator = Allocator::new_for_map_with_salience(&map, ceiling, salience_table)?;
         allocator.reserve_weights(unique_weights(&anchor_placement))?;
 
         reserve_pointer(&mut allocator, &map, super_root_ptr)?;

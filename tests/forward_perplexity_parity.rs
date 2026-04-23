@@ -61,8 +61,7 @@ const PPL_TEXT: &str = concat!(
 const CTX_LEN: usize = 128;
 
 fn fixture_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/perplexity/smollm2_slice.json")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/perplexity/smollm2_slice.json")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,8 +88,7 @@ fn tokenizer_binary() -> String {
 }
 
 fn perplexity_binary() -> String {
-    std::env::var("LLMDB_LLAMA_PERPLEXITY")
-        .unwrap_or_else(|_| "llama-perplexity".to_owned())
+    std::env::var("LLMDB_LLAMA_PERPLEXITY").unwrap_or_else(|_| "llama-perplexity".to_owned())
 }
 
 // ─── Fast test ──────────────────────────────────────────────────────
@@ -161,9 +159,7 @@ fn regen_smollm2_ppl_fixture() {
         ctx_len: CTX_LEN,
         tokens,
         reference_ppl,
-        generator: format!(
-            "llama-perplexity -m {SMOLLM2_GGUF} --ctx-size {CTX_LEN} -f <slice>",
-        ),
+        generator: format!("llama-perplexity -m {SMOLLM2_GGUF} --ctx-size {CTX_LEN} -f <slice>",),
     };
     let path = fixture_path();
     if let Some(parent) = path.parent() {

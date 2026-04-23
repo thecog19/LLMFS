@@ -110,7 +110,11 @@ mod tests {
     fn append_grows_current_len_and_copies_rows() {
         let mut c = LayerKvCache::new(4, 3);
         assert_eq!(c.current_len, 0);
-        c.append(&[1., 2., 3., 4., 5., 6.], &[10., 20., 30., 40., 50., 60.], 2);
+        c.append(
+            &[1., 2., 3., 4., 5., 6.],
+            &[10., 20., 30., 40., 50., 60.],
+            2,
+        );
         assert_eq!(c.current_len, 2);
         assert_eq!(&c.k[..6], &[1., 2., 3., 4., 5., 6.]);
         assert_eq!(&c.v[..6], &[10., 20., 30., 40., 50., 60.]);

@@ -115,14 +115,7 @@ fn tensor_names_for(site: ActivationSite, layer: usize) -> Vec<String> {
 }
 
 impl BlockObserver for AwqCollector {
-    fn observe(
-        &mut self,
-        site: ActivationSite,
-        layer: usize,
-        x: &[f32],
-        rows: usize,
-        cols: usize,
-    ) {
+    fn observe(&mut self, site: ActivationSite, layer: usize, x: &[f32], rows: usize, cols: usize) {
         assert_eq!(x.len(), rows * cols);
         let entry = self
             .sums
@@ -175,7 +168,13 @@ mod tests {
     fn ffn_gate_up_share_salience_but_down_gets_its_own() {
         let mut c = AwqCollector::new();
         c.observe(ActivationSite::FfnGateUpInput, 2, &[2.0_f32, 4.0], 1, 2);
-        c.observe(ActivationSite::FfnDownInput, 2, &[10.0_f32, 20.0, 30.0], 1, 3);
+        c.observe(
+            ActivationSite::FfnDownInput,
+            2,
+            &[10.0_f32, 20.0, 30.0],
+            1,
+            3,
+        );
         let f = c.finalize();
         assert_eq!(f["blk.2.ffn_gate.weight"], vec![2.0, 4.0]);
         assert_eq!(f["blk.2.ffn_up.weight"], vec![2.0, 4.0]);

@@ -23,13 +23,11 @@ use std::path::Path;
 
 use thiserror::Error;
 
-use crate::forward::{
-    AwqCollector, ForwardModel, KvCache, ModelLoadError, ModelScratch,
-};
+use crate::forward::{AwqCollector, ForwardModel, KvCache, ModelLoadError, ModelScratch};
 use crate::gguf::parser::parse_path;
 use crate::stego::tensor_map::TensorMap;
 use crate::v2::fs::{Filesystem as V2Filesystem, FsError as V2FsError};
-use crate::v2::salience::SalienceTable;
+use crate::v2::salience::{PeriodicSlotSalience, SalienceError, SalienceTable};
 
 /// Calibration corpus bundled with the CLI. Chosen to be short
 /// enough to run in seconds on CPU but long enough to produce a
@@ -68,6 +66,9 @@ pub enum CalibrateError {
 
     #[error("filesystem: {0}")]
     Fs(#[from] V2FsError),
+
+    #[error("salience: {0}")]
+    Salience(#[from] SalienceError),
 
     #[error(
         "tensor {tensor}: weight_count mismatch between TensorMap ({map_count}) \
@@ -124,18 +125,13 @@ pub fn run_calibration(
     let mut cache = KvCache::new(&model.config, ctx_len);
     let mut scratch = ModelScratch::new(&model.config, ctx_len, ctx_len);
     let mut collector = AwqCollector::new();
-    let _ = model.forward_all_logits_with_observer(
-        &tokens,
-        &mut cache,
-        &mut scratch,
-        &mut collector,
-    );
+    let _ =
+        model.forward_all_logits_with_observer(&tokens, &mut cache, &mut scratch, &mut collector);
     let per_tensor_salience = collector.finalize();
 
     // 4. Parse GGUF to get tensor shapes (for per-channel→per-weight
     //    expansion we need the input dimension).
-    let gguf = parse_path(model_path)
-        .map_err(|e| CalibrateError::GgufParse(e.to_string()))?;
+    let gguf = parse_path(model_path).map_err(|e| CalibrateError::GgufParse(e.to_string()))?;
     let table = build_salience_table(tensor_map, &gguf.tensors, &per_tensor_salience)?;
     let populated_slot_count = table.populated_slot_count();
     let total_slot_count = table.slot_count();
@@ -162,7 +158,7 @@ fn build_salience_table(
     gguf_tensors: &[crate::gguf::parser::GgufTensorInfo],
     per_tensor_salience: &std::collections::HashMap<String, Vec<f32>>,
 ) -> Result<SalienceTable, CalibrateError> {
-    let mut per_slot: Vec<Option<Vec<f32>>> = vec![None; tensor_map.slots.len()];
+    let mut per_slot: Vec<Option<PeriodicSlotSalience>> = vec![None; tensor_map.slots.len()];
     for (slot_idx, slot) in tensor_map.slots.iter().enumerate() {
         let Some(channel_salience) = per_tensor_salience.get(&slot.name) else {
             continue; // AWQ didn't observe this tensor — leave slot empty.
@@ -190,13 +186,11 @@ fn build_salience_table(
         if in_dim == 0 || channels == 0 {
             continue;
         }
-        let weight_count = slot.weight_count as usize;
         let period = in_dim.min(channels);
-        let mut expanded = Vec::with_capacity(weight_count);
-        for i in 0..weight_count {
-            expanded.push(channel_salience[i % period]);
-        }
-        per_slot[slot_idx] = Some(expanded);
+        per_slot[slot_idx] = Some(PeriodicSlotSalience::new(
+            slot.weight_count,
+            channel_salience[..period].to_vec(),
+        )?);
     }
     Ok(SalienceTable::new(per_slot))
 }
@@ -244,13 +238,15 @@ mod tests {
         };
         let tensors = vec![tensor_info("blk.0.attn_q.weight", vec![3, 2])];
         let mut salience = HashMap::new();
-        salience.insert(
-            "blk.0.attn_q.weight".to_owned(),
-            vec![1.0_f32, 2.0, 3.0],
-        );
+        salience.insert("blk.0.attn_q.weight".to_owned(), vec![1.0_f32, 2.0, 3.0]);
         let table = build_salience_table(&map, &tensors, &salience).unwrap();
         assert_eq!(table.slot_count(), 1);
         assert_eq!(table.populated_slot_count(), 1);
+        assert_eq!(
+            table.encode().len(),
+            36,
+            "store one 3-channel period, not 6 dense weights"
+        );
         // Access via max_over_range for 1-weight windows to verify
         // each position.
         for i in 0..6_u64 {
@@ -282,10 +278,7 @@ mod tests {
             tensor_info("blk.0.token_embd.weight", vec![4, 3]),
         ];
         let mut salience = HashMap::new();
-        salience.insert(
-            "blk.0.attn_q.weight".to_owned(),
-            vec![1.0_f32, 2.0, 3.0],
-        );
+        salience.insert("blk.0.attn_q.weight".to_owned(), vec![1.0_f32, 2.0, 3.0]);
         let table = build_salience_table(&map, &tensors, &salience).unwrap();
         assert_eq!(table.slot_count(), 2);
         assert_eq!(table.populated_slot_count(), 1);
@@ -301,14 +294,8 @@ mod tests {
         };
         let tensors = vec![tensor_info("blk.0.attn_q.weight", vec![3, 100])]; // 300 elements
         let mut salience = HashMap::new();
-        salience.insert(
-            "blk.0.attn_q.weight".to_owned(),
-            vec![1.0_f32, 2.0, 3.0],
-        );
+        salience.insert("blk.0.attn_q.weight".to_owned(), vec![1.0_f32, 2.0, 3.0]);
         let err = build_salience_table(&map, &tensors, &salience).unwrap_err();
-        assert!(matches!(
-            err,
-            CalibrateError::WeightCountMismatch { .. },
-        ));
+        assert!(matches!(err, CalibrateError::WeightCountMismatch { .. },));
     }
 }

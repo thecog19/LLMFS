@@ -205,16 +205,16 @@ fn uncalibrated_cover_reports_calibrated_false() {
 
 #[test]
 fn calibrated_cover_reports_salience_slot_count() {
-    use llmdb::v2::salience::SalienceTable;
+    use llmdb::v2::salience::{PeriodicSlotSalience, SalienceTable};
 
     let (cover, map) = make_cover(20_000);
     let mut fs = Filesystem::init_with_cdc_params(cover, map.clone(), small_cdc()).expect("init");
 
     // Two populated slot entries out of three total.
     let table = SalienceTable::new(vec![
-        Some(vec![0.1_f32, 0.2, 0.3]),
+        Some(PeriodicSlotSalience::new(3, vec![0.1_f32, 0.2, 0.3]).unwrap()),
         None,
-        Some(vec![0.5_f32, 0.5]),
+        Some(PeriodicSlotSalience::new(2, vec![0.5_f32, 0.5]).unwrap()),
     ]);
     fs.commit_salience(&table).expect("commit");
 

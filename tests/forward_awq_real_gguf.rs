@@ -67,12 +67,8 @@ fn awq_collector_produces_finite_nonconstant_salience_per_matmul() {
     let mut scratch = ModelScratch::new(&cfg, ctx_len, ctx_len);
     let mut collector = AwqCollector::new();
 
-    let _ = model.forward_all_logits_with_observer(
-        &tokens,
-        &mut cache,
-        &mut scratch,
-        &mut collector,
-    );
+    let _ =
+        model.forward_all_logits_with_observer(&tokens, &mut cache, &mut scratch, &mut collector);
     let salience = collector.finalize();
 
     // Structural checks:

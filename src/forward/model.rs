@@ -45,9 +45,9 @@ pub struct ForwardModel {
 /// for either the last position only (`forward`) or every position
 /// (`forward_all_logits`), and the logits buffer.
 pub struct ModelScratch {
-    pub x: Vec<f32>,           // [batch, hidden]
-    pub norm: Vec<f32>,        // [batch, hidden] — per-position final norm
-    pub logits: Vec<f32>,      // [batch, vocab_size]
+    pub x: Vec<f32>,      // [batch, hidden]
+    pub norm: Vec<f32>,   // [batch, hidden] — per-position final norm
+    pub logits: Vec<f32>, // [batch, vocab_size]
     pub block_scratch: BlockScratch,
     batch: usize,
     vocab_size: usize,
@@ -131,11 +131,7 @@ impl ForwardModel {
     /// Perplexity on a pre-tokenized stream at the given context
     /// length. Non-overlapping chunks of `ctx_len` tokens each;
     /// cross-entropy accumulated, exponentiated at the end.
-    pub fn perplexity(
-        &self,
-        tokens: &[u32],
-        ctx_len: usize,
-    ) -> Result<f32, PerplexityError> {
+    pub fn perplexity(&self, tokens: &[u32], ctx_len: usize) -> Result<f32, PerplexityError> {
         perplexity(self, tokens, ctx_len)
     }
 

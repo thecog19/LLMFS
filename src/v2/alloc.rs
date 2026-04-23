@@ -140,8 +140,7 @@ impl Allocator {
                 });
             }
             let max_ceiling = ceiling.max_over_range(slot_idx as u32, 0, slot.weight_count);
-            let max_salience =
-                salience.max_over_range(slot_idx as u32, 0, slot.weight_count);
+            let max_salience = salience.max_over_range(slot_idx as u32, 0, slot.weight_count);
             freelist.insert(FreeRun {
                 slot: slot_idx as u16,
                 start_weight: 0,

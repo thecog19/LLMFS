@@ -351,9 +351,7 @@ pub enum TokenizerError {
     )]
     MalformedMerge(String),
 
-    #[error(
-        "unsupported tokenizer model `{0:?}` — Milestone A implements gpt2 only"
-    )]
+    #[error("unsupported tokenizer model `{0:?}` — Milestone A implements gpt2 only")]
     UnsupportedModel(TokenizerModel),
 
     #[error("pre-tokenizer: {0}")]
@@ -416,11 +414,12 @@ impl Tokenizer {
             .map(|(rank, (l, r))| ((l.clone(), r.clone()), rank as u32))
             .collect();
 
-        let pre_tokenizer_variant = config.pre_tokenizer.as_deref().ok_or(
-            TokenizerError::MissingKey("tokenizer.ggml.pre"),
-        )?;
-        let pre_tokenizer = PreTokenizer::new(pre_tokenizer_variant)
-            .map_err(TokenizerError::PreTokenizer)?;
+        let pre_tokenizer_variant = config
+            .pre_tokenizer
+            .as_deref()
+            .ok_or(TokenizerError::MissingKey("tokenizer.ggml.pre"))?;
+        let pre_tokenizer =
+            PreTokenizer::new(pre_tokenizer_variant).map_err(TokenizerError::PreTokenizer)?;
 
         Ok(Self {
             config,
@@ -482,13 +481,11 @@ impl Tokenizer {
             byte_level_encode_into(region, &mut pieces);
             bpe_merge_inplace(&mut pieces, &self.merge_ranks);
             for piece in pieces.iter() {
-                let id = self
-                    .vocab_map
-                    .get(piece)
-                    .copied()
-                    .ok_or_else(|| EncodeError::UnknownMerged {
+                let id = self.vocab_map.get(piece).copied().ok_or_else(|| {
+                    EncodeError::UnknownMerged {
                         merged: piece.clone(),
-                    })?;
+                    }
+                })?;
                 ids.push(id);
             }
         }
@@ -518,10 +515,7 @@ impl Tokenizer {
                 .get(idx)
                 .ok_or(DecodeError::OutOfVocabulary(id))?;
             for c in token.chars() {
-                let b = char_to_byte(c).ok_or(DecodeError::InvalidTokenChar {
-                    id,
-                    char: c,
-                })?;
+                let b = char_to_byte(c).ok_or(DecodeError::InvalidTokenChar { id, char: c })?;
                 bytes.push(b);
             }
         }
@@ -549,9 +543,7 @@ pub enum DecodeError {
     #[error("token id {0} is past the end of the vocabulary")]
     OutOfVocabulary(u32),
 
-    #[error(
-        "token {id} contains char {char:?} that isn't part of the GPT-2 byte↔unicode alphabet"
-    )]
+    #[error("token {id} contains char {char:?} that isn't part of the GPT-2 byte↔unicode alphabet")]
     InvalidTokenChar { id: u32, char: char },
 
     #[error("decoded byte sequence is not valid UTF-8 (stopped at byte {valid_up_to})")]
@@ -733,7 +725,10 @@ mod tests {
         // 256 distinct bytes → 256 distinct codepoints.
         let mut seen = std::collections::HashSet::new();
         for b in 0u8..=255 {
-            assert!(seen.insert(byte_to_char(b) as u32), "duplicate byte→char at {b}");
+            assert!(
+                seen.insert(byte_to_char(b) as u32),
+                "duplicate byte→char at {b}"
+            );
         }
     }
 

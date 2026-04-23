@@ -32,14 +32,7 @@ use crate::forward::ops::{matmul, rmsnorm, rope, softmax, swiglu};
 /// A no-op `NoopObserver` is provided for callers that don't want
 /// any hook.
 pub trait BlockObserver {
-    fn observe(
-        &mut self,
-        site: ActivationSite,
-        layer: usize,
-        x: &[f32],
-        rows: usize,
-        cols: usize,
-    );
+    fn observe(&mut self, site: ActivationSite, layer: usize, x: &[f32], rows: usize, cols: usize);
 }
 
 /// Zero-overhead observer that discards every callback.
@@ -114,16 +107,16 @@ impl BlockConfig {
 /// Reusable scratch for one block call. Caller owns the buffers so
 /// the whole forward pass can allocate once per token shape.
 pub struct BlockScratch {
-    pub norm_out: Vec<f32>,  // [seq, hidden]
-    pub q: Vec<f32>,         // [seq, n_heads * head_dim]
-    pub k: Vec<f32>,         // [seq, n_kv_heads * head_dim]
-    pub v: Vec<f32>,         // [seq, n_kv_heads * head_dim]
-    pub attn_out: Vec<f32>,  // [seq, n_heads * head_dim]
-    pub proj_out: Vec<f32>,  // [seq, hidden]
-    pub gate: Vec<f32>,      // [seq, ffn_dim]
-    pub up: Vec<f32>,        // [seq, ffn_dim]
+    pub norm_out: Vec<f32>,    // [seq, hidden]
+    pub q: Vec<f32>,           // [seq, n_heads * head_dim]
+    pub k: Vec<f32>,           // [seq, n_kv_heads * head_dim]
+    pub v: Vec<f32>,           // [seq, n_kv_heads * head_dim]
+    pub attn_out: Vec<f32>,    // [seq, n_heads * head_dim]
+    pub proj_out: Vec<f32>,    // [seq, hidden]
+    pub gate: Vec<f32>,        // [seq, ffn_dim]
+    pub up: Vec<f32>,          // [seq, ffn_dim]
     pub ffn_down_in: Vec<f32>, // [seq, ffn_dim]
-    pub scores: Vec<f32>,    // [seq] reused per (head, query)
+    pub scores: Vec<f32>,      // [seq] reused per (head, query)
 }
 
 impl BlockScratch {
@@ -273,17 +266,15 @@ pub fn forward_block(
         let kv_h = h / q_per_kv;
         for q_i in 0..seq_len {
             let q_pos = start_pos + q_i;
-            let q_vec = &scratch.q
-                [q_i * cfg.q_width() + h * cfg.head_dim
-                    ..q_i * cfg.q_width() + (h + 1) * cfg.head_dim];
+            let q_vec = &scratch.q[q_i * cfg.q_width() + h * cfg.head_dim
+                ..q_i * cfg.q_width() + (h + 1) * cfg.head_dim];
             for k_i in 0..total {
                 if k_i > q_pos {
                     scratch.scores[k_i] = f32::NEG_INFINITY;
                     continue;
                 }
-                let k_vec = &cache.k
-                    [k_i * cfg.kv_width() + kv_h * cfg.head_dim
-                        ..k_i * cfg.kv_width() + (kv_h + 1) * cfg.head_dim];
+                let k_vec = &cache.k[k_i * cfg.kv_width() + kv_h * cfg.head_dim
+                    ..k_i * cfg.kv_width() + (kv_h + 1) * cfg.head_dim];
                 let mut dot = 0.0_f32;
                 for d in 0..cfg.head_dim {
                     dot += q_vec[d] * k_vec[d];
@@ -292,9 +283,8 @@ pub fn forward_block(
             }
             softmax(&mut scratch.scores[..total]);
 
-            let out_slot = &mut scratch.attn_out
-                [q_i * cfg.q_width() + h * cfg.head_dim
-                    ..q_i * cfg.q_width() + (h + 1) * cfg.head_dim];
+            let out_slot = &mut scratch.attn_out[q_i * cfg.q_width() + h * cfg.head_dim
+                ..q_i * cfg.q_width() + (h + 1) * cfg.head_dim];
             for v in out_slot.iter_mut() {
                 *v = 0.0;
             }
@@ -303,9 +293,8 @@ pub fn forward_block(
                 if w == 0.0 {
                     continue;
                 }
-                let v_vec = &cache.v
-                    [k_i * cfg.kv_width() + kv_h * cfg.head_dim
-                        ..k_i * cfg.kv_width() + (kv_h + 1) * cfg.head_dim];
+                let v_vec = &cache.v[k_i * cfg.kv_width() + kv_h * cfg.head_dim
+                    ..k_i * cfg.kv_width() + (kv_h + 1) * cfg.head_dim];
                 for d in 0..cfg.head_dim {
                     out_slot[d] += w * v_vec[d];
                 }
@@ -331,7 +320,10 @@ pub fn forward_block(
     );
 
     // 6. Residual add: x ← x + proj_out.
-    for (xi, yi) in x.iter_mut().zip(scratch.proj_out[..seq_len * cfg.hidden].iter()) {
+    for (xi, yi) in x
+        .iter_mut()
+        .zip(scratch.proj_out[..seq_len * cfg.hidden].iter())
+    {
         *xi += *yi;
     }
 
@@ -394,7 +386,10 @@ pub fn forward_block(
     );
 
     // 11. Residual add.
-    for (xi, yi) in x.iter_mut().zip(scratch.proj_out[..seq_len * cfg.hidden].iter()) {
+    for (xi, yi) in x
+        .iter_mut()
+        .zip(scratch.proj_out[..seq_len * cfg.hidden].iter())
+    {
         *xi += *yi;
     }
 }
@@ -641,7 +636,8 @@ mod tests {
             assert!(
                 (x_a[d] - x_b[d]).abs() < 1e-5,
                 "causal mask broken: pos-0 differs after swapping later tokens ({} vs {})",
-                x_a[d], x_b[d],
+                x_a[d],
+                x_b[d],
             );
         }
     }
@@ -651,8 +647,9 @@ mod tests {
         // Shape conservation and no NaNs under GQA.
         let cfg = gqa_cfg();
         let w = OwnedBlockWeights::random(&cfg, 99);
-        let mut x: Vec<f32> =
-            (0..4 * cfg.hidden).map(|i| (i as f32 * 0.1).sin()).collect();
+        let mut x: Vec<f32> = (0..4 * cfg.hidden)
+            .map(|i| (i as f32 * 0.1).sin())
+            .collect();
         let start_len = x.len();
         let mut s = BlockScratch::new(&cfg, 4, 8);
         let mut cache = fresh_cache(&cfg, 8);
