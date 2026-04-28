@@ -13,6 +13,7 @@ use thiserror::Error;
 use crate::forward::awq::{ActivationSite, tensor_site_for_name};
 use crate::gguf::parser::GgufTensorInfo;
 use crate::stego::tensor_map::TensorMap;
+use crate::v2::pointer::Pointer;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompensationTarget {
@@ -26,6 +27,20 @@ pub struct CompensationTarget {
     pub output_channel: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompensationRegionKey {
+    pub tensor_name: String,
+    pub site: ActivationSite,
+    pub layer: usize,
+    pub output_channel: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompensationWriteRegion {
+    pub key: CompensationRegionKey,
+    pub input_channels: Vec<usize>,
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum CompensationTargetError {
     #[error("slot {slot} out of range (map has {slot_count} slots)")]
@@ -35,6 +50,19 @@ pub enum CompensationTargetError {
     WeightOutOfRange {
         slot: u16,
         weight_index: u64,
+        weight_count: u64,
+    },
+
+    #[error("pointer targets slot {slot}, which has no stealable bits")]
+    NonStealableSlot { slot: u16 },
+
+    #[error(
+        "pointer range [{start_weight}, {end_weight}) lies outside slot {slot} with {weight_count} weights"
+    )]
+    PointerOutOfBounds {
+        slot: u16,
+        start_weight: u32,
+        end_weight: u64,
         weight_count: u64,
     },
 
@@ -139,6 +167,68 @@ pub fn target_for_weight(
         input_channel: (weight_index % input_dim_raw) as usize,
         output_channel: (weight_index / input_dim_raw) as usize,
     }))
+}
+
+pub fn regions_for_pointer(
+    map: &TensorMap,
+    gguf_tensors: &[GgufTensorInfo],
+    pointer: Pointer,
+) -> Result<Vec<CompensationWriteRegion>, CompensationTargetError> {
+    if pointer.is_null() {
+        return Ok(Vec::new());
+    }
+
+    let slot =
+        map.slots
+            .get(pointer.slot as usize)
+            .ok_or(CompensationTargetError::SlotOutOfRange {
+                slot: pointer.slot,
+                slot_count: map.slots.len(),
+            })?;
+    let bpw = slot.stealable_bits_per_weight as u32;
+    if bpw == 0 {
+        return Err(CompensationTargetError::NonStealableSlot { slot: pointer.slot });
+    }
+
+    let covered_weights = pointer.length_in_bits.div_ceil(bpw);
+    let end_weight = u64::from(pointer.start_weight) + u64::from(covered_weights);
+    if end_weight > slot.weight_count {
+        return Err(CompensationTargetError::PointerOutOfBounds {
+            slot: pointer.slot,
+            start_weight: pointer.start_weight,
+            end_weight,
+            weight_count: slot.weight_count,
+        });
+    }
+
+    let mut regions: Vec<CompensationWriteRegion> = Vec::new();
+    for weight_index in pointer.start_weight..pointer.start_weight + covered_weights {
+        let Some(target) =
+            target_for_weight(map, gguf_tensors, pointer.slot, u64::from(weight_index))?
+        else {
+            continue;
+        };
+        let key = CompensationRegionKey {
+            tensor_name: target.tensor_name,
+            site: target.site,
+            layer: target.layer,
+            output_channel: target.output_channel,
+        };
+        let region = match regions.iter_mut().find(|r| r.key == key) {
+            Some(region) => region,
+            None => {
+                regions.push(CompensationWriteRegion {
+                    key,
+                    input_channels: Vec::new(),
+                });
+                regions.last_mut().expect("just pushed region")
+            }
+        };
+        if !region.input_channels.contains(&target.input_channel) {
+            region.input_channels.push(target.input_channel);
+        }
+    }
+    Ok(regions)
 }
 
 #[cfg(test)]
@@ -293,5 +383,98 @@ mod tests {
                 gguf_count: 15,
             }
         );
+    }
+
+    #[test]
+    fn pointer_groups_weights_by_tensor_site_layer_and_output_channel() {
+        let name = "blk.7.attn_q.weight";
+        let map = map(vec![slot(name, 12)]);
+        let tensors = vec![tensor(name, 4, 3)];
+        let ptr = Pointer {
+            slot: 0,
+            start_weight: 1,
+            length_in_bits: 32,
+            flags: 0,
+            reserved: 0,
+        };
+
+        let regions = regions_for_pointer(&map, &tensors, ptr).expect("regions");
+
+        assert_eq!(
+            regions,
+            vec![
+                CompensationWriteRegion {
+                    key: CompensationRegionKey {
+                        tensor_name: name.to_owned(),
+                        site: ActivationSite::QkvInput,
+                        layer: 7,
+                        output_channel: 0,
+                    },
+                    input_channels: vec![1, 2, 3],
+                },
+                CompensationWriteRegion {
+                    key: CompensationRegionKey {
+                        tensor_name: name.to_owned(),
+                        site: ActivationSite::QkvInput,
+                        layer: 7,
+                        output_channel: 1,
+                    },
+                    input_channels: vec![0, 1, 2, 3],
+                },
+                CompensationWriteRegion {
+                    key: CompensationRegionKey {
+                        tensor_name: name.to_owned(),
+                        site: ActivationSite::QkvInput,
+                        layer: 7,
+                        output_channel: 2,
+                    },
+                    input_channels: vec![0],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn pointer_partial_final_weight_is_included() {
+        let name = "blk.0.ffn_down.weight";
+        let map = map(vec![slot(name, 8)]);
+        let tensors = vec![tensor(name, 4, 2)];
+        let ptr = Pointer {
+            slot: 0,
+            start_weight: 0,
+            length_in_bits: 5,
+            flags: 0,
+            reserved: 0,
+        };
+
+        let regions = regions_for_pointer(&map, &tensors, ptr).expect("regions");
+
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].input_channels, vec![0, 1]);
+    }
+
+    #[test]
+    fn null_pointer_has_no_compensation_regions() {
+        let map = map(vec![slot("blk.0.attn_q.weight", 12)]);
+        let regions = regions_for_pointer(&map, &[], Pointer::NULL).expect("regions");
+        assert!(regions.is_empty());
+    }
+
+    #[test]
+    fn pointer_to_non_compensatable_tensor_has_no_regions() {
+        let name = "token_embd.weight";
+        let map = map(vec![slot(name, 12)]);
+        let tensors = vec![tensor(name, 4, 3)];
+        let ptr = Pointer {
+            slot: 0,
+            start_weight: 0,
+            length_in_bits: 8,
+            flags: 0,
+            reserved: 0,
+        };
+
+        let regions = regions_for_pointer(&map, &tensors, ptr).expect("regions");
+
+        assert!(regions.is_empty());
     }
 }
