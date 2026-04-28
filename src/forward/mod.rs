@@ -38,7 +38,10 @@ pub mod weights;
 // external-API shape.
 pub use awq::{ActivationSite, AwqCollector};
 pub use block::{BlockObserver, NoopObserver};
-pub use compensation_context::{CompensationTarget, CompensationTargetError, target_for_weight};
+pub use compensation_context::{
+    CompensationRegionKey, CompensationTarget, CompensationTargetError, CompensationWriteRegion,
+    regions_for_pointer, target_for_weight,
+};
 pub use config::{ConfigError, LlamaConfig};
 pub use hessian::HessianAccumulator;
 pub use hessian_cache::{CholeskyFactor, HessianFactorCache, LowRankFactor};
