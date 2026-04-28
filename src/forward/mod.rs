@@ -16,6 +16,7 @@
 pub mod awq;
 pub mod block;
 pub mod compensation;
+pub mod compensation_context;
 pub mod config;
 pub mod dequant;
 pub mod hessian;
@@ -37,9 +38,10 @@ pub mod weights;
 // external-API shape.
 pub use awq::{ActivationSite, AwqCollector};
 pub use block::{BlockObserver, NoopObserver};
+pub use compensation_context::{CompensationTarget, CompensationTargetError, target_for_weight};
+pub use config::{ConfigError, LlamaConfig};
 pub use hessian::HessianAccumulator;
 pub use hessian_cache::{CholeskyFactor, HessianFactorCache, LowRankFactor};
-pub use config::{ConfigError, LlamaConfig};
 pub use kv_cache::{KvCache, LayerKvCache};
 pub use model::{ForwardModel, ModelLoadError, ModelScratch};
 pub use perplexity::PerplexityError;

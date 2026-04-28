@@ -77,7 +77,10 @@ impl HessianAccumulator {
 
     /// Token count at `(site, layer)`, or 0 if unseen.
     pub fn token_count(&self, site: ActivationSite, layer: usize) -> u64 {
-        self.entries.get(&(site, layer)).map(|e| e.tokens).unwrap_or(0)
+        self.entries
+            .get(&(site, layer))
+            .map(|e| e.tokens)
+            .unwrap_or(0)
     }
 
     /// Raw upper-triangle sum `Σ_t x_t x_t^T` at `(site, layer)` —
@@ -114,14 +117,7 @@ impl HessianAccumulator {
 }
 
 impl BlockObserver for HessianAccumulator {
-    fn observe(
-        &mut self,
-        site: ActivationSite,
-        layer: usize,
-        x: &[f32],
-        rows: usize,
-        cols: usize,
-    ) {
+    fn observe(&mut self, site: ActivationSite, layer: usize, x: &[f32], rows: usize, cols: usize) {
         assert_eq!(
             x.len(),
             rows * cols,
@@ -130,11 +126,14 @@ impl BlockObserver for HessianAccumulator {
             rows,
             cols,
         );
-        let entry = self.entries.entry((site, layer)).or_insert_with(|| HessianEntry {
-            n: cols,
-            tri: vec![0.0_f64; cols * (cols + 1) / 2],
-            tokens: 0,
-        });
+        let entry = self
+            .entries
+            .entry((site, layer))
+            .or_insert_with(|| HessianEntry {
+                n: cols,
+                tri: vec![0.0_f64; cols * (cols + 1) / 2],
+                tokens: 0,
+            });
         assert_eq!(
             entry.n, cols,
             "observe({site:?}, layer={layer}): cols changed from {} to {cols}",
@@ -247,7 +246,9 @@ mod tests {
         for (slot, v) in expected.iter_mut().zip(single_token_triangle(&x2)) {
             *slot += v;
         }
-        let got = acc.raw_upper_triangle(ActivationSite::FfnDownInput, 2).unwrap();
+        let got = acc
+            .raw_upper_triangle(ActivationSite::FfnDownInput, 2)
+            .unwrap();
         for (g, e) in got.iter().zip(expected.iter()) {
             assert!((g - e).abs() < 1e-9, "got {g}, expected {e}");
         }
@@ -263,8 +264,14 @@ mod tests {
         // Same layer, different sites — same numerical content but
         // distinct keys.
         assert_eq!(acc.len(), 2);
-        assert!(acc.raw_upper_triangle(ActivationSite::QkvInput, 0).is_some());
-        assert!(acc.raw_upper_triangle(ActivationSite::FfnDownInput, 0).is_some());
+        assert!(
+            acc.raw_upper_triangle(ActivationSite::QkvInput, 0)
+                .is_some()
+        );
+        assert!(
+            acc.raw_upper_triangle(ActivationSite::FfnDownInput, 0)
+                .is_some()
+        );
         // And no accidental sharing of the vector.
         assert_eq!(acc.token_count(ActivationSite::QkvInput, 0), 1);
         assert_eq!(acc.token_count(ActivationSite::FfnDownInput, 0), 1);
@@ -287,7 +294,9 @@ mod tests {
         // contributes [[4,0,0],[0,0,0],[0,0,0]]; sum = [[16,0,0]...];
         // mean with T=4 = [[4,0,0]...]. Upper triangle mean = [4,0,0,0,0,0].
         let mut acc = HessianAccumulator::new();
-        let x = [2.0_f32, 0.0, 0.0, 2.0, 0.0, 0.0, 2.0, 0.0, 0.0, 2.0, 0.0, 0.0];
+        let x = [
+            2.0_f32, 0.0, 0.0, 2.0, 0.0, 0.0, 2.0, 0.0, 0.0, 2.0, 0.0, 0.0,
+        ];
         acc.observe(ActivationSite::QkvInput, 0, &x, 4, 3);
         let finalized = acc.finalize();
         let (n, tri) = finalized.get(&(ActivationSite::QkvInput, 0)).unwrap();
@@ -349,7 +358,9 @@ mod tests {
             flat.extend_from_slice(t);
         }
         acc.observe(ActivationSite::FfnDownInput, 5, &flat, 4, 4);
-        let tri = acc.raw_upper_triangle(ActivationSite::FfnDownInput, 5).unwrap();
+        let tri = acc
+            .raw_upper_triangle(ActivationSite::FfnDownInput, 5)
+            .unwrap();
 
         // Reconstruct full H from the upper triangle.
         let n = 4;
@@ -367,7 +378,11 @@ mod tests {
         // squares. Cheap PSD evidence; the full eigenvalue check
         // lives in the Python analyzer.
         for i in 0..n {
-            assert!(full[i * n + i] >= 0.0, "diag[{i}] = {} is negative", full[i * n + i]);
+            assert!(
+                full[i * n + i] >= 0.0,
+                "diag[{i}] = {} is negative",
+                full[i * n + i]
+            );
         }
         // Symmetry.
         for i in 0..n {

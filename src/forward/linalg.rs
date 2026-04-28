@@ -33,10 +33,12 @@ use crate::forward::hessian::upper_tri_offset;
 
 #[derive(Debug, Error)]
 pub enum CholeskyError {
-    #[error(
-        "input upper-triangle length {got} does not match n*(n+1)/2 = {expected} for n={n}"
-    )]
-    LengthMismatch { n: usize, expected: usize, got: usize },
+    #[error("input upper-triangle length {got} does not match n*(n+1)/2 = {expected} for n={n}")]
+    LengthMismatch {
+        n: usize,
+        expected: usize,
+        got: usize,
+    },
 
     #[error(
         "matrix not positive definite: diagonal at row {row} computed as sqrt({diag_sq}), \
@@ -47,10 +49,12 @@ pub enum CholeskyError {
 
 #[derive(Debug, Error)]
 pub enum PivotedCholeskyError {
-    #[error(
-        "input upper-triangle length {got} does not match n*(n+1)/2 = {expected} for n={n}"
-    )]
-    LengthMismatch { n: usize, expected: usize, got: usize },
+    #[error("input upper-triangle length {got} does not match n*(n+1)/2 = {expected} for n={n}")]
+    LengthMismatch {
+        n: usize,
+        expected: usize,
+        got: usize,
+    },
 
     #[error(
         "tolerance must be in [0, 1] (got {tolerance}) — interpreted as a \
@@ -234,7 +238,7 @@ pub fn obs_saliency(l: &[f32], n: usize) -> Vec<f32> {
 /// 3. Compute column `v_k` of length `N`:
 ///    - `v_k[p_k] = √R_k[p_k][p_k]`,
 ///    - `v_k[i] = R_k[i][p_k] / v_k[p_k]` for `i ≠ p_k`,
-///    where `R_k[i][p_k] = H[i][p_k] − Σ_{j<k} v_j[i] · v_j[p_k]`.
+///      where `R_k[i][p_k] = H[i][p_k] − Σ_{j<k} v_j[i] · v_j[p_k]`.
 /// 4. Update residual diagonal: `d_i ← d_i − v_k[i]²`; force
 ///    `d_{p_k} ← 0` to mark that position exhausted. Track the
 ///    incremental trace reduction `‖v_k‖²` for the next iteration's
@@ -284,9 +288,7 @@ pub fn pivoted_cholesky(
 
     // Residual diagonal. Starts as diag(H); decreases as we peel
     // off rank-1 updates.
-    let mut diagonal: Vec<f64> = (0..n)
-        .map(|i| h_at(h_upper, n, i, i) as f64)
-        .collect();
+    let mut diagonal: Vec<f64> = (0..n).map(|i| h_at(h_upper, n, i, i) as f64).collect();
     let initial_trace: f64 = diagonal.iter().copied().sum();
     // Track residual trace = sum of residual diagonal. Bound the
     // approximation error directly: `sum ≤ tolerance · initial_trace`
@@ -666,8 +668,8 @@ mod tests {
         let l_full = expand_lower(&l, n);
         for i in 0..n {
             let mut sum = 0.0_f64;
-            for k in 0..=i {
-                sum += l_full[i][k] as f64 * y[k] as f64;
+            for (k, &y_k) in y.iter().enumerate().take(i + 1) {
+                sum += l_full[i][k] as f64 * y_k as f64;
             }
             let got = sum as f32;
             assert!(
@@ -732,9 +734,21 @@ mod tests {
         l[lower_tri_offset(1, 1)] = 3.0;
         l[lower_tri_offset(2, 2)] = 4.0;
         let obs = obs_saliency(&l, n);
-        assert!((obs[0] - 4.0).abs() < 1e-5, "OBS[0] = {}, expected 4.0", obs[0]);
-        assert!((obs[1] - 9.0).abs() < 1e-5, "OBS[1] = {}, expected 9.0", obs[1]);
-        assert!((obs[2] - 16.0).abs() < 1e-5, "OBS[2] = {}, expected 16.0", obs[2]);
+        assert!(
+            (obs[0] - 4.0).abs() < 1e-5,
+            "OBS[0] = {}, expected 4.0",
+            obs[0]
+        );
+        assert!(
+            (obs[1] - 9.0).abs() < 1e-5,
+            "OBS[1] = {}, expected 9.0",
+            obs[1]
+        );
+        assert!(
+            (obs[2] - 16.0).abs() < 1e-5,
+            "OBS[2] = {}, expected 16.0",
+            obs[2]
+        );
     }
 
     #[test]
@@ -747,8 +761,16 @@ mod tests {
         let h = [4.0_f32, 2.0, 5.0];
         let l = cholesky(&h, 2).unwrap();
         let obs = obs_saliency(&l, 2);
-        assert!((obs[0] - 3.2).abs() < 1e-4, "OBS[0] = {}, expected 3.2", obs[0]);
-        assert!((obs[1] - 4.0).abs() < 1e-4, "OBS[1] = {}, expected 4.0", obs[1]);
+        assert!(
+            (obs[0] - 3.2).abs() < 1e-4,
+            "OBS[0] = {}, expected 3.2",
+            obs[0]
+        );
+        assert!(
+            (obs[1] - 4.0).abs() < 1e-4,
+            "OBS[1] = {}, expected 4.0",
+            obs[1]
+        );
     }
 
     #[test]
@@ -937,16 +959,13 @@ mod tests {
                 h[upper_tri_offset(n, i, j)] = vv + identity;
             }
         }
-        let initial_trace: f64 = (0..n)
-            .map(|i| h[upper_tri_offset(n, i, i)] as f64)
-            .sum();
+        let initial_trace: f64 = (0..n).map(|i| h[upper_tri_offset(n, i, i)] as f64).sum();
         let tolerance = 0.1_f32;
         let result = pivoted_cholesky(&h, n, tolerance, n).unwrap();
         // Residual trace = trace(H - V V^T) = Σ_i (H_ii - (V V^T)_ii).
         let residual_trace: f64 = (0..n)
             .map(|i| {
-                h[upper_tri_offset(n, i, i)] as f64
-                    - vvt_entry(&result.v, n, result.rank(), i, i)
+                h[upper_tri_offset(n, i, i)] as f64 - vvt_entry(&result.v, n, result.rank(), i, i)
             })
             .sum();
         assert!(

@@ -114,6 +114,21 @@ pub(crate) fn tensor_names_for(site: ActivationSite, layer: usize) -> Vec<String
     }
 }
 
+pub(crate) fn tensor_site_for_name(name: &str) -> Option<(ActivationSite, usize)> {
+    let rest = name.strip_prefix("blk.")?;
+    let (layer, rest) = rest.split_once('.')?;
+    let layer = layer.parse::<usize>().ok()?;
+    let tensor_kind = rest.strip_suffix(".weight")?;
+    let site = match tensor_kind {
+        "attn_q" | "attn_k" | "attn_v" => ActivationSite::QkvInput,
+        "attn_output" => ActivationSite::AttnOutputInput,
+        "ffn_gate" | "ffn_up" => ActivationSite::FfnGateUpInput,
+        "ffn_down" => ActivationSite::FfnDownInput,
+        _ => return None,
+    };
+    Some((site, layer))
+}
+
 impl BlockObserver for AwqCollector {
     fn observe(&mut self, site: ActivationSite, layer: usize, x: &[f32], rows: usize, cols: usize) {
         assert_eq!(x.len(), rows * cols);

@@ -167,15 +167,15 @@ fn exercise_full_pipeline(label: &str, h: &[f32], n: usize, region_size: usize) 
     let mut max_h_delta_j: f64 = 0.0;
     for c in &op.c_indices {
         let mut sum = 0.0_f64;
-        for k in 0..n {
-            sum += h_entry(h, n, *c, k) * delta[k] as f64;
+        for (k, &delta_k) in delta.iter().enumerate() {
+            sum += h_entry(h, n, *c, k) * delta_k as f64;
         }
         max_residual_c = max_residual_c.max(sum.abs());
     }
     for j in &op.region {
         let mut sum = 0.0_f64;
-        for k in 0..n {
-            sum += h_entry(h, n, *j, k) * delta[k] as f64;
+        for (k, &delta_k) in delta.iter().enumerate() {
+            sum += h_entry(h, n, *j, k) * delta_k as f64;
         }
         max_h_delta_j = max_h_delta_j.max(sum.abs());
     }
@@ -231,8 +231,18 @@ fn math_layer_on_real_ffn_down_input_layer_0() {
 fn math_layer_on_real_all_sites_layer_0() {
     let cases: &[(&str, &str, usize, usize)] = &[
         ("qkv_input/layer=0", "00_qkv_input.f32", 576, 16),
-        ("attn_output_input/layer=0", "00_attn_output_input.f32", 576, 16),
-        ("ffn_gate_up_input/layer=0", "00_ffn_gate_up_input.f32", 576, 16),
+        (
+            "attn_output_input/layer=0",
+            "00_attn_output_input.f32",
+            576,
+            16,
+        ),
+        (
+            "ffn_gate_up_input/layer=0",
+            "00_ffn_gate_up_input.f32",
+            576,
+            16,
+        ),
         ("ffn_down_input/layer=0", "00_ffn_down_input.f32", 1536, 48),
     ];
     let mut any_ran = false;

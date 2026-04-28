@@ -258,7 +258,10 @@ mod tests {
         cache.insert(ActivationSite::QkvInput, 0, f1);
         let f2 = synthetic_factor(4);
         let replaced = cache.insert(ActivationSite::QkvInput, 0, f2);
-        assert!(replaced.is_some(), "overwrite must return the previous factor");
+        assert!(
+            replaced.is_some(),
+            "overwrite must return the previous factor"
+        );
     }
 
     #[test]
@@ -307,10 +310,8 @@ mod tests {
         let mut cache = HessianFactorCache::new();
         cache.insert(ActivationSite::QkvInput, 0, synthetic_factor(4));
         cache.insert(ActivationSite::FfnDownInput, 5, synthetic_factor(8));
-        let seen: Vec<(ActivationSite, usize)> = cache
-            .iter()
-            .map(|(site, layer, _)| (site, layer))
-            .collect();
+        let seen: Vec<(ActivationSite, usize)> =
+            cache.iter().map(|(site, layer, _)| (site, layer)).collect();
         assert_eq!(seen.len(), 2);
         assert!(seen.contains(&(ActivationSite::QkvInput, 0)));
         assert!(seen.contains(&(ActivationSite::FfnDownInput, 5)));
@@ -349,8 +350,7 @@ mod tests {
     fn low_rank_factor_bytes_resident_counts_both_storages() {
         // n=4, rank=2 → 8 f32 entries in v + 2 usize entries in pivots.
         let f = LowRankFactor::new(4, vec![0, 1], vec![0.0_f32; 8]);
-        let expected =
-            8 * std::mem::size_of::<f32>() + 2 * std::mem::size_of::<usize>();
+        let expected = 8 * std::mem::size_of::<f32>() + 2 * std::mem::size_of::<usize>();
         assert_eq!(f.bytes_resident(), expected);
     }
 

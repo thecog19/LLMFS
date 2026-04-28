@@ -114,34 +114,18 @@ pub fn dequantize_row_into(
         GgufQuantType::F32 => dequant_f32(src, dst),
         GgufQuantType::F16 => dequant_f16(src, dst),
         GgufQuantType::Q8_0 => dequant_q8_0(src, dst),
-        GgufQuantType::Q3K => dequant_k_quant(
-            quant,
-            src,
-            dst,
-            q3_k::BLOCK_BYTES,
-            q3_k::read_weight_value,
-        ),
-        GgufQuantType::Q4K => dequant_k_quant(
-            quant,
-            src,
-            dst,
-            q4_k::BLOCK_BYTES,
-            q4_k::read_weight_value,
-        ),
-        GgufQuantType::Q5K => dequant_k_quant(
-            quant,
-            src,
-            dst,
-            q5_k::BLOCK_BYTES,
-            q5_k::read_weight_value,
-        ),
-        GgufQuantType::Q6K => dequant_k_quant(
-            quant,
-            src,
-            dst,
-            q6_k::BLOCK_BYTES,
-            q6_k::read_weight_value,
-        ),
+        GgufQuantType::Q3K => {
+            dequant_k_quant(quant, src, dst, q3_k::BLOCK_BYTES, q3_k::read_weight_value)
+        }
+        GgufQuantType::Q4K => {
+            dequant_k_quant(quant, src, dst, q4_k::BLOCK_BYTES, q4_k::read_weight_value)
+        }
+        GgufQuantType::Q5K => {
+            dequant_k_quant(quant, src, dst, q5_k::BLOCK_BYTES, q5_k::read_weight_value)
+        }
+        GgufQuantType::Q6K => {
+            dequant_k_quant(quant, src, dst, q6_k::BLOCK_BYTES, q6_k::read_weight_value)
+        }
         other => Err(DequantError::Unsupported { quant: other }),
     }
 }
@@ -551,7 +535,12 @@ mod tests {
         // Q2_K is in the enum but has no packing module yet.
         let err = dequantize_row(GgufQuantType::Q2K, &[0u8; 256]).unwrap_err();
         assert!(
-            matches!(err, DequantError::Unsupported { quant: GgufQuantType::Q2K }),
+            matches!(
+                err,
+                DequantError::Unsupported {
+                    quant: GgufQuantType::Q2K
+                }
+            ),
             "expected Unsupported(Q2K), got {err:?}",
         );
     }
@@ -566,7 +555,10 @@ mod tests {
         assert_eq!(weight_count(GgufQuantType::F32, 17), None);
         assert_eq!(weight_count(GgufQuantType::Q8_0, 33), None);
         // K-quants: one block = 256 weights.
-        assert_eq!(weight_count(GgufQuantType::Q4K, q4_k::BLOCK_BYTES), Some(256));
+        assert_eq!(
+            weight_count(GgufQuantType::Q4K, q4_k::BLOCK_BYTES),
+            Some(256)
+        );
         assert_eq!(
             weight_count(GgufQuantType::Q6K, q6_k::BLOCK_BYTES * 3),
             Some(768),

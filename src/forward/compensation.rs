@@ -110,14 +110,13 @@ impl CompensationOperator {
             self.region_size(),
         );
         let c = self.free_size();
-        let r = self.region_size();
         let mut out = vec![0.0_f32; c];
-        for i in 0..c {
+        for (i, out_i) in out.iter_mut().enumerate() {
             let mut sum = 0.0_f64;
-            for j in 0..r {
-                sum += self.m[j * c + i] as f64 * delta_r[j] as f64;
+            for (j, &delta_j) in delta_r.iter().enumerate() {
+                sum += self.m[j * c + i] as f64 * delta_j as f64;
             }
-            out[i] = sum as f32;
+            *out_i = sum as f32;
         }
         out
     }
@@ -189,8 +188,8 @@ pub fn compensation_operator(
     }
 
     // 3. Cholesky-factor the r×r submatrix.
-    let l_rr = cholesky(&hinv_rr, r)
-        .map_err(|e| CompensationError::SubmatrixCholesky { source: e })?;
+    let l_rr =
+        cholesky(&hinv_rr, r).map_err(|e| CompensationError::SubmatrixCholesky { source: e })?;
 
     // 4. For each free channel c, solve inv(H)[R,R] · x =
     //    (inv(H)[c, R])ᵀ to get the c-th row of M_R (as an
@@ -500,8 +499,8 @@ mod tests {
             // Check (H Δ) at each free channel ≈ 0.
             for &c in &op.c_indices {
                 let mut sum = 0.0_f64;
-                for k in 0..n {
-                    sum += h_entry(&h, n, c, k) * delta[k] as f64;
+                for (k, &delta_k) in delta.iter().enumerate() {
+                    sum += h_entry(&h, n, c, k) * delta_k as f64;
                 }
                 assert!(
                     sum.abs() < 1e-3,

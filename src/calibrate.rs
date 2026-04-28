@@ -266,14 +266,14 @@ pub fn run_full_forward(
     // for non-singular factorization. If it doesn't, surface a clear
     // error instead of letting Cholesky detect the failure deeper in
     // the pipeline.
-    if let Some(((_, _), (n_max, _))) = finalized.iter().max_by_key(|(_, (n, _))| *n) {
-        if *n_max > token_count {
-            return Err(CalibrateError::CorpusTooShortForFull {
-                got: token_count,
-                need: *n_max,
-                n_max: *n_max,
-            });
-        }
+    if let Some(((_, _), (n_max, _))) = finalized.iter().max_by_key(|(_, (n, _))| *n)
+        && *n_max > token_count
+    {
+        return Err(CalibrateError::CorpusTooShortForFull {
+            got: token_count,
+            need: *n_max,
+            n_max: *n_max,
+        });
     }
 
     let mut per_tensor = HashMap::new();

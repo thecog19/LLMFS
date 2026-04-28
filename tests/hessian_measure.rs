@@ -30,9 +30,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use llmdb::forward::{
-    ActivationSite, ForwardModel, HessianAccumulator, KvCache, ModelScratch,
-};
+use llmdb::forward::{ActivationSite, ForwardModel, HessianAccumulator, KvCache, ModelScratch};
 
 const SMOLLM2_Q8_0: &str = "models/smollm2-135m-q8_0.gguf";
 const SMOLLM2_F16: &str = "models/smollm2-135m-f16.gguf";
@@ -166,9 +164,8 @@ fn run_dump(model_path: &str, cover_tag: &str, target_tokens: usize) {
         let mut f = fs::File::create(&fpath).expect("create dump file");
         // Little-endian F32 per entry, via a single bytemuck-free
         // write_all over the raw bytes.
-        let byte_slice: &[u8] = unsafe {
-            std::slice::from_raw_parts(tri.as_ptr() as *const u8, tri.len() * 4)
-        };
+        let byte_slice: &[u8] =
+            unsafe { std::slice::from_raw_parts(tri.as_ptr() as *const u8, tri.len() * 4) };
         f.write_all(byte_slice).expect("write triangle");
         total_bytes += byte_slice.len() as u64;
 

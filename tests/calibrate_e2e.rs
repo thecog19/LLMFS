@@ -96,14 +96,8 @@ fn calibrate_and_assert(
     );
     assert_eq!(pre.salience_slot_count, 0);
 
-    let summary = run_calibration(
-        &mut fs,
-        path,
-        &map,
-        DEFAULT_CALIBRATION_CORPUS,
-        mode,
-    )
-    .expect("calibrate");
+    let summary =
+        run_calibration(&mut fs, path, &map, DEFAULT_CALIBRATION_CORPUS, mode).expect("calibrate");
     eprintln!(
         "calibration: {} tokens, {}/{} slots",
         summary.token_count, summary.populated_slot_count, summary.total_slot_count,

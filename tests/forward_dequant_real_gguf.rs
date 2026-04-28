@@ -200,10 +200,7 @@ fn smollm2_q8_0_full_model_loads_through_weight_loader() {
     assert_eq!(weights.embedding.len(), cfg.vocab_size * cfg.hidden_dim);
     assert_eq!(weights.blocks.len(), cfg.n_layers);
     let b0 = &weights.blocks[0];
-    assert_eq!(
-        b0.wq.len(),
-        cfg.n_heads * cfg.head_dim * cfg.hidden_dim,
-    );
+    assert_eq!(b0.wq.len(), cfg.n_heads * cfg.head_dim * cfg.hidden_dim,);
     // Every dequantized weight finite, non-degenerate magnitudes.
     // 332k weights in attn_q; a handful of trained-outlier
     // positions at ±5 or so is normal, and Q8_0 can round those

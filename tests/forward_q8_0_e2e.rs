@@ -130,8 +130,12 @@ fn q8_0_vs_f16_perplexity_diagnostic() {
         tokens_f16.len(),
     );
     let ctx_len = 128;
-    let ppl_f16 = f16.perplexity(&tokens_f16[..ctx_len], ctx_len).expect("ppl f16");
-    let ppl_q8 = q8.perplexity(&tokens_q8[..ctx_len], ctx_len).expect("ppl q8_0");
+    let ppl_f16 = f16
+        .perplexity(&tokens_f16[..ctx_len], ctx_len)
+        .expect("ppl f16");
+    let ppl_q8 = q8
+        .perplexity(&tokens_q8[..ctx_len], ctx_len)
+        .expect("ppl q8_0");
     eprintln!("F16  ppl on {ctx_len} tokens: {ppl_f16:.3}");
     eprintln!("Q8_0 ppl on {ctx_len} tokens: {ppl_q8:.3}");
     eprintln!(
