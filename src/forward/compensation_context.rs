@@ -13,6 +13,7 @@ use thiserror::Error;
 use crate::forward::awq::{ActivationSite, tensor_site_for_name};
 use crate::gguf::parser::GgufTensorInfo;
 use crate::stego::tensor_map::TensorMap;
+use crate::v2::chunk::WeightDelta;
 use crate::v2::pointer::Pointer;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +40,16 @@ pub struct CompensationRegionKey {
 pub struct CompensationWriteRegion {
     pub key: CompensationRegionKey,
     pub input_channels: Vec<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompensationWriteDeltaRegion {
+    pub key: CompensationRegionKey,
+    /// Sorted input-channel indices. This order matches `deltas` and
+    /// can be passed to `compensation_operator` as the region.
+    pub input_channels: Vec<usize>,
+    /// Signed forced perturbations for `input_channels`.
+    pub deltas: Vec<f32>,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -229,6 +240,73 @@ pub fn regions_for_pointer(
         }
     }
     Ok(regions)
+}
+
+pub fn delta_regions_for_weight_deltas(
+    map: &TensorMap,
+    gguf_tensors: &[GgufTensorInfo],
+    deltas: &[WeightDelta],
+) -> Result<Vec<CompensationWriteDeltaRegion>, CompensationTargetError> {
+    let mut regions: Vec<CompensationWriteDeltaRegion> = Vec::new();
+    for delta in deltas {
+        let value_delta = delta.delta();
+        if value_delta == 0.0 {
+            continue;
+        }
+        let Some(target) = target_for_weight(map, gguf_tensors, delta.slot, delta.weight_index)?
+        else {
+            continue;
+        };
+        let key = CompensationRegionKey {
+            tensor_name: target.tensor_name,
+            site: target.site,
+            layer: target.layer,
+            output_channel: target.output_channel,
+        };
+        let region = match regions.iter_mut().find(|r| r.key == key) {
+            Some(region) => region,
+            None => {
+                regions.push(CompensationWriteDeltaRegion {
+                    key,
+                    input_channels: Vec::new(),
+                    deltas: Vec::new(),
+                });
+                regions.last_mut().expect("just pushed region")
+            }
+        };
+        match region
+            .input_channels
+            .iter()
+            .position(|&channel| channel == target.input_channel)
+        {
+            Some(index) => region.deltas[index] += value_delta,
+            None => {
+                region.input_channels.push(target.input_channel);
+                region.deltas.push(value_delta);
+            }
+        }
+    }
+
+    for region in &mut regions {
+        sort_region_deltas(region);
+    }
+    Ok(regions)
+}
+
+fn sort_region_deltas(region: &mut CompensationWriteDeltaRegion) {
+    let mut pairs: Vec<(usize, f32)> = region
+        .input_channels
+        .iter()
+        .copied()
+        .zip(region.deltas.iter().copied())
+        .collect();
+    pairs.sort_unstable_by_key(|(channel, _)| *channel);
+    region.input_channels.clear();
+    region.deltas.clear();
+    for (channel, delta) in pairs {
+        region.input_channels.push(channel);
+        region.deltas.push(delta);
+    }
 }
 
 #[cfg(test)]
@@ -474,6 +552,97 @@ mod tests {
         };
 
         let regions = regions_for_pointer(&map, &tensors, ptr).expect("regions");
+
+        assert!(regions.is_empty());
+    }
+
+    #[test]
+    fn weight_deltas_group_into_operator_ready_delta_regions() {
+        let name = "blk.7.attn_q.weight";
+        let map = map(vec![slot(name, 12)]);
+        let tensors = vec![tensor(name, 4, 3)];
+        let deltas = vec![
+            WeightDelta {
+                slot: 0,
+                weight_index: 5,
+                before: 10.0,
+                after: 12.0,
+            },
+            WeightDelta {
+                slot: 0,
+                weight_index: 4,
+                before: 2.0,
+                after: 1.0,
+            },
+            WeightDelta {
+                slot: 0,
+                weight_index: 1,
+                before: 0.0,
+                after: 0.25,
+            },
+            WeightDelta {
+                slot: 0,
+                weight_index: 5,
+                before: 0.0,
+                after: 3.0,
+            },
+        ];
+
+        let regions = delta_regions_for_weight_deltas(&map, &tensors, &deltas).expect("regions");
+
+        assert_eq!(
+            regions,
+            vec![
+                CompensationWriteDeltaRegion {
+                    key: CompensationRegionKey {
+                        tensor_name: name.to_owned(),
+                        site: ActivationSite::QkvInput,
+                        layer: 7,
+                        output_channel: 1,
+                    },
+                    input_channels: vec![0, 1],
+                    deltas: vec![-1.0, 5.0],
+                },
+                CompensationWriteDeltaRegion {
+                    key: CompensationRegionKey {
+                        tensor_name: name.to_owned(),
+                        site: ActivationSite::QkvInput,
+                        layer: 7,
+                        output_channel: 0,
+                    },
+                    input_channels: vec![1],
+                    deltas: vec![0.25],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn weight_delta_regions_skip_zero_and_non_compensatable_targets() {
+        let map = map(vec![
+            slot("blk.0.attn_q.weight", 4),
+            slot("token_embd.weight", 4),
+        ]);
+        let tensors = vec![
+            tensor("blk.0.attn_q.weight", 2, 2),
+            tensor("token_embd.weight", 2, 2),
+        ];
+        let deltas = vec![
+            WeightDelta {
+                slot: 0,
+                weight_index: 0,
+                before: 1.0,
+                after: 1.0,
+            },
+            WeightDelta {
+                slot: 1,
+                weight_index: 0,
+                before: 1.0,
+                after: 2.0,
+            },
+        ];
+
+        let regions = delta_regions_for_weight_deltas(&map, &tensors, &deltas).expect("regions");
 
         assert!(regions.is_empty());
     }

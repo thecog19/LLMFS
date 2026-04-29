@@ -1,10 +1,12 @@
 use llmdb::forward::{
-    ActivationSite, CompensationRegionKey, CompensationWriteRegion, regions_for_pointer,
+    ActivationSite, CompensationRegionKey, CompensationWriteDeltaRegion, CompensationWriteRegion,
+    delta_regions_for_weight_deltas, regions_for_pointer,
 };
 use llmdb::gguf::parser::GgufTensorInfo;
 use llmdb::gguf::quant::GgufQuantType;
 use llmdb::stego::planner::TensorTier;
 use llmdb::stego::tensor_map::{TensorMap, TensorSlot};
+use llmdb::v2::chunk::WeightDelta;
 use llmdb::v2::pointer::Pointer;
 
 #[test]
@@ -51,6 +53,32 @@ fn forward_reexports_pointer_region_api() {
                 output_channel: 0,
             },
             input_channels: vec![0, 1],
+        }]
+    );
+
+    let delta_regions = delta_regions_for_weight_deltas(
+        &map,
+        &tensors,
+        &[WeightDelta {
+            slot: 0,
+            weight_index: 0,
+            before: 1.0,
+            after: 1.5,
+        }],
+    )
+    .expect("delta regions");
+
+    assert_eq!(
+        delta_regions,
+        vec![CompensationWriteDeltaRegion {
+            key: CompensationRegionKey {
+                tensor_name: name.to_owned(),
+                site: ActivationSite::QkvInput,
+                layer: 0,
+                output_channel: 0,
+            },
+            input_channels: vec![0],
+            deltas: vec![0.5],
         }]
     );
 }

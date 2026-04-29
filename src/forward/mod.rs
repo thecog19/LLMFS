@@ -39,7 +39,8 @@ pub mod weights;
 pub use awq::{ActivationSite, AwqCollector};
 pub use block::{BlockObserver, NoopObserver};
 pub use compensation_context::{
-    CompensationRegionKey, CompensationTarget, CompensationTargetError, CompensationWriteRegion,
+    CompensationRegionKey, CompensationTarget, CompensationTargetError,
+    CompensationWriteDeltaRegion, CompensationWriteRegion, delta_regions_for_weight_deltas,
     regions_for_pointer, target_for_weight,
 };
 pub use config::{ConfigError, LlamaConfig};
