@@ -3,9 +3,11 @@
 //!
 //! This module implements the single-weight case from
 //! [`docs/compensation-design.md §1.1`](../../../docs/compensation-design.md).
-//! Multi-weight regions, the `M_R` operator cache, Sherman-Morrison
-//! online maintenance, and the mask-and-correct dirty-weight path
-//! are later Phase E slices.
+//! Multi-weight regions are represented by [`CompensationOperator`].
+//! Applying cached factors to concrete write deltas is handled by
+//! [`apply_cached_compensation`]. The `M_R` operator cache,
+//! Sherman-Morrison online maintenance, and the mask-and-correct
+//! dirty-weight path are later Phase E slices.
 //!
 //! ## The single-weight case
 //!
@@ -36,7 +38,10 @@
 
 use thiserror::Error;
 
+use crate::forward::awq::ActivationSite;
+use crate::forward::compensation_context::{CompensationRegionKey, CompensationWriteDeltaRegion};
 use crate::forward::hessian::upper_tri_offset;
+use crate::forward::hessian_cache::HessianFactorCache;
 use crate::forward::linalg::{
     CholeskyError, cholesky, h_inv_column, solve_lower, solve_lower_transposed,
 };
@@ -54,6 +59,46 @@ pub enum CompensationError {
         #[source]
         source: CholeskyError,
     },
+}
+
+#[derive(Debug, Error)]
+pub enum CompensationApplyError {
+    #[error("missing Hessian factor for {site:?} layer {layer}")]
+    MissingFactor { site: ActivationSite, layer: usize },
+
+    #[error(
+        "delta region for {site:?} layer {layer} output channel {output_channel} has \
+         {input_channels} input channels but {deltas} deltas"
+    )]
+    DeltaLengthMismatch {
+        site: ActivationSite,
+        layer: usize,
+        output_channel: usize,
+        input_channels: usize,
+        deltas: usize,
+    },
+
+    #[error("compensation operator for {site:?} layer {layer}: {source}")]
+    Operator {
+        site: ActivationSite,
+        layer: usize,
+        #[source]
+        source: CompensationError,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AppliedCompensationRegion {
+    pub key: CompensationRegionKey,
+    /// Forced channels from the original write region, sorted to
+    /// match the order consumed by the compensation operator.
+    pub forced_input_channels: Vec<usize>,
+    /// Free channels receiving compensation. This order matches
+    /// `compensation_deltas`.
+    pub compensation_input_channels: Vec<usize>,
+    /// Signed optimal compensation perturbations for
+    /// `compensation_input_channels`.
+    pub compensation_deltas: Vec<f32>,
 }
 
 /// Compensation operator `M_R = -H_CC⁻¹ H_CR` for a region `R` of
@@ -219,6 +264,69 @@ pub fn compensation_operator(
     })
 }
 
+/// Resolve concrete write-delta regions against cached layer
+/// Cholesky factors and return the compensation-channel deltas for
+/// each row-local region.
+///
+/// This is the hot-path boundary between V2 chunk writes and the
+/// compensation math: callers provide signed forced perturbations
+/// grouped by `(tensor, site, layer, output_channel)`, and this
+/// function computes `Δ_C = M_R · Δ_R` using the factor cache. It
+/// does not mutate cover weights; a later write-path slice consumes
+/// [`AppliedCompensationRegion`] and applies those deltas to the
+/// corresponding clean compensation weights.
+pub fn apply_cached_compensation(
+    cache: &HessianFactorCache,
+    regions: &[CompensationWriteDeltaRegion],
+) -> Result<Vec<AppliedCompensationRegion>, CompensationApplyError> {
+    let mut applied = Vec::with_capacity(regions.len());
+    for region in regions {
+        if region.input_channels.len() != region.deltas.len() {
+            return Err(CompensationApplyError::DeltaLengthMismatch {
+                site: region.key.site,
+                layer: region.key.layer,
+                output_channel: region.key.output_channel,
+                input_channels: region.input_channels.len(),
+                deltas: region.deltas.len(),
+            });
+        }
+
+        let factor = cache.get(region.key.site, region.key.layer).ok_or(
+            CompensationApplyError::MissingFactor {
+                site: region.key.site,
+                layer: region.key.layer,
+            },
+        )?;
+        let (forced_input_channels, deltas) = sorted_region_deltas(region);
+        let operator = compensation_operator(&factor.l, factor.n, &forced_input_channels).map_err(
+            |source| CompensationApplyError::Operator {
+                site: region.key.site,
+                layer: region.key.layer,
+                source,
+            },
+        )?;
+        let compensation_deltas = operator.apply(&deltas);
+        applied.push(AppliedCompensationRegion {
+            key: region.key.clone(),
+            forced_input_channels,
+            compensation_input_channels: operator.c_indices,
+            compensation_deltas,
+        });
+    }
+    Ok(applied)
+}
+
+fn sorted_region_deltas(region: &CompensationWriteDeltaRegion) -> (Vec<usize>, Vec<f32>) {
+    let mut pairs: Vec<(usize, f32)> = region
+        .input_channels
+        .iter()
+        .copied()
+        .zip(region.deltas.iter().copied())
+        .collect();
+    pairs.sort_unstable_by_key(|(channel, _)| *channel);
+    pairs.into_iter().unzip()
+}
+
 /// Compensation factor vector for a forced perturbation at input
 /// channel `j` of a layer whose Hessian is represented by the
 /// lower-triangle-packed Cholesky factor `l`.
@@ -257,7 +365,12 @@ pub fn single_weight_compensation_vector(l: &[f32], n: usize, j: usize) -> Vec<f
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::forward::awq::ActivationSite;
+    use crate::forward::compensation_context::{
+        CompensationRegionKey, CompensationWriteDeltaRegion,
+    };
     use crate::forward::hessian::upper_tri_offset;
+    use crate::forward::hessian_cache::{CholeskyFactor, HessianFactorCache};
     use crate::forward::linalg::cholesky;
 
     #[test]
@@ -520,5 +633,154 @@ mod tests {
             op.apply(&[1.0_f32, 2.0]);
         });
         assert!(result.is_err(), "apply should panic on wrong length");
+    }
+
+    #[test]
+    fn cached_compensation_applies_factor_to_delta_regions() {
+        // H = [[4, 2], [2, 5]]
+        // For forced channel 0, M_R gives channel 1 a factor of -0.4.
+        let h = [4.0_f32, 2.0, 5.0];
+        let l = cholesky(&h, 2).unwrap();
+        let mut cache = HessianFactorCache::new();
+        cache.insert(ActivationSite::QkvInput, 0, CholeskyFactor::new(2, l));
+
+        let region = CompensationWriteDeltaRegion {
+            key: CompensationRegionKey {
+                tensor_name: "blk.0.attn_q.weight".to_owned(),
+                site: ActivationSite::QkvInput,
+                layer: 0,
+                output_channel: 3,
+            },
+            input_channels: vec![0],
+            deltas: vec![10.0],
+        };
+
+        let applied = apply_cached_compensation(&cache, std::slice::from_ref(&region)).unwrap();
+
+        assert_eq!(applied.len(), 1);
+        assert_eq!(applied[0].key, region.key);
+        assert_eq!(applied[0].forced_input_channels, vec![0]);
+        assert_eq!(applied[0].compensation_input_channels, vec![1]);
+        assert!(
+            (applied[0].compensation_deltas[0] - (-4.0)).abs() < 1e-4,
+            "compensation delta = {}",
+            applied[0].compensation_deltas[0],
+        );
+    }
+
+    #[test]
+    fn cached_compensation_reports_missing_factor() {
+        let region = CompensationWriteDeltaRegion {
+            key: CompensationRegionKey {
+                tensor_name: "blk.2.ffn_down.weight".to_owned(),
+                site: ActivationSite::FfnDownInput,
+                layer: 2,
+                output_channel: 0,
+            },
+            input_channels: vec![0],
+            deltas: vec![1.0],
+        };
+
+        let err = apply_cached_compensation(&HessianFactorCache::new(), &[region]).unwrap_err();
+
+        assert!(matches!(
+            err,
+            CompensationApplyError::MissingFactor {
+                site: ActivationSite::FfnDownInput,
+                layer: 2
+            }
+        ));
+    }
+
+    #[test]
+    fn cached_compensation_propagates_operator_errors() {
+        let mut cache = HessianFactorCache::new();
+        cache.insert(
+            ActivationSite::QkvInput,
+            0,
+            CholeskyFactor::new(1, vec![1.0]),
+        );
+        let region = CompensationWriteDeltaRegion {
+            key: CompensationRegionKey {
+                tensor_name: "blk.0.attn_q.weight".to_owned(),
+                site: ActivationSite::QkvInput,
+                layer: 0,
+                output_channel: 0,
+            },
+            input_channels: vec![2],
+            deltas: vec![1.0],
+        };
+
+        let err = apply_cached_compensation(&cache, &[region]).unwrap_err();
+
+        assert!(matches!(
+            err,
+            CompensationApplyError::Operator {
+                site: ActivationSite::QkvInput,
+                layer: 0,
+                source: CompensationError::RegionIndexOutOfRange { n: 1, index: 2 }
+            }
+        ));
+    }
+
+    #[test]
+    fn cached_compensation_reports_delta_length_mismatch() {
+        let region = CompensationWriteDeltaRegion {
+            key: CompensationRegionKey {
+                tensor_name: "blk.0.attn_q.weight".to_owned(),
+                site: ActivationSite::QkvInput,
+                layer: 0,
+                output_channel: 1,
+            },
+            input_channels: vec![0, 1],
+            deltas: vec![1.0],
+        };
+
+        let err = apply_cached_compensation(&HessianFactorCache::new(), &[region]).unwrap_err();
+
+        assert!(matches!(
+            err,
+            CompensationApplyError::DeltaLengthMismatch {
+                site: ActivationSite::QkvInput,
+                layer: 0,
+                output_channel: 1,
+                input_channels: 2,
+                deltas: 1
+            }
+        ));
+    }
+
+    #[test]
+    fn cached_compensation_sorts_channels_without_losing_deltas() {
+        let n = 3;
+        let h = spd_upper(&[1.0_f32, -0.5, 2.0]);
+        let l = cholesky(&h, n).unwrap();
+        let expected = compensation_operator(&l, n, &[0, 1])
+            .unwrap()
+            .apply(&[10.0, 2.0]);
+        let mut cache = HessianFactorCache::new();
+        cache.insert(ActivationSite::QkvInput, 0, CholeskyFactor::new(n, l));
+
+        let region = CompensationWriteDeltaRegion {
+            key: CompensationRegionKey {
+                tensor_name: "blk.0.attn_q.weight".to_owned(),
+                site: ActivationSite::QkvInput,
+                layer: 0,
+                output_channel: 0,
+            },
+            input_channels: vec![1, 0],
+            deltas: vec![2.0, 10.0],
+        };
+
+        let applied = apply_cached_compensation(&cache, &[region]).unwrap();
+
+        assert_eq!(applied[0].forced_input_channels, vec![0, 1]);
+        assert_eq!(applied[0].compensation_input_channels, vec![2]);
+        assert!(
+            (applied[0].compensation_deltas[0] - expected[0]).abs() < 1e-5,
+            "compensation delta = {}, expected {}",
+            applied[0].compensation_deltas[0],
+            expected[0],
+        );
     }
 }

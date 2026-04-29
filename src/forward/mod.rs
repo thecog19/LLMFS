@@ -38,6 +38,9 @@ pub mod weights;
 // external-API shape.
 pub use awq::{ActivationSite, AwqCollector};
 pub use block::{BlockObserver, NoopObserver};
+pub use compensation::{
+    AppliedCompensationRegion, CompensationApplyError, apply_cached_compensation,
+};
 pub use compensation_context::{
     CompensationRegionKey, CompensationTarget, CompensationTargetError,
     CompensationWriteDeltaRegion, CompensationWriteRegion, delta_regions_for_weight_deltas,

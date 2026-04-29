@@ -1,6 +1,8 @@
+use llmdb::forward::linalg::cholesky;
 use llmdb::forward::{
-    ActivationSite, CompensationRegionKey, CompensationWriteDeltaRegion, CompensationWriteRegion,
-    delta_regions_for_weight_deltas, regions_for_pointer,
+    ActivationSite, AppliedCompensationRegion, CholeskyFactor, CompensationRegionKey,
+    CompensationWriteDeltaRegion, CompensationWriteRegion, HessianFactorCache,
+    apply_cached_compensation, delta_regions_for_weight_deltas, regions_for_pointer,
 };
 use llmdb::gguf::parser::GgufTensorInfo;
 use llmdb::gguf::quant::GgufQuantType;
@@ -80,5 +82,40 @@ fn forward_reexports_pointer_region_api() {
             input_channels: vec![0],
             deltas: vec![0.5],
         }]
+    );
+
+    let mut cache = HessianFactorCache::new();
+    cache.insert(
+        ActivationSite::QkvInput,
+        0,
+        CholeskyFactor::new(2, cholesky(&[4.0_f32, 2.0, 5.0], 2).unwrap()),
+    );
+
+    let applied = apply_cached_compensation(&cache, &delta_regions).expect("applied");
+
+    let expected = AppliedCompensationRegion {
+        key: CompensationRegionKey {
+            tensor_name: name.to_owned(),
+            site: ActivationSite::QkvInput,
+            layer: 0,
+            output_channel: 0,
+        },
+        forced_input_channels: vec![0],
+        compensation_input_channels: vec![1],
+        compensation_deltas: vec![-0.2],
+    };
+    assert_eq!(applied[0].key, expected.key);
+    assert_eq!(
+        applied[0].forced_input_channels,
+        expected.forced_input_channels
+    );
+    assert_eq!(
+        applied[0].compensation_input_channels,
+        expected.compensation_input_channels
+    );
+    assert!(
+        (applied[0].compensation_deltas[0] - expected.compensation_deltas[0]).abs() < 1e-6,
+        "compensation delta = {}",
+        applied[0].compensation_deltas[0],
     );
 }
