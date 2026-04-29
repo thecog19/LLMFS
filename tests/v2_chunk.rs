@@ -13,9 +13,12 @@
 //! byte_io convention so the two modules are inter-operable.
 
 use llmdb::gguf::quant::GgufQuantType;
+use llmdb::stego::packing::float::f16_to_f32;
 use llmdb::stego::planner::TensorTier;
 use llmdb::stego::tensor_map::{TensorMap, TensorSlot};
-use llmdb::v2::chunk::{ChunkError, read_chunk, write_chunk};
+use llmdb::v2::chunk::{
+    ChunkError, WeightDelta, read_chunk, write_chunk, write_chunk_with_weight_deltas,
+};
 use llmdb::v2::pointer::Pointer;
 
 // ------------------------------------------------------------------
@@ -295,6 +298,103 @@ fn q8_0_chunk_round_trip() {
     let mut out = [0u8; 16];
     read_chunk(&cover, &map, ptr, 0, &mut out).expect("read");
     assert_eq!(out, data);
+}
+
+#[test]
+fn write_chunk_with_weight_deltas_reports_signed_f16_changes() {
+    let mut cover = f16_cover(&[1.0, -2.0]);
+    let slot = f16_slot(2, 0);
+    let map = single_slot_map(slot);
+    let ptr = Pointer {
+        slot: 0,
+        start_weight: 0,
+        length_in_bits: 8,
+        flags: 0,
+        reserved: 0,
+    };
+
+    let deltas = write_chunk_with_weight_deltas(&mut cover, &map, ptr, 0, &[0x21])
+        .expect("write with deltas");
+
+    assert_eq!(
+        deltas,
+        vec![
+            WeightDelta {
+                slot: 0,
+                weight_index: 0,
+                before: f16_to_f32(0x3C00),
+                after: f16_to_f32(0x3C01),
+            },
+            WeightDelta {
+                slot: 0,
+                weight_index: 1,
+                before: f16_to_f32(0xC000),
+                after: f16_to_f32(0xC002),
+            },
+        ]
+    );
+    assert_eq!(deltas[0].delta(), deltas[0].after - deltas[0].before);
+}
+
+#[test]
+fn write_chunk_with_weight_deltas_reports_signed_q8_0_changes() {
+    let (slot, mut cover) = q8_0_block(&[16, -16], 0.5);
+    let map = single_slot_map(slot);
+    let ptr = Pointer {
+        slot: 0,
+        start_weight: 0,
+        length_in_bits: 8,
+        flags: 0,
+        reserved: 0,
+    };
+
+    let deltas = write_chunk_with_weight_deltas(&mut cover, &map, ptr, 0, &[0x21])
+        .expect("write with deltas");
+
+    assert_eq!(
+        deltas,
+        vec![
+            WeightDelta {
+                slot: 0,
+                weight_index: 0,
+                before: 8.0,
+                after: 8.5,
+            },
+            WeightDelta {
+                slot: 0,
+                weight_index: 1,
+                before: -8.0,
+                after: -7.0,
+            },
+        ]
+    );
+}
+
+#[test]
+fn write_chunk_with_weight_deltas_only_reports_live_tail_weights() {
+    let mut cover = f16_cover(&[0.0, 0.0, 0.0]);
+    let slot = f16_slot(3, 0);
+    let map = single_slot_map(slot);
+    let ptr = Pointer {
+        slot: 0,
+        start_weight: 0,
+        length_in_bits: 12,
+        flags: 0,
+        reserved: 0,
+    };
+
+    let deltas = write_chunk_with_weight_deltas(&mut cover, &map, ptr, 1, &[0xFF])
+        .expect("partial tail write with deltas");
+
+    assert_eq!(
+        deltas,
+        vec![WeightDelta {
+            slot: 0,
+            weight_index: 2,
+            before: 0.0,
+            after: f16_to_f32(0x000F),
+        }]
+    );
 }
 
 #[test]

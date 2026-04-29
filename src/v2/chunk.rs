@@ -37,8 +37,9 @@
 use thiserror::Error;
 
 use crate::stego::calibration::bit_io::{read_bit, write_bit};
+use crate::stego::calibration::magnitude::read_weight_value;
 use crate::stego::calibration::placement::MetadataBitPos;
-use crate::stego::tensor_map::TensorMap;
+use crate::stego::tensor_map::{TensorMap, TensorSlot};
 use crate::v2::pointer::Pointer;
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -64,6 +65,25 @@ pub enum ChunkError {
         end_weight: u64,
         weight_count: u64,
     },
+}
+
+/// Signed change to one model weight caused by a chunk write.
+///
+/// `before` and `after` are decoded with the same quant-specific
+/// reader used by calibration, so `delta()` is the forced model-space
+/// perturbation that Phase E compensation consumes for this weight.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WeightDelta {
+    pub slot: u16,
+    pub weight_index: u64,
+    pub before: f32,
+    pub after: f32,
+}
+
+impl WeightDelta {
+    pub fn delta(&self) -> f32 {
+        self.after - self.before
+    }
 }
 
 /// Bytes addressable through the chunk — `ceil(length_in_bits / 8)`.
@@ -119,6 +139,59 @@ pub fn write_chunk(
     let bits_per_weight = bits_per_weight(slot, pointer.slot)?;
     validate_pointer_range(slot, pointer, bits_per_weight)?;
     check_bounds(pointer, byte_offset, data.len() as u64)?;
+    write_chunk_bits(mmap, slot, pointer, bits_per_weight, byte_offset, data);
+    Ok(())
+}
+
+/// Write `data` with the same semantics as [`write_chunk`], returning
+/// one [`WeightDelta`] per weight whose stealable bits were in the
+/// live write range.
+///
+/// The returned vector includes zero-delta entries when a touched
+/// weight's payload bits decode back to the same model value. Callers
+/// can filter on [`WeightDelta::delta`] when they only need non-zero
+/// perturbations.
+pub fn write_chunk_with_weight_deltas(
+    mmap: &mut [u8],
+    map: &TensorMap,
+    pointer: Pointer,
+    byte_offset: u64,
+    data: &[u8],
+) -> Result<Vec<WeightDelta>, ChunkError> {
+    let slot = resolve_slot(map, pointer)?;
+    let bits_per_weight = bits_per_weight(slot, pointer.slot)?;
+    validate_pointer_range(slot, pointer, bits_per_weight)?;
+    check_bounds(pointer, byte_offset, data.len() as u64)?;
+
+    let mut deltas: Vec<WeightDelta> =
+        touched_weight_indices(pointer, bits_per_weight, byte_offset, data.len() as u64)
+            .map(|weight_index| {
+                let before = read_weight_value(mmap, slot, weight_index);
+                WeightDelta {
+                    slot: pointer.slot,
+                    weight_index,
+                    before,
+                    after: before,
+                }
+            })
+            .collect();
+
+    write_chunk_bits(mmap, slot, pointer, bits_per_weight, byte_offset, data);
+
+    for delta in &mut deltas {
+        delta.after = read_weight_value(mmap, slot, delta.weight_index);
+    }
+    Ok(deltas)
+}
+
+fn write_chunk_bits(
+    mmap: &mut [u8],
+    slot: &TensorSlot,
+    pointer: Pointer,
+    bits_per_weight: u64,
+    byte_offset: u64,
+    data: &[u8],
+) {
     let bit_len = pointer.length_in_bits as u64;
     for (i, &byte) in data.iter().enumerate() {
         let chunk_bit_base = (byte_offset + i as u64) * 8;
@@ -130,13 +203,9 @@ pub fn write_chunk(
             write_bit(mmap, slot, pos, bit);
         }
     }
-    Ok(())
 }
 
-fn resolve_slot(
-    map: &TensorMap,
-    pointer: Pointer,
-) -> Result<&crate::stego::tensor_map::TensorSlot, ChunkError> {
+fn resolve_slot(map: &TensorMap, pointer: Pointer) -> Result<&TensorSlot, ChunkError> {
     map.slots
         .get(pointer.slot as usize)
         .ok_or(ChunkError::SlotOutOfRange {
@@ -145,10 +214,7 @@ fn resolve_slot(
         })
 }
 
-fn bits_per_weight(
-    slot: &crate::stego::tensor_map::TensorSlot,
-    slot_index: u16,
-) -> Result<u64, ChunkError> {
+fn bits_per_weight(slot: &TensorSlot, slot_index: u16) -> Result<u64, ChunkError> {
     let bits = slot.stealable_bits_per_weight as u64;
     if bits == 0 {
         Err(ChunkError::NonStealableSlot { slot: slot_index })
@@ -158,7 +224,7 @@ fn bits_per_weight(
 }
 
 fn validate_pointer_range(
-    slot: &crate::stego::tensor_map::TensorSlot,
+    slot: &TensorSlot,
     pointer: Pointer,
     bits_per_weight: u64,
 ) -> Result<(), ChunkError> {
@@ -177,6 +243,24 @@ fn validate_pointer_range(
         });
     }
     Ok(())
+}
+
+fn touched_weight_indices(
+    pointer: Pointer,
+    bits_per_weight: u64,
+    byte_offset: u64,
+    len: u64,
+) -> impl Iterator<Item = u64> {
+    let start_bit = byte_offset * 8;
+    let end_bit = (start_bit + len * 8).min(pointer.length_in_bits as u64);
+    let start_weight = u64::from(pointer.start_weight);
+    let start = start_weight + start_bit / bits_per_weight;
+    let end = if start_bit >= end_bit {
+        start
+    } else {
+        start_weight + (end_bit - 1) / bits_per_weight + 1
+    };
+    start..end
 }
 
 fn check_bounds(pointer: Pointer, byte_offset: u64, len: u64) -> Result<(), ChunkError> {
