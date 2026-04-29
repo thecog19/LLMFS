@@ -44,9 +44,9 @@ pub use compensation::{
 pub use compensation_context::{
     CompensatedChunkWrite, CompensatedChunkWriteError, CompensationCoverApplyError,
     CompensationRegionKey, CompensationTarget, CompensationTargetError,
-    CompensationWriteDeltaRegion, CompensationWriteRegion, apply_compensation_to_cover,
-    delta_regions_for_weight_deltas, regions_for_pointer, target_for_weight,
-    write_chunk_with_cached_compensation,
+    CompensationWriteDeltaRegion, CompensationWriteRegion, apply_compensation_to_clean_cover,
+    apply_compensation_to_cover, delta_regions_for_weight_deltas, regions_for_pointer,
+    target_for_weight, write_chunk_with_cached_compensation,
 };
 pub use config::{ConfigError, LlamaConfig};
 pub use hessian::HessianAccumulator;

@@ -1,10 +1,10 @@
 use llmdb::forward::linalg::cholesky;
 use llmdb::forward::{
     ActivationSite, AppliedCompensationRegion, CholeskyFactor, CompensatedChunkWriteError,
-    CompensationApplyError, CompensationRegionKey, CompensationWriteDeltaRegion,
-    CompensationWriteRegion, HessianFactorCache, apply_cached_compensation,
-    apply_compensation_to_cover, delta_regions_for_weight_deltas, regions_for_pointer,
-    write_chunk_with_cached_compensation,
+    CompensationApplyError, CompensationCoverApplyError, CompensationRegionKey,
+    CompensationWriteDeltaRegion, CompensationWriteRegion, HessianFactorCache,
+    apply_cached_compensation, apply_compensation_to_clean_cover, apply_compensation_to_cover,
+    delta_regions_for_weight_deltas, regions_for_pointer, write_chunk_with_cached_compensation,
 };
 use llmdb::gguf::parser::GgufTensorInfo;
 use llmdb::gguf::quant::GgufQuantType;
@@ -12,6 +12,7 @@ use llmdb::stego::packing::float::f16_to_f32;
 use llmdb::stego::planner::TensorTier;
 use llmdb::stego::tensor_map::{TensorMap, TensorSlot};
 use llmdb::v2::chunk::WeightDelta;
+use llmdb::v2::dirty::DirtyBitmap;
 use llmdb::v2::pointer::Pointer;
 
 #[test]
@@ -220,6 +221,40 @@ fn apply_compensation_to_cover_rejects_mismatched_region_without_mutation() {
         .expect_err("mismatched compensation region");
 
     assert!(format!("{err}").contains("2 compensation channels but 1 deltas"));
+    assert_eq!(cover, before_cover);
+}
+
+#[test]
+fn apply_compensation_to_clean_cover_rejects_dirty_targets_without_mutation() {
+    let name = "blk.0.attn_q.weight";
+    let mut cover = f16_cover_bits(&[0x3C00, 0x4000, 0x4200, 0x4400]);
+    let before_cover = cover.clone();
+    let map = f16_tensor_map(name, 4);
+    let tensors = vec![tensor(name, 2, 2)];
+    let mut dirty = DirtyBitmap::new(&map);
+    dirty.mark(0, 2);
+    let region = AppliedCompensationRegion {
+        key: CompensationRegionKey {
+            tensor_name: name.to_owned(),
+            site: ActivationSite::QkvInput,
+            layer: 0,
+            output_channel: 1,
+        },
+        forced_input_channels: vec![1],
+        compensation_input_channels: vec![0],
+        compensation_deltas: vec![f16_to_f32(0x4205) - f16_to_f32(0x4200)],
+    };
+
+    let err = apply_compensation_to_clean_cover(&mut cover, &map, &tensors, &dirty, &[region])
+        .expect_err("dirty compensation target");
+
+    assert!(matches!(
+        err,
+        CompensationCoverApplyError::DirtyCompensationTarget {
+            slot: 0,
+            weight_index: 2,
+        }
+    ));
     assert_eq!(cover, before_cover);
 }
 

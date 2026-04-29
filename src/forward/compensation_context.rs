@@ -21,6 +21,7 @@ use crate::stego::tensor_map::TensorMap;
 use crate::v2::chunk::{
     ChunkError, WeightDelta, write_chunk_with_weight_deltas, write_weight_nearest_value,
 };
+use crate::v2::dirty::DirtyBitmap;
 use crate::v2::pointer::Pointer;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,6 +135,12 @@ pub enum CompensationCoverApplyError {
         #[from]
         source: ChunkError,
     },
+
+    #[error("compensation target slot {slot} weight {weight_index} is dirty")]
+    DirtyCompensationTarget { slot: u16, weight_index: u64 },
+
+    #[error("dirty bitmap cannot address slot {slot} weight {weight_index}")]
+    DirtyWeightIndexTooLarge { slot: u16, weight_index: u64 },
 
     #[error(
         "applied compensation region for tensor '{tensor}' output channel {output_channel} has \
@@ -374,6 +381,26 @@ pub fn apply_compensation_to_cover(
     gguf_tensors: &[GgufTensorInfo],
     regions: &[AppliedCompensationRegion],
 ) -> Result<Vec<WeightDelta>, CompensationCoverApplyError> {
+    apply_compensation_to_cover_impl(mmap, map, gguf_tensors, None, regions)
+}
+
+pub fn apply_compensation_to_clean_cover(
+    mmap: &mut [u8],
+    map: &TensorMap,
+    gguf_tensors: &[GgufTensorInfo],
+    dirty: &DirtyBitmap,
+    regions: &[AppliedCompensationRegion],
+) -> Result<Vec<WeightDelta>, CompensationCoverApplyError> {
+    apply_compensation_to_cover_impl(mmap, map, gguf_tensors, Some(dirty), regions)
+}
+
+fn apply_compensation_to_cover_impl(
+    mmap: &mut [u8],
+    map: &TensorMap,
+    gguf_tensors: &[GgufTensorInfo],
+    dirty: Option<&DirtyBitmap>,
+    regions: &[AppliedCompensationRegion],
+) -> Result<Vec<WeightDelta>, CompensationCoverApplyError> {
     let mut planned = Vec::new();
     for region in regions {
         if region.compensation_input_channels.len() != region.compensation_deltas.len() {
@@ -407,6 +434,20 @@ pub fn apply_compensation_to_cover(
             }
             let weight_index =
                 region.key.output_channel as u64 * layout.input_dim as u64 + input_channel as u64;
+            if let Some(dirty) = dirty {
+                let dirty_weight_index = u32::try_from(weight_index).map_err(|_| {
+                    CompensationCoverApplyError::DirtyWeightIndexTooLarge {
+                        slot: layout.slot_index,
+                        weight_index,
+                    }
+                })?;
+                if dirty.is_dirty(layout.slot_index, dirty_weight_index) {
+                    return Err(CompensationCoverApplyError::DirtyCompensationTarget {
+                        slot: layout.slot_index,
+                        weight_index,
+                    });
+                }
+            }
             let before = read_weight_value(mmap, slot, weight_index);
             let target = before + delta;
             if !target.is_finite() {
