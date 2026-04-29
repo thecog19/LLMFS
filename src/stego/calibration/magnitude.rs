@@ -46,6 +46,34 @@ pub fn read_weight_abs(mmap: &[u8], slot: &TensorSlot, weight_index: u64) -> f32
     }
 }
 
+/// Read the signed value of a single weight from the mmap'd cover
+/// file. This is the delta-facing companion to [`read_weight_abs`]:
+/// Phase E compensation needs `after - before`, not just salience
+/// magnitude.
+///
+/// Non-stealable quant types return `0.0`, matching
+/// [`read_weight_abs`]'s convention. Supported stego quant types share
+/// the same decode paths as magnitude ranking so both views stay in
+/// lockstep.
+pub fn read_weight_value(mmap: &[u8], slot: &TensorSlot, weight_index: u64) -> f32 {
+    match slot.quant_type {
+        GgufQuantType::F16 => read_f16_value(mmap, slot.data_offset, weight_index),
+        GgufQuantType::F32 => read_f32_value(mmap, slot.data_offset, weight_index),
+        GgufQuantType::Q8_0 => read_q8_0_value(mmap, slot.data_offset, weight_index),
+        GgufQuantType::Q3K => read_q3_k_value(mmap, slot.data_offset, weight_index),
+        GgufQuantType::Q4K => read_q4_k_value(mmap, slot.data_offset, weight_index),
+        GgufQuantType::Q5K => read_q5_k_value(mmap, slot.data_offset, weight_index),
+        GgufQuantType::Q6K => read_q6_k_value(mmap, slot.data_offset, weight_index),
+        GgufQuantType::Q2K
+        | GgufQuantType::Q4_0
+        | GgufQuantType::Q4_1
+        | GgufQuantType::Q5_0
+        | GgufQuantType::Q5_1
+        | GgufQuantType::Q8_1
+        | GgufQuantType::Q8K => 0.0,
+    }
+}
+
 /// Read the **ceiling magnitude** of a single weight:
 /// `max_over_stealable_bit_values(|w|)`. Invariant under any V2 write
 /// — depends only on the non-stealable bits of the weight and the
@@ -185,54 +213,72 @@ fn read_kquant_ceiling(mmap: &[u8], slot: &TensorSlot, weight_index: u64) -> f32
 }
 
 fn read_q3_k_abs(mmap: &[u8], data_offset: u64, weight_index: u64) -> f32 {
+    read_q3_k_value(mmap, data_offset, weight_index).abs()
+}
+
+fn read_q3_k_value(mmap: &[u8], data_offset: u64, weight_index: u64) -> f32 {
     let block_weights = q3_k::WEIGHTS_PER_BLOCK as u64;
     let block_bytes = q3_k::BLOCK_BYTES;
     let block_idx = weight_index / block_weights;
     let in_block = (weight_index % block_weights) as usize;
     let block_start = data_offset as usize + block_idx as usize * block_bytes;
     let block = &mmap[block_start..block_start + block_bytes];
-    q3_k::read_weight_value(block, in_block)
-        .expect("q3_k weight read invariant violated")
-        .abs()
+    q3_k::read_weight_value(block, in_block).expect("q3_k weight read invariant violated")
 }
 
 fn read_q4_k_abs(mmap: &[u8], data_offset: u64, weight_index: u64) -> f32 {
+    read_q4_k_value(mmap, data_offset, weight_index).abs()
+}
+
+fn read_q4_k_value(mmap: &[u8], data_offset: u64, weight_index: u64) -> f32 {
     let block_weights = q4_k::WEIGHTS_PER_BLOCK as u64;
     let block_bytes = q4_k::BLOCK_BYTES;
     let block_idx = weight_index / block_weights;
     let in_block = (weight_index % block_weights) as usize;
     let block_start = data_offset as usize + block_idx as usize * block_bytes;
     let block = &mmap[block_start..block_start + block_bytes];
-    q4_k::read_weight_value(block, in_block)
-        .expect("q4_k weight read invariant violated")
-        .abs()
+    q4_k::read_weight_value(block, in_block).expect("q4_k weight read invariant violated")
 }
 
 fn read_q5_k_abs(mmap: &[u8], data_offset: u64, weight_index: u64) -> f32 {
+    read_q5_k_value(mmap, data_offset, weight_index).abs()
+}
+
+fn read_q5_k_value(mmap: &[u8], data_offset: u64, weight_index: u64) -> f32 {
     let block_weights = q5_k::WEIGHTS_PER_BLOCK as u64;
     let block_bytes = q5_k::BLOCK_BYTES;
     let block_idx = weight_index / block_weights;
     let in_block = (weight_index % block_weights) as usize;
     let block_start = data_offset as usize + block_idx as usize * block_bytes;
     let block = &mmap[block_start..block_start + block_bytes];
-    q5_k::read_weight_value(block, in_block)
-        .expect("q5_k weight read invariant violated")
-        .abs()
+    q5_k::read_weight_value(block, in_block).expect("q5_k weight read invariant violated")
 }
 
 fn read_f16_abs(mmap: &[u8], data_offset: u64, weight_index: u64) -> f32 {
+    read_f16_value(mmap, data_offset, weight_index).abs()
+}
+
+fn read_f16_value(mmap: &[u8], data_offset: u64, weight_index: u64) -> f32 {
     let off = (data_offset + weight_index * 2) as usize;
     let bits = u16::from_le_bytes([mmap[off], mmap[off + 1]]);
-    float::f16_to_f32(bits).abs()
+    float::f16_to_f32(bits)
 }
 
 fn read_f32_abs(mmap: &[u8], data_offset: u64, weight_index: u64) -> f32 {
+    read_f32_value(mmap, data_offset, weight_index).abs()
+}
+
+fn read_f32_value(mmap: &[u8], data_offset: u64, weight_index: u64) -> f32 {
     let off = (data_offset + weight_index * 4) as usize;
     let bits = u32::from_le_bytes([mmap[off], mmap[off + 1], mmap[off + 2], mmap[off + 3]]);
-    f32::from_bits(bits).abs()
+    f32::from_bits(bits)
 }
 
 fn read_q8_0_abs(mmap: &[u8], data_offset: u64, weight_index: u64) -> f32 {
+    read_q8_0_value(mmap, data_offset, weight_index).abs()
+}
+
+fn read_q8_0_value(mmap: &[u8], data_offset: u64, weight_index: u64) -> f32 {
     // Q8_0 layout: per 32-weight block, 2-byte fp16 scale followed by
     // 32 int8 values (34 bytes total).
     const BLOCK_WEIGHTS: u64 = 32;
@@ -243,10 +289,14 @@ fn read_q8_0_abs(mmap: &[u8], data_offset: u64, weight_index: u64) -> f32 {
     let scale_bits = u16::from_le_bytes([mmap[block_off], mmap[block_off + 1]]);
     let scale = float::f16_to_f32(scale_bits);
     let int8 = mmap[block_off + 2 + in_block] as i8;
-    (int8 as f32 * scale).abs()
+    int8 as f32 * scale
 }
 
 fn read_q6_k_abs(mmap: &[u8], data_offset: u64, weight_index: u64) -> f32 {
+    read_q6_k_value(mmap, data_offset, weight_index).abs()
+}
+
+fn read_q6_k_value(mmap: &[u8], data_offset: u64, weight_index: u64) -> f32 {
     let block_weights = q6_k::WEIGHTS_PER_BLOCK as u64;
     let block_bytes = q6_k::BLOCK_BYTES;
     let block_idx = weight_index / block_weights;
@@ -256,9 +306,7 @@ fn read_q6_k_abs(mmap: &[u8], data_offset: u64, weight_index: u64) -> f32 {
     // The packer's value reader does its own bounds checks. If they
     // ever fail it's a programmer error (calibration walked off-tensor),
     // hence panic.
-    q6_k::read_weight_value(block, in_block)
-        .expect("q6_k weight read invariant violated")
-        .abs()
+    q6_k::read_weight_value(block, in_block).expect("q6_k weight read invariant violated")
 }
 
 /// Return the `n` lowest-`|w|` weights across all slots in `map`,
@@ -423,7 +471,27 @@ impl PartialOrd for F32Ord {
 mod tests {
     use super::*;
 
+    use crate::gguf::quant::GgufQuantType;
     use crate::stego::packing::float::f16_to_f32;
+    use crate::stego::planner::TensorTier;
+
+    fn test_slot(
+        quant_type: GgufQuantType,
+        weight_count: u64,
+        stealable_bits_per_weight: usize,
+    ) -> TensorSlot {
+        TensorSlot {
+            name: "test.weight".to_owned(),
+            quant_type,
+            tier: TensorTier::Tier1,
+            data_offset: 0,
+            weight_count,
+            stealable_bits_per_weight,
+            capacity_bits: weight_count * stealable_bits_per_weight as u64,
+            bit_start: 0,
+            bit_end: weight_count * stealable_bits_per_weight as u64,
+        }
+    }
 
     #[test]
     fn f16_to_f32_decodes_canonical_values() {
@@ -488,6 +556,30 @@ mod tests {
         assert_eq!(read_q8_0_abs(&buf, 0, 0), 1.0);
         // Block 1, weight 0 (weight_index 32): |2 * 3| = 6.0
         assert_eq!(read_q8_0_abs(&buf, 0, 32), 6.0);
+    }
+
+    #[test]
+    fn read_weight_value_preserves_f16_sign() {
+        // 1.0 = 0x3C00, -2.0 = 0xC000.
+        let mmap = vec![0x00, 0x3C, 0x00, 0xC0];
+        let slot = test_slot(GgufQuantType::F16, 2, 4);
+
+        assert_eq!(read_weight_value(&mmap, &slot, 0), 1.0);
+        assert_eq!(read_weight_value(&mmap, &slot, 1), -2.0);
+    }
+
+    #[test]
+    fn read_weight_value_preserves_q8_0_sign() {
+        // Scale = 0.5 (fp16 0x3800). Weights: [4, -8, 0, ...].
+        let mut block = vec![0_u8; 34];
+        block[0] = 0x00;
+        block[1] = 0x38;
+        block[2] = 4;
+        block[3] = (-8_i8) as u8;
+        let slot = test_slot(GgufQuantType::Q8_0, 32, 4);
+
+        assert_eq!(read_weight_value(&block, &slot, 0), 2.0);
+        assert_eq!(read_weight_value(&block, &slot, 1), -4.0);
     }
 
     #[test]
