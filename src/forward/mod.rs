@@ -42,10 +42,11 @@ pub use compensation::{
     AppliedCompensationRegion, CompensationApplyError, apply_cached_compensation,
 };
 pub use compensation_context::{
-    CompensationCoverApplyError, CompensationRegionKey, CompensationTarget,
-    CompensationTargetError, CompensationWriteDeltaRegion, CompensationWriteRegion,
-    apply_compensation_to_cover, delta_regions_for_weight_deltas, regions_for_pointer,
-    target_for_weight,
+    CompensatedChunkWrite, CompensatedChunkWriteError, CompensationCoverApplyError,
+    CompensationRegionKey, CompensationTarget, CompensationTargetError,
+    CompensationWriteDeltaRegion, CompensationWriteRegion, apply_compensation_to_cover,
+    delta_regions_for_weight_deltas, regions_for_pointer, target_for_weight,
+    write_chunk_with_cached_compensation,
 };
 pub use config::{ConfigError, LlamaConfig};
 pub use hessian::HessianAccumulator;

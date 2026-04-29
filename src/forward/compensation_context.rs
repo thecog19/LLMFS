@@ -11,11 +11,16 @@
 use thiserror::Error;
 
 use crate::forward::awq::{ActivationSite, tensor_site_for_name};
-use crate::forward::compensation::AppliedCompensationRegion;
+use crate::forward::compensation::{
+    AppliedCompensationRegion, CompensationApplyError, apply_cached_compensation,
+};
+use crate::forward::hessian_cache::HessianFactorCache;
 use crate::gguf::parser::GgufTensorInfo;
 use crate::stego::calibration::magnitude::read_weight_value;
 use crate::stego::tensor_map::TensorMap;
-use crate::v2::chunk::{ChunkError, WeightDelta, write_weight_nearest_value};
+use crate::v2::chunk::{
+    ChunkError, WeightDelta, write_chunk_with_weight_deltas, write_weight_nearest_value,
+};
 use crate::v2::pointer::Pointer;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +57,12 @@ pub struct CompensationWriteDeltaRegion {
     pub input_channels: Vec<usize>,
     /// Signed forced perturbations for `input_channels`.
     pub deltas: Vec<f32>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompensatedChunkWrite {
+    pub forced_deltas: Vec<WeightDelta>,
+    pub compensation_deltas: Vec<WeightDelta>,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -151,6 +162,33 @@ pub enum CompensationCoverApplyError {
         tensor: String,
         input_channel: usize,
         input_dim: usize,
+    },
+}
+
+#[derive(Debug, Error)]
+pub enum CompensatedChunkWriteError {
+    #[error("chunk I/O: {source}")]
+    Chunk {
+        #[from]
+        source: ChunkError,
+    },
+
+    #[error("compensation target: {source}")]
+    Target {
+        #[from]
+        source: CompensationTargetError,
+    },
+
+    #[error("compensation apply: {source}")]
+    Apply {
+        #[from]
+        source: CompensationApplyError,
+    },
+
+    #[error("cover apply: {source}")]
+    Cover {
+        #[from]
+        source: CompensationCoverApplyError,
     },
 }
 
@@ -292,6 +330,42 @@ pub fn regions_for_pointer(
         }
     }
     Ok(regions)
+}
+
+pub fn write_chunk_with_cached_compensation(
+    mmap: &mut [u8],
+    map: &TensorMap,
+    gguf_tensors: &[GgufTensorInfo],
+    cache: &HessianFactorCache,
+    pointer: Pointer,
+    byte_offset: u64,
+    data: &[u8],
+) -> Result<CompensatedChunkWrite, CompensatedChunkWriteError> {
+    let preflight_regions: Vec<CompensationWriteDeltaRegion> =
+        regions_for_pointer(map, gguf_tensors, pointer)?
+            .into_iter()
+            .map(|region| {
+                let delta_count = region.input_channels.len();
+                CompensationWriteDeltaRegion {
+                    key: region.key,
+                    input_channels: region.input_channels,
+                    deltas: vec![0.0; delta_count],
+                }
+            })
+            .collect();
+    apply_cached_compensation(cache, &preflight_regions)?;
+
+    let forced_deltas = write_chunk_with_weight_deltas(mmap, map, pointer, byte_offset, data)?;
+    let delta_regions = delta_regions_for_weight_deltas(map, gguf_tensors, &forced_deltas)?;
+    let applied_regions = apply_cached_compensation(cache, &delta_regions)?;
+    let compensation_deltas =
+        apply_compensation_to_cover(mmap, map, gguf_tensors, &applied_regions)
+            .map_err(|source| CompensatedChunkWriteError::Cover { source })?;
+
+    Ok(CompensatedChunkWrite {
+        forced_deltas,
+        compensation_deltas,
+    })
 }
 
 pub fn apply_compensation_to_cover(

@@ -1,9 +1,10 @@
 use llmdb::forward::linalg::cholesky;
 use llmdb::forward::{
-    ActivationSite, AppliedCompensationRegion, CholeskyFactor, CompensationRegionKey,
-    CompensationWriteDeltaRegion, CompensationWriteRegion, HessianFactorCache,
-    apply_cached_compensation, apply_compensation_to_cover, delta_regions_for_weight_deltas,
-    regions_for_pointer,
+    ActivationSite, AppliedCompensationRegion, CholeskyFactor, CompensatedChunkWriteError,
+    CompensationApplyError, CompensationRegionKey, CompensationWriteDeltaRegion,
+    CompensationWriteRegion, HessianFactorCache, apply_cached_compensation,
+    apply_compensation_to_cover, delta_regions_for_weight_deltas, regions_for_pointer,
+    write_chunk_with_cached_compensation,
 };
 use llmdb::gguf::parser::GgufTensorInfo;
 use llmdb::gguf::quant::GgufQuantType;
@@ -222,10 +223,128 @@ fn apply_compensation_to_cover_rejects_mismatched_region_without_mutation() {
     assert_eq!(cover, before_cover);
 }
 
+#[test]
+fn write_chunk_with_cached_compensation_applies_payload_and_compensation() {
+    let name = "blk.0.attn_q.weight";
+    let mut cover = f16_cover_bits(&[0x3C0F, 0x4000, 0x4200, 0x4400]);
+    let map = f16_tensor_map(name, 4);
+    let tensors = vec![tensor(name, 2, 2)];
+    let mut cache = HessianFactorCache::new();
+    cache.insert(
+        ActivationSite::QkvInput,
+        0,
+        CholeskyFactor::new(2, cholesky(&[4.0_f32, 2.0, 5.0], 2).unwrap()),
+    );
+    let pointer = Pointer {
+        slot: 0,
+        start_weight: 0,
+        length_in_bits: 4,
+        flags: 0,
+        reserved: 0,
+    };
+
+    let result = write_chunk_with_cached_compensation(
+        &mut cover,
+        &map,
+        &tensors,
+        &cache,
+        pointer,
+        0,
+        &[0x00],
+    )
+    .expect("compensated chunk write");
+
+    assert_eq!(
+        result.forced_deltas,
+        vec![WeightDelta {
+            slot: 0,
+            weight_index: 0,
+            before: f16_to_f32(0x3C0F),
+            after: f16_to_f32(0x3C00),
+        }]
+    );
+    assert_eq!(
+        result.compensation_deltas,
+        vec![WeightDelta {
+            slot: 0,
+            weight_index: 1,
+            before: f16_to_f32(0x4000),
+            after: f16_to_f32(0x4003),
+        }]
+    );
+    assert_eq!(u16::from_le_bytes([cover[0], cover[1]]), 0x3C00);
+    assert_eq!(u16::from_le_bytes([cover[2], cover[3]]), 0x4003);
+}
+
+#[test]
+fn write_chunk_with_cached_compensation_preflights_missing_factor_without_mutation() {
+    let name = "blk.0.attn_q.weight";
+    let mut cover = f16_cover_bits(&[0x3C0F, 0x4000, 0x4200, 0x4400]);
+    let before_cover = cover.clone();
+    let map = f16_tensor_map(name, 4);
+    let tensors = vec![tensor(name, 2, 2)];
+    let pointer = Pointer {
+        slot: 0,
+        start_weight: 0,
+        length_in_bits: 4,
+        flags: 0,
+        reserved: 0,
+    };
+
+    let err = write_chunk_with_cached_compensation(
+        &mut cover,
+        &map,
+        &tensors,
+        &HessianFactorCache::new(),
+        pointer,
+        0,
+        &[0x00],
+    )
+    .expect_err("missing factor");
+
+    assert!(matches!(
+        err,
+        CompensatedChunkWriteError::Apply {
+            source: CompensationApplyError::MissingFactor {
+                site: ActivationSite::QkvInput,
+                layer: 0,
+            }
+        }
+    ));
+    assert_eq!(cover, before_cover);
+}
+
 fn f16_cover_bits(bits: &[u16]) -> Vec<u8> {
     let mut cover = Vec::with_capacity(bits.len() * 2);
     for value in bits {
         cover.extend_from_slice(&value.to_le_bytes());
     }
     cover
+}
+
+fn f16_tensor_map(name: &str, weight_count: u64) -> TensorMap {
+    TensorMap {
+        slots: vec![TensorSlot {
+            name: name.to_owned(),
+            quant_type: GgufQuantType::F16,
+            tier: TensorTier::Tier1,
+            data_offset: 0,
+            weight_count,
+            stealable_bits_per_weight: 4,
+            capacity_bits: weight_count * 4,
+            bit_start: 0,
+            bit_end: weight_count * 4,
+        }],
+        total_capacity_bits: weight_count * 4,
+        total_capacity_bytes: weight_count / 2,
+    }
+}
+
+fn tensor(name: &str, input_dim: u64, output_dim: u64) -> GgufTensorInfo {
+    GgufTensorInfo {
+        name: name.to_owned(),
+        dimensions: vec![input_dim, output_dim],
+        raw_type_id: GgufQuantType::F16 as u32,
+        data_offset: 0,
+    }
 }
