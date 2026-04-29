@@ -2,10 +2,12 @@ use llmdb::forward::linalg::cholesky;
 use llmdb::forward::{
     ActivationSite, AppliedCompensationRegion, CholeskyFactor, CompensationRegionKey,
     CompensationWriteDeltaRegion, CompensationWriteRegion, HessianFactorCache,
-    apply_cached_compensation, delta_regions_for_weight_deltas, regions_for_pointer,
+    apply_cached_compensation, apply_compensation_to_cover, delta_regions_for_weight_deltas,
+    regions_for_pointer,
 };
 use llmdb::gguf::parser::GgufTensorInfo;
 use llmdb::gguf::quant::GgufQuantType;
+use llmdb::stego::packing::float::f16_to_f32;
 use llmdb::stego::planner::TensorTier;
 use llmdb::stego::tensor_map::{TensorMap, TensorSlot};
 use llmdb::v2::chunk::WeightDelta;
@@ -118,4 +120,112 @@ fn forward_reexports_pointer_region_api() {
         "compensation delta = {}",
         applied[0].compensation_deltas[0],
     );
+}
+
+#[test]
+fn apply_compensation_to_cover_writes_nearest_weight_values() {
+    let name = "blk.0.attn_q.weight";
+    let mut cover = f16_cover_bits(&[0x3C00, 0x4000, 0x4200, 0x4400]);
+    let map = TensorMap {
+        slots: vec![TensorSlot {
+            name: name.to_owned(),
+            quant_type: GgufQuantType::F16,
+            tier: TensorTier::Tier1,
+            data_offset: 0,
+            weight_count: 4,
+            stealable_bits_per_weight: 4,
+            capacity_bits: 16,
+            bit_start: 0,
+            bit_end: 16,
+        }],
+        total_capacity_bits: 16,
+        total_capacity_bytes: 2,
+    };
+    let tensors = vec![GgufTensorInfo {
+        name: name.to_owned(),
+        dimensions: vec![2, 2],
+        raw_type_id: GgufQuantType::F16 as u32,
+        data_offset: 0,
+    }];
+    let before = f16_to_f32(0x4200);
+    let after = f16_to_f32(0x4205);
+    let region = AppliedCompensationRegion {
+        key: CompensationRegionKey {
+            tensor_name: name.to_owned(),
+            site: ActivationSite::QkvInput,
+            layer: 0,
+            output_channel: 1,
+        },
+        forced_input_channels: vec![1],
+        compensation_input_channels: vec![0],
+        compensation_deltas: vec![after - before],
+    };
+
+    let deltas = apply_compensation_to_cover(&mut cover, &map, &tensors, &[region])
+        .expect("apply compensation");
+
+    assert_eq!(
+        deltas,
+        vec![WeightDelta {
+            slot: 0,
+            weight_index: 2,
+            before,
+            after,
+        }]
+    );
+    assert_eq!(u16::from_le_bytes([cover[4], cover[5]]), 0x4205);
+    assert_eq!(u16::from_le_bytes([cover[6], cover[7]]), 0x4400);
+}
+
+#[test]
+fn apply_compensation_to_cover_rejects_mismatched_region_without_mutation() {
+    let name = "blk.0.attn_q.weight";
+    let mut cover = f16_cover_bits(&[0x3C00, 0x4000, 0x4200, 0x4400]);
+    let before_cover = cover.clone();
+    let map = TensorMap {
+        slots: vec![TensorSlot {
+            name: name.to_owned(),
+            quant_type: GgufQuantType::F16,
+            tier: TensorTier::Tier1,
+            data_offset: 0,
+            weight_count: 4,
+            stealable_bits_per_weight: 4,
+            capacity_bits: 16,
+            bit_start: 0,
+            bit_end: 16,
+        }],
+        total_capacity_bits: 16,
+        total_capacity_bytes: 2,
+    };
+    let tensors = vec![GgufTensorInfo {
+        name: name.to_owned(),
+        dimensions: vec![2, 2],
+        raw_type_id: GgufQuantType::F16 as u32,
+        data_offset: 0,
+    }];
+    let region = AppliedCompensationRegion {
+        key: CompensationRegionKey {
+            tensor_name: name.to_owned(),
+            site: ActivationSite::QkvInput,
+            layer: 0,
+            output_channel: 1,
+        },
+        forced_input_channels: vec![1],
+        compensation_input_channels: vec![0, 1],
+        compensation_deltas: vec![0.001],
+    };
+
+    let err = apply_compensation_to_cover(&mut cover, &map, &tensors, &[region])
+        .expect_err("mismatched compensation region");
+
+    assert!(format!("{err}").contains("2 compensation channels but 1 deltas"));
+    assert_eq!(cover, before_cover);
+}
+
+fn f16_cover_bits(bits: &[u16]) -> Vec<u8> {
+    let mut cover = Vec::with_capacity(bits.len() * 2);
+    for value in bits {
+        cover.extend_from_slice(&value.to_le_bytes());
+    }
+    cover
 }

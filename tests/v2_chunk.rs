@@ -18,6 +18,7 @@ use llmdb::stego::planner::TensorTier;
 use llmdb::stego::tensor_map::{TensorMap, TensorSlot};
 use llmdb::v2::chunk::{
     ChunkError, WeightDelta, read_chunk, write_chunk, write_chunk_with_weight_deltas,
+    write_weight_nearest_value,
 };
 use llmdb::v2::pointer::Pointer;
 
@@ -395,6 +396,87 @@ fn write_chunk_with_weight_deltas_only_reports_live_tail_weights() {
             after: f16_to_f32(0x000F),
         }]
     );
+}
+
+#[test]
+fn write_weight_nearest_value_sets_f16_stealable_bits() {
+    let mut cover = f16_cover(&[1.0, -2.0]);
+    let slot = f16_slot(2, 0);
+    let map = single_slot_map(slot);
+    let target = f16_to_f32(0x3C09);
+
+    let delta =
+        write_weight_nearest_value(&mut cover, &map, 0, 0, target).expect("nearest f16 write");
+
+    assert_eq!(
+        delta,
+        WeightDelta {
+            slot: 0,
+            weight_index: 0,
+            before: f16_to_f32(0x3C00),
+            after: target,
+        }
+    );
+    assert_eq!(cover[0] & 0x0F, 0x09);
+    assert_eq!(
+        u16::from_le_bytes([cover[2], cover[3]]),
+        0xC000,
+        "other weights must not be touched",
+    );
+}
+
+#[test]
+fn write_weight_nearest_value_sets_q8_0_stealable_bits() {
+    let (slot, mut cover) = q8_0_block(&[16], 0.5);
+    let map = single_slot_map(slot);
+
+    let delta =
+        write_weight_nearest_value(&mut cover, &map, 0, 0, 8.5).expect("nearest q8_0 write");
+
+    assert_eq!(
+        delta,
+        WeightDelta {
+            slot: 0,
+            weight_index: 0,
+            before: 8.0,
+            after: 8.5,
+        }
+    );
+    assert_eq!(cover[2], 0x11);
+}
+
+#[test]
+fn write_weight_nearest_value_rejects_bad_targets_without_mutation() {
+    let mut cover = f16_cover(&[1.0]);
+    let before = cover.clone();
+    let slot = f16_slot(1, 0);
+    let map = single_slot_map(slot);
+
+    let err = write_weight_nearest_value(&mut cover, &map, 0, 0, f32::NAN).expect_err("nan target");
+
+    assert_eq!(err, ChunkError::NonFiniteTarget);
+    assert_eq!(cover, before);
+}
+
+#[test]
+fn write_weight_nearest_value_rejects_out_of_range_weight_without_mutation() {
+    let mut cover = f16_cover(&[1.0]);
+    let before = cover.clone();
+    let slot = f16_slot(1, 0);
+    let map = single_slot_map(slot);
+
+    let err =
+        write_weight_nearest_value(&mut cover, &map, 0, 1, 1.0).expect_err("out of range weight");
+
+    assert_eq!(
+        err,
+        ChunkError::WeightOutOfRange {
+            slot: 0,
+            weight_index: 1,
+            weight_count: 1,
+        }
+    );
+    assert_eq!(cover, before);
 }
 
 #[test]

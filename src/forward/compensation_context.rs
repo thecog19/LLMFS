@@ -11,9 +11,11 @@
 use thiserror::Error;
 
 use crate::forward::awq::{ActivationSite, tensor_site_for_name};
+use crate::forward::compensation::AppliedCompensationRegion;
 use crate::gguf::parser::GgufTensorInfo;
+use crate::stego::calibration::magnitude::read_weight_value;
 use crate::stego::tensor_map::TensorMap;
-use crate::v2::chunk::WeightDelta;
+use crate::v2::chunk::{ChunkError, WeightDelta, write_weight_nearest_value};
 use crate::v2::pointer::Pointer;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,6 +101,56 @@ pub enum CompensationTargetError {
         tensor: String,
         map_count: u64,
         gguf_count: u64,
+    },
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum CompensationCoverApplyError {
+    #[error("tensor '{tensor}' is not present in the TensorMap")]
+    MissingTensorSlot { tensor: String },
+
+    #[error("slot index {slot_index} for tensor '{tensor}' does not fit u16")]
+    SlotIndexTooLarge { tensor: String, slot_index: usize },
+
+    #[error("compensation target: {source}")]
+    Target {
+        #[from]
+        source: CompensationTargetError,
+    },
+
+    #[error("chunk I/O: {source}")]
+    Chunk {
+        #[from]
+        source: ChunkError,
+    },
+
+    #[error(
+        "applied compensation region for tensor '{tensor}' output channel {output_channel} has \
+         {channels} compensation channels but {deltas} deltas"
+    )]
+    DeltaLengthMismatch {
+        tensor: String,
+        output_channel: usize,
+        channels: usize,
+        deltas: usize,
+    },
+
+    #[error(
+        "output channel {output_channel} out of range for tensor '{tensor}' with output dim {output_dim}"
+    )]
+    OutputChannelOutOfRange {
+        tensor: String,
+        output_channel: usize,
+        output_dim: usize,
+    },
+
+    #[error(
+        "input channel {input_channel} out of range for tensor '{tensor}' with input dim {input_dim}"
+    )]
+    InputChannelOutOfRange {
+        tensor: String,
+        input_channel: usize,
+        input_dim: usize,
     },
 }
 
@@ -242,6 +294,71 @@ pub fn regions_for_pointer(
     Ok(regions)
 }
 
+pub fn apply_compensation_to_cover(
+    mmap: &mut [u8],
+    map: &TensorMap,
+    gguf_tensors: &[GgufTensorInfo],
+    regions: &[AppliedCompensationRegion],
+) -> Result<Vec<WeightDelta>, CompensationCoverApplyError> {
+    let mut planned = Vec::new();
+    for region in regions {
+        if region.compensation_input_channels.len() != region.compensation_deltas.len() {
+            return Err(CompensationCoverApplyError::DeltaLengthMismatch {
+                tensor: region.key.tensor_name.clone(),
+                output_channel: region.key.output_channel,
+                channels: region.compensation_input_channels.len(),
+                deltas: region.compensation_deltas.len(),
+            });
+        }
+        let layout = layout_for_region_key(map, gguf_tensors, &region.key)?;
+        if region.key.output_channel >= layout.output_dim {
+            return Err(CompensationCoverApplyError::OutputChannelOutOfRange {
+                tensor: region.key.tensor_name.clone(),
+                output_channel: region.key.output_channel,
+                output_dim: layout.output_dim,
+            });
+        }
+        let slot = &map.slots[layout.slot_index as usize];
+        for (&input_channel, &delta) in region
+            .compensation_input_channels
+            .iter()
+            .zip(&region.compensation_deltas)
+        {
+            if input_channel >= layout.input_dim {
+                return Err(CompensationCoverApplyError::InputChannelOutOfRange {
+                    tensor: region.key.tensor_name.clone(),
+                    input_channel,
+                    input_dim: layout.input_dim,
+                });
+            }
+            let weight_index =
+                region.key.output_channel as u64 * layout.input_dim as u64 + input_channel as u64;
+            let before = read_weight_value(mmap, slot, weight_index);
+            let target = before + delta;
+            if !target.is_finite() {
+                return Err(ChunkError::NonFiniteTarget.into());
+            }
+            planned.push(ConcreteCompensationWrite {
+                slot_index: layout.slot_index,
+                weight_index,
+                target,
+            });
+        }
+    }
+
+    let mut deltas = Vec::with_capacity(planned.len());
+    for write in planned {
+        deltas.push(write_weight_nearest_value(
+            mmap,
+            map,
+            write.slot_index,
+            write.weight_index,
+            write.target,
+        )?);
+    }
+    Ok(deltas)
+}
+
 pub fn delta_regions_for_weight_deltas(
     map: &TensorMap,
     gguf_tensors: &[GgufTensorInfo],
@@ -291,6 +408,89 @@ pub fn delta_regions_for_weight_deltas(
         sort_region_deltas(region);
     }
     Ok(regions)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TensorLayout {
+    slot_index: u16,
+    input_dim: usize,
+    output_dim: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ConcreteCompensationWrite {
+    slot_index: u16,
+    weight_index: u64,
+    target: f32,
+}
+
+fn layout_for_region_key(
+    map: &TensorMap,
+    gguf_tensors: &[GgufTensorInfo],
+    key: &CompensationRegionKey,
+) -> Result<TensorLayout, CompensationCoverApplyError> {
+    let slot_index = map
+        .slots
+        .iter()
+        .position(|slot| slot.name == key.tensor_name)
+        .ok_or_else(|| CompensationCoverApplyError::MissingTensorSlot {
+            tensor: key.tensor_name.clone(),
+        })?;
+    let slot_index =
+        u16::try_from(slot_index).map_err(|_| CompensationCoverApplyError::SlotIndexTooLarge {
+            tensor: key.tensor_name.clone(),
+            slot_index,
+        })?;
+    let slot = &map.slots[slot_index as usize];
+
+    let tensor = gguf_tensors
+        .iter()
+        .find(|tensor| tensor.name == key.tensor_name)
+        .ok_or_else(|| CompensationTargetError::MissingTensorInfo {
+            tensor: key.tensor_name.clone(),
+        })?;
+    if tensor.dimensions.len() != 2 {
+        return Err(CompensationTargetError::UnsupportedTensorRank {
+            tensor: key.tensor_name.clone(),
+            rank: tensor.dimensions.len(),
+        }
+        .into());
+    }
+
+    let input_dim_raw = tensor.dimensions[0];
+    let output_dim_raw = tensor.dimensions[1];
+    if input_dim_raw == 0 {
+        return Err(CompensationTargetError::ZeroInputDim {
+            tensor: key.tensor_name.clone(),
+        }
+        .into());
+    }
+    let input_dim =
+        usize::try_from(input_dim_raw).map_err(|_| CompensationTargetError::InputDimTooLarge {
+            tensor: key.tensor_name.clone(),
+            value: input_dim_raw,
+        })?;
+    let output_dim = usize::try_from(output_dim_raw).map_err(|_| {
+        CompensationTargetError::OutputDimTooLarge {
+            tensor: key.tensor_name.clone(),
+            value: output_dim_raw,
+        }
+    })?;
+    let gguf_count = tensor.element_count();
+    if gguf_count != slot.weight_count {
+        return Err(CompensationTargetError::WeightCountMismatch {
+            tensor: key.tensor_name.clone(),
+            map_count: slot.weight_count,
+            gguf_count,
+        }
+        .into());
+    }
+
+    Ok(TensorLayout {
+        slot_index,
+        input_dim,
+        output_dim,
+    })
 }
 
 fn sort_region_deltas(region: &mut CompensationWriteDeltaRegion) {

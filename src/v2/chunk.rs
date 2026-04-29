@@ -54,8 +54,18 @@ pub enum ChunkError {
     },
     #[error("pointer slot {slot} out of range (map has {slot_count} slots)")]
     SlotOutOfRange { slot: u16, slot_count: usize },
+    #[error("weight {weight_index} out of range for slot {slot} with {weight_count} weights")]
+    WeightOutOfRange {
+        slot: u16,
+        weight_index: u64,
+        weight_count: u64,
+    },
     #[error("pointer targets slot {slot}, which has no stealable bits")]
     NonStealableSlot { slot: u16 },
+    #[error("target compensation value is not finite")]
+    NonFiniteTarget,
+    #[error("no finite candidate value for slot {slot} weight {weight_index}")]
+    NoFiniteWeightCandidate { slot: u16, weight_index: u64 },
     #[error(
         "pointer range [{start_weight}, {end_weight}) lies outside slot {slot} with {weight_count} weights"
     )]
@@ -182,6 +192,135 @@ pub fn write_chunk_with_weight_deltas(
         delta.after = read_weight_value(mmap, slot, delta.weight_index);
     }
     Ok(deltas)
+}
+
+/// Set one weight's stealable bits to the pattern whose decoded
+/// model-space value is closest to `target`.
+///
+/// This is the compensation actuator primitive: it preserves every
+/// non-stealable bit, enumerates the quant-type-specific stealable
+/// bit patterns for the selected weight, and returns the signed
+/// before/after model-space delta caused by the chosen write.
+pub fn write_weight_nearest_value(
+    mmap: &mut [u8],
+    map: &TensorMap,
+    slot_index: u16,
+    weight_index: u64,
+    target: f32,
+) -> Result<WeightDelta, ChunkError> {
+    if !target.is_finite() {
+        return Err(ChunkError::NonFiniteTarget);
+    }
+    let slot = map
+        .slots
+        .get(slot_index as usize)
+        .ok_or(ChunkError::SlotOutOfRange {
+            slot: slot_index,
+            slot_count: map.slots.len(),
+        })?;
+    if weight_index >= slot.weight_count {
+        return Err(ChunkError::WeightOutOfRange {
+            slot: slot_index,
+            weight_index,
+            weight_count: slot.weight_count,
+        });
+    }
+    let bits_per_weight = bits_per_weight(slot, slot_index)? as u8;
+    let before = read_weight_value(mmap, slot, weight_index);
+    let original_pattern =
+        read_stealable_pattern(mmap, slot, slot_index, weight_index, bits_per_weight);
+    let pattern_count = 1_u32 << bits_per_weight;
+
+    let mut best_pattern = None;
+    let mut best_error = f32::INFINITY;
+    for pattern in 0..pattern_count {
+        write_stealable_pattern(
+            mmap,
+            slot,
+            slot_index,
+            weight_index,
+            bits_per_weight,
+            pattern,
+        );
+        let candidate = read_weight_value(mmap, slot, weight_index);
+        if !candidate.is_finite() {
+            continue;
+        }
+        let error = (candidate - target).abs();
+        if error < best_error {
+            best_error = error;
+            best_pattern = Some(pattern);
+        }
+    }
+
+    let Some(best_pattern) = best_pattern else {
+        write_stealable_pattern(
+            mmap,
+            slot,
+            slot_index,
+            weight_index,
+            bits_per_weight,
+            original_pattern,
+        );
+        return Err(ChunkError::NoFiniteWeightCandidate {
+            slot: slot_index,
+            weight_index,
+        });
+    };
+    write_stealable_pattern(
+        mmap,
+        slot,
+        slot_index,
+        weight_index,
+        bits_per_weight,
+        best_pattern,
+    );
+    let after = read_weight_value(mmap, slot, weight_index);
+    Ok(WeightDelta {
+        slot: slot_index,
+        weight_index,
+        before,
+        after,
+    })
+}
+
+fn read_stealable_pattern(
+    mmap: &[u8],
+    slot: &TensorSlot,
+    slot_index: u16,
+    weight_index: u64,
+    bits_per_weight: u8,
+) -> u32 {
+    let mut pattern = 0_u32;
+    for bit_index in 0..bits_per_weight {
+        let pos = MetadataBitPos {
+            slot_index: u32::from(slot_index),
+            weight_index,
+            bit_index,
+        };
+        if read_bit(mmap, slot, pos) {
+            pattern |= 1_u32 << bit_index;
+        }
+    }
+    pattern
+}
+
+fn write_stealable_pattern(
+    mmap: &mut [u8],
+    slot: &TensorSlot,
+    slot_index: u16,
+    weight_index: u64,
+    bits_per_weight: u8,
+    pattern: u32,
+) {
+    for bit_index in 0..bits_per_weight {
+        let pos = MetadataBitPos {
+            slot_index: u32::from(slot_index),
+            weight_index,
+            bit_index,
+        };
+        write_bit(mmap, slot, pos, (pattern >> bit_index) & 1 == 1);
+    }
 }
 
 fn write_chunk_bits(
