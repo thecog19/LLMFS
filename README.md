@@ -71,7 +71,9 @@ Works on any GGUF. No mount, no root, no inference runtime needed.
 ./target/release/llmdb init model.gguf
 
 # Store a host file at an absolute path inside the filesystem.
-# Parent directories are created on demand.
+# Parent directories are created on demand. Store warms a Full
+# compensation runtime by default; use --no-compensation only for
+# explicit fast/debug writes.
 ./target/release/llmdb store model.gguf ./notes.txt --stego-path /notes.txt
 
 # List entries (defaults to `/`).

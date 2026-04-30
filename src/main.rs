@@ -76,12 +76,22 @@ enum Command {
 
     /// Copy a host file into the filesystem at `<stego_path>`
     /// (must be absolute, e.g. `/notes.txt`). Creates parent
-    /// directories on the fly.
+    /// directories on the fly. By default this warms a Full
+    /// compensation runtime first and writes file content through it.
     Store {
         model: PathBuf,
         host_path: PathBuf,
         #[arg(long)]
         stego_path: String,
+        /// Skip Full calibration and store without runtime Hessian
+        /// compensation. Intended for smoke tests and explicit
+        /// fast/debug writes.
+        #[arg(long, action = ArgAction::SetTrue)]
+        no_compensation: bool,
+        /// Optional corpus file for the default Full compensation
+        /// warmup. Defaults to the bundled calibration corpus.
+        #[arg(long, value_name = "CORPUS", conflicts_with = "no_compensation")]
+        compensation_corpus: Option<PathBuf>,
     },
 
     /// Copy a file out of the filesystem to the host. `--output`
@@ -168,7 +178,15 @@ fn dispatch(cmd: Command) -> Result<(), CliError> {
             model,
             host_path,
             stego_path,
-        } => cmd_store(&model, &host_path, &stego_path),
+            no_compensation,
+            compensation_corpus,
+        } => cmd_store(
+            &model,
+            &host_path,
+            &stego_path,
+            no_compensation,
+            compensation_corpus.as_deref(),
+        ),
         Command::Get {
             model,
             stego_path,
@@ -226,6 +244,10 @@ fn open_cover_mmap(model: &Path) -> Result<MmapMut, CliError> {
 
 fn mount_v2(model: &Path) -> Result<V2Filesystem, CliError> {
     let map = build_tensor_map(model)?;
+    mount_v2_with_map(model, map)
+}
+
+fn mount_v2_with_map(model: &Path, map: TensorMap) -> Result<V2Filesystem, CliError> {
     let cover = open_cover_mmap(model)?;
     V2Filesystem::mount(cover, map)
         .map_err(|e| CliError::user(format!("V2 mount (no anchor? run `llmdb init` first): {e}")))
@@ -404,16 +426,61 @@ fn cmd_ls(model: &Path, path: &str) -> Result<(), CliError> {
     Ok(())
 }
 
-fn cmd_store(model: &Path, host_path: &Path, stego_path: &str) -> Result<(), CliError> {
+fn cmd_store(
+    model: &Path,
+    host_path: &Path,
+    stego_path: &str,
+    no_compensation: bool,
+    compensation_corpus: Option<&Path>,
+) -> Result<(), CliError> {
     let bytes = std::fs::read(host_path)
         .map_err(|e| CliError::user(format!("reading {}: {e}", host_path.display())))?;
 
-    let mut fs = mount_v2(model)?;
+    let map = build_tensor_map(model)?;
+    let mut fs = mount_v2_with_map(model, map.clone())?;
+    if !no_compensation {
+        attach_full_compensation_runtime(&mut fs, model, &map, compensation_corpus)?;
+    }
     ensure_parent_dirs(&mut fs, stego_path)?;
     fs.create_file(stego_path, &bytes).map_err(fs_err)?;
     flush_and_close(model, fs)?;
 
     println!("stored {} ({} bytes)", stego_path, bytes.len());
+    Ok(())
+}
+
+fn read_calibration_corpus(corpus: Option<&Path>) -> Result<String, CliError> {
+    match corpus {
+        Some(path) => std::fs::read_to_string(path)
+            .map_err(|e| CliError::user(format!("read corpus {}: {e}", path.display()))),
+        None => Ok(llmdb::calibrate::DEFAULT_CALIBRATION_CORPUS.to_owned()),
+    }
+}
+
+fn attach_full_compensation_runtime(
+    fs: &mut V2Filesystem,
+    model: &Path,
+    map: &TensorMap,
+    corpus: Option<&Path>,
+) -> Result<(), CliError> {
+    let corpus_text = read_calibration_corpus(corpus)?;
+    println!(
+        "calibrating compensation runtime for {} ({} corpus chars, mode = Full)",
+        model.display(),
+        corpus_text.len(),
+    );
+    let summary = llmdb::calibrate::run_calibration(
+        fs,
+        model,
+        map,
+        &corpus_text,
+        llmdb::calibrate::CalibrationMode::Full,
+    )
+    .map_err(|e| CliError::user(format!("calibrate compensation runtime: {e}")))?;
+    println!(
+        "compensation runtime: {} tokens, {}/{} slots populated",
+        summary.token_count, summary.populated_slot_count, summary.total_slot_count,
+    );
     Ok(())
 }
 
@@ -438,11 +505,7 @@ fn cmd_calibrate(model: &Path, corpus: Option<&Path>, full: bool) -> Result<(), 
         CliError::user(format!("V2 mount (no anchor? run `llmdb init` first): {e}"))
     })?;
 
-    let corpus_text: String = match corpus {
-        Some(path) => std::fs::read_to_string(path)
-            .map_err(|e| CliError::user(format!("read corpus {}: {e}", path.display())))?,
-        None => llmdb::calibrate::DEFAULT_CALIBRATION_CORPUS.to_owned(),
-    };
+    let corpus_text = read_calibration_corpus(corpus)?;
 
     let mode = if full {
         llmdb::calibrate::CalibrationMode::Full

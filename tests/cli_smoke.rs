@@ -116,6 +116,7 @@ fn store_ls_get_rm_roundtrip() {
         .arg("store")
         .arg(&fx.path)
         .arg(tmp.path())
+        .arg("--no-compensation")
         .arg("--stego-path")
         .arg("/notes/round.txt")
         .assert()
@@ -188,6 +189,7 @@ fn rm_on_empty_directory_succeeds() {
         .arg("store")
         .arg(&fx.path)
         .arg(tmp.path())
+        .arg("--no-compensation")
         .arg("--stego-path")
         .arg("/d/leaf.bin")
         .assert()
@@ -241,6 +243,7 @@ fn re_init_wipes_prior_state() {
         .arg("store")
         .arg(&fx.path)
         .arg(tmp.path())
+        .arg("--no-compensation")
         .arg("--stego-path")
         .arg("/dying.txt")
         .assert()
@@ -282,10 +285,37 @@ fn store_subcommand_help_names_its_args() {
     let out = llmdb().arg("store").arg("--help").assert().success();
     let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
     // clap renders required positionals in uppercase angle-brackets.
-    for token in ["<MODEL>", "<HOST_PATH>", "--stego-path"] {
+    for token in [
+        "<MODEL>",
+        "<HOST_PATH>",
+        "--stego-path",
+        "--no-compensation",
+        "--compensation-corpus",
+    ] {
         assert!(
             stdout.contains(token),
             "store --help missing `{token}`:\n{stdout}"
         );
     }
+}
+
+#[test]
+fn store_compensation_corpus_conflicts_with_no_compensation() {
+    let out = llmdb()
+        .arg("store")
+        .arg("model.gguf")
+        .arg("host.bin")
+        .arg("--no-compensation")
+        .arg("--stego-path")
+        .arg("/payload.bin")
+        .arg("--compensation-corpus")
+        .arg("corpus.txt")
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
+
+    assert!(
+        stderr.contains("--no-compensation"),
+        "parse error should name --no-compensation:\n{stderr}"
+    );
 }

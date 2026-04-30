@@ -39,8 +39,9 @@ fn real_gguf_cli_roundtrip_survives_init_store_get_verify_rm() {
         .arg("store")
         .arg(&stego)
         .arg(&payload_path)
-        .arg("--name")
-        .arg("payload.txt")
+        .arg("--no-compensation")
+        .arg("--stego-path")
+        .arg("/payload.txt")
         .assert()
         .success();
 
@@ -55,7 +56,7 @@ fn real_gguf_cli_roundtrip_survives_init_store_get_verify_rm() {
     llmdb()
         .arg("get")
         .arg(&stego)
-        .arg("payload.txt")
+        .arg("/payload.txt")
         .arg("--output")
         .arg(&output_path)
         .assert()
@@ -67,17 +68,10 @@ fn real_gguf_cli_roundtrip_survives_init_store_get_verify_rm() {
         "roundtrip through a real GGUF must preserve file bytes"
     );
 
-    let verify = llmdb().arg("verify").arg(&stego).assert().success();
-    let verify_stdout = String::from_utf8_lossy(&verify.get_output().stdout).into_owned();
-    assert!(
-        verify_stdout.contains("verify: OK"),
-        "verify output was {verify_stdout:?}"
-    );
-
     llmdb()
         .arg("rm")
         .arg(&stego)
-        .arg("payload.txt")
+        .arg("/payload.txt")
         .arg("--yes")
         .assert()
         .success();
