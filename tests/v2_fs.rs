@@ -17,6 +17,8 @@
 //! 8. **Mount fails on invalid CDC params**.
 //! 9. **Mount fails on corrupted inode pointer**.
 
+use llmdb::forward::{ActivationSite, CholeskyFactor, HessianFactorCache};
+use llmdb::gguf::parser::GgufTensorInfo;
 use llmdb::gguf::quant::GgufQuantType;
 use llmdb::stego::planner::TensorTier;
 use llmdb::stego::tensor_map::{TensorMap, TensorSlot};
@@ -93,6 +95,26 @@ fn make_cover(weight_count: u64) -> (Vec<u8>, TensorMap) {
     (bytes, map)
 }
 
+fn identity_factor(n: usize) -> CholeskyFactor {
+    let mut l = vec![0.0_f32; n * (n + 1) / 2];
+    for i in 0..n {
+        l[i * (i + 1) / 2 + i] = 1.0;
+    }
+    CholeskyFactor::new(n, l)
+}
+
+fn compensation_runtime_fixture() -> (Vec<GgufTensorInfo>, HessianFactorCache) {
+    let tensors = vec![GgufTensorInfo {
+        name: "blk.0.attn_q.weight".to_owned(),
+        dimensions: vec![2, 2],
+        raw_type_id: GgufQuantType::F16 as u32,
+        data_offset: 0,
+    }];
+    let mut factors = HessianFactorCache::new();
+    factors.insert(ActivationSite::QkvInput, 0, identity_factor(2));
+    (tensors, factors)
+}
+
 // ------------------------------------------------------------------
 // Tests
 // ------------------------------------------------------------------
@@ -106,6 +128,35 @@ fn init_then_unmount_remount_sees_empty_root() {
 
     let fs2 = Filesystem::mount_with_cdc_params(cover_after, map, small_cdc()).expect("mount");
     assert!(fs2.readdir("/").expect("readdir on mount").is_empty());
+}
+
+#[test]
+fn init_starts_without_compensation_runtime() {
+    let (cover, map) = make_cover(20_000);
+    let fs = Filesystem::init_with_cdc_params(cover, map, small_cdc()).expect("init");
+
+    assert!(fs.compensation_runtime().is_none());
+}
+
+#[test]
+fn compensation_runtime_is_mount_local_state() {
+    let (cover, map) = make_cover(20_000);
+    let mut fs = Filesystem::init_with_cdc_params(cover, map.clone(), small_cdc()).expect("init");
+    let (tensors, factors) = compensation_runtime_fixture();
+
+    fs.set_compensation_runtime(tensors.clone(), factors.clone());
+    let runtime = fs.compensation_runtime().expect("runtime");
+    assert_eq!(runtime.gguf_tensors(), tensors.as_slice());
+    assert_eq!(runtime.factors().len(), 1);
+    assert!(runtime.factors().contains(ActivationSite::QkvInput, 0));
+
+    fs.clear_compensation_runtime();
+    assert!(fs.compensation_runtime().is_none());
+
+    fs.set_compensation_runtime(tensors, factors);
+    let cover_after = fs.unmount().expect("unmount");
+    let fs2 = Filesystem::mount_with_cdc_params(cover_after, map, small_cdc()).expect("mount");
+    assert!(fs2.compensation_runtime().is_none());
 }
 
 #[test]

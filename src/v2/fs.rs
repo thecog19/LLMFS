@@ -46,6 +46,8 @@
 
 use thiserror::Error;
 
+use crate::forward::HessianFactorCache;
+use crate::gguf::parser::GgufTensorInfo;
 use crate::stego::calibration::placement::MetadataPlacement;
 use crate::stego::tensor_map::TensorMap;
 use crate::v2::alloc::{AllocError, Allocator};
@@ -90,6 +92,38 @@ pub struct Filesystem {
     /// Dirty-weight bitmap. Marked as chunks get written; allocator
     /// uses it to prefer previously-perturbed free runs.
     dirty_bitmap: DirtyBitmap,
+    /// Runtime-only compensation state. This is never persisted in
+    /// the cover; callers must recompute or reattach it on mount.
+    compensation: Option<CompensationRuntime>,
+}
+
+/// Runtime-only state needed to apply Hessian compensation during
+/// V2 writes.
+///
+/// This deliberately carries parsed GGUF tensor layout plus the
+/// in-memory Hessian factor cache, and nothing persistent. It is
+/// reattached by the mounting process once calibration has run.
+#[derive(Debug, Clone)]
+pub struct CompensationRuntime {
+    gguf_tensors: Vec<GgufTensorInfo>,
+    factors: HessianFactorCache,
+}
+
+impl CompensationRuntime {
+    pub fn new(gguf_tensors: Vec<GgufTensorInfo>, factors: HessianFactorCache) -> Self {
+        Self {
+            gguf_tensors,
+            factors,
+        }
+    }
+
+    pub fn gguf_tensors(&self) -> &[GgufTensorInfo] {
+        &self.gguf_tensors
+    }
+
+    pub fn factors(&self) -> &HessianFactorCache {
+        &self.factors
+    }
 }
 
 #[derive(Debug, Error)]
@@ -267,6 +301,7 @@ impl Filesystem {
             cdc_params,
             dedup_index,
             dirty_bitmap,
+            compensation: None,
         })
     }
 
@@ -437,6 +472,7 @@ impl Filesystem {
             cdc_params,
             dedup_index,
             dirty_bitmap,
+            compensation: None,
         })
     }
 
@@ -448,6 +484,21 @@ impl Filesystem {
     pub fn unmount(mut self) -> std::io::Result<Box<dyn CoverStorage>> {
         self.cover.flush()?;
         Ok(self.cover)
+    }
+
+    /// Attach runtime-only compensation state for subsequent writes.
+    /// The state is not persisted and is cleared by unmount/remount.
+    pub fn set_compensation_runtime(
+        &mut self,
+        gguf_tensors: Vec<GgufTensorInfo>,
+        factors: HessianFactorCache,
+    ) {
+        self.compensation = Some(CompensationRuntime::new(gguf_tensors, factors));
+    }
+
+    /// Remove any attached compensation runtime from this mount.
+    pub fn clear_compensation_runtime(&mut self) {
+        self.compensation = None;
     }
 
     // --------------------------------------------------------------
@@ -676,6 +727,10 @@ impl Filesystem {
 
     pub fn dirty_bitmap(&self) -> &DirtyBitmap {
         &self.dirty_bitmap
+    }
+
+    pub fn compensation_runtime(&self) -> Option<&CompensationRuntime> {
+        self.compensation.as_ref()
     }
 
     pub fn allocator_free_weights(&self) -> u64 {
