@@ -36,6 +36,11 @@
 //! not dedup — they're overwritten on every commit and the hash
 //! lookup would be wasted work.
 //!
+//! When a mount has a [`CompensationRuntime`] attached, newly-written
+//! file content chunks route through cached Hessian compensation.
+//! Filesystem metadata chunks still use the plain writer; their
+//! perturbation is bounded by the existing anchor / metadata policy.
+//!
 //! # Reclamation
 //!
 //! After each commit the old tree's chunks are returned to the
@@ -46,7 +51,10 @@
 
 use thiserror::Error;
 
-use crate::forward::HessianFactorCache;
+use crate::forward::{
+    CompensatedChunkWriteError, CompensationWriteDeltaRegion, HessianFactorCache,
+    apply_cached_compensation, regions_for_pointer, write_chunk_with_cached_compensation,
+};
 use crate::gguf::parser::GgufTensorInfo;
 use crate::stego::calibration::placement::MetadataPlacement;
 use crate::stego::tensor_map::TensorMap;
@@ -54,7 +62,7 @@ use crate::v2::alloc::{AllocError, Allocator};
 use crate::v2::anchor::{self, AnchorError};
 use crate::v2::cdc::{FastCdcError, FastCdcParams, FastCdcStream, chunk_ranges};
 use crate::v2::ceiling::CeilingSummary;
-use crate::v2::chunk::{ChunkError, byte_capacity, read_chunk, write_chunk};
+use crate::v2::chunk::{ChunkError, WeightDelta, byte_capacity, read_chunk, write_chunk};
 use crate::v2::cover::CoverStorage;
 use crate::v2::dedup::{DedupIndex, hash_chunk};
 use crate::v2::directory::{DirEntry, Directory, DirectoryError, EntryKind, MAX_NAME_LEN};
@@ -137,6 +145,9 @@ pub enum FsError {
     #[error("chunk I/O: {0}")]
     Chunk(#[from] ChunkError),
 
+    #[error("compensated chunk write: {0}")]
+    Compensation(#[from] CompensatedChunkWriteError),
+
     #[error("inode codec: {0}")]
     Inode(#[from] InodeError),
 
@@ -154,6 +165,9 @@ pub enum FsError {
 
     #[error("dirty bitmap: {0}")]
     Dirty(#[from] DirtyBitmapError),
+
+    #[error("dirty bitmap cannot address slot {slot} weight {weight_index}")]
+    DirtyWeightIndexTooLarge { slot: u16, weight_index: u64 },
 
     #[error("directory codec: {0}")]
     Directory(#[from] DirectoryError),
@@ -994,7 +1008,7 @@ impl Filesystem {
     /// writes all go through the same function so identical chunks
     /// across any of them collapse to one physical allocation.
     fn write_file_content(&mut self, data: &[u8]) -> Result<Pointer, FsError> {
-        persist_as_byte_stream(
+        persist_as_byte_stream_with_compensation(
             self.cover.bytes_mut(),
             &self.map,
             &mut self.alloc,
@@ -1002,6 +1016,7 @@ impl Filesystem {
             &mut self.dedup_index,
             &self.cdc_params,
             data,
+            self.compensation.as_ref(),
         )
     }
 }
@@ -1196,6 +1211,22 @@ fn dedup_or_write(
     dedup: &mut DedupIndex,
     chunk: &[u8],
 ) -> Result<Pointer, FsError> {
+    dedup_or_write_with_compensation(cover, map, allocator, dirty, dedup, chunk, None)
+}
+
+/// Like [`dedup_or_write`], but file data chunks can opt into the
+/// attached runtime-only compensation path. Metadata callers pass
+/// `None` so their write ordering and pointer bytes remain unchanged.
+#[allow(clippy::too_many_arguments)]
+fn dedup_or_write_with_compensation(
+    cover: &mut [u8],
+    map: &TensorMap,
+    allocator: &mut Allocator,
+    dirty: &mut DirtyBitmap,
+    dedup: &mut DedupIndex,
+    chunk: &[u8],
+    compensation: Option<&CompensationRuntime>,
+) -> Result<Pointer, FsError> {
     let hash = hash_chunk(chunk);
     if let Some(p) = dedup.lookup(&hash) {
         return Ok(p);
@@ -1206,10 +1237,79 @@ fn dedup_or_write(
         .ok_or(FsError::OutOfSpace {
             requested_bits: bit_count,
         })?;
-    write_chunk(cover, map, p, 0, chunk)?;
-    mark_pointer_dirty(dirty, map, p);
+    if let Some(runtime) = compensation {
+        if let Err(err) = preflight_cached_compensation_write(map, runtime, p) {
+            allocator.free(map, p)?;
+            return Err(err);
+        }
+        match write_chunk_with_cached_compensation(
+            cover,
+            map,
+            runtime.gguf_tensors(),
+            runtime.factors(),
+            p,
+            0,
+            chunk,
+        ) {
+            Ok(write) => {
+                mark_pointer_dirty(dirty, map, p);
+                mark_weight_deltas_dirty(dirty, &write.compensation_deltas)?;
+            }
+            Err(err) => {
+                return Err(FsError::Compensation(err));
+            }
+        }
+    } else {
+        if let Err(err) = write_chunk(cover, map, p, 0, chunk) {
+            allocator.free(map, p)?;
+            return Err(FsError::Chunk(err));
+        }
+        mark_pointer_dirty(dirty, map, p);
+    }
     dedup.insert(hash, p);
     Ok(p)
+}
+
+fn preflight_cached_compensation_write(
+    map: &TensorMap,
+    runtime: &CompensationRuntime,
+    pointer: Pointer,
+) -> Result<(), FsError> {
+    let regions: Vec<CompensationWriteDeltaRegion> =
+        regions_for_pointer(map, runtime.gguf_tensors(), pointer)
+            .map_err(|source| FsError::Compensation(CompensatedChunkWriteError::Target { source }))?
+            .into_iter()
+            .map(|region| {
+                let delta_count = region.input_channels.len();
+                CompensationWriteDeltaRegion {
+                    key: region.key,
+                    input_channels: region.input_channels,
+                    deltas: vec![0.0; delta_count],
+                }
+            })
+            .collect();
+    apply_cached_compensation(runtime.factors(), &regions)
+        .map_err(|source| FsError::Compensation(CompensatedChunkWriteError::Apply { source }))?;
+    Ok(())
+}
+
+fn mark_weight_deltas_dirty(
+    dirty: &mut DirtyBitmap,
+    deltas: &[WeightDelta],
+) -> Result<(), FsError> {
+    let mut weights = Vec::with_capacity(deltas.len());
+    for delta in deltas {
+        let weight_index =
+            u32::try_from(delta.weight_index).map_err(|_| FsError::DirtyWeightIndexTooLarge {
+                slot: delta.slot,
+                weight_index: delta.weight_index,
+            })?;
+        weights.push((delta.slot, weight_index));
+    }
+    for (slot, weight_index) in weights {
+        dirty.mark(slot, weight_index);
+    }
+    Ok(())
 }
 
 /// Outcome reported by [`dedup_or_write_no_mark`] so callers know
@@ -1658,6 +1758,22 @@ fn persist_as_byte_stream(
     cdc_params: &FastCdcParams,
     data: &[u8],
 ) -> Result<Pointer, FsError> {
+    persist_as_byte_stream_with_compensation(
+        cover, map, allocator, dirty, dedup, cdc_params, data, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn persist_as_byte_stream_with_compensation(
+    cover: &mut [u8],
+    map: &TensorMap,
+    allocator: &mut Allocator,
+    dirty: &mut DirtyBitmap,
+    dedup: &mut DedupIndex,
+    cdc_params: &FastCdcParams,
+    data: &[u8],
+    compensation: Option<&CompensationRuntime>,
+) -> Result<Pointer, FsError> {
     let ranges = chunk_ranges(data, cdc_params);
     let max_chunks = max_chunks_for(cdc_params);
     if ranges.len() > max_chunks {
@@ -1671,7 +1787,15 @@ fn persist_as_byte_stream(
     let mut data_chunk_ptrs = Vec::with_capacity(ranges.len());
     for range in &ranges {
         let chunk = &data[range.clone()];
-        let ptr = dedup_or_write(cover, map, allocator, dirty, dedup, chunk)?;
+        let ptr = dedup_or_write_with_compensation(
+            cover,
+            map,
+            allocator,
+            dirty,
+            dedup,
+            chunk,
+            compensation,
+        )?;
         data_chunk_ptrs.push(ptr);
     }
 

@@ -17,7 +17,10 @@
 //! 8. **Mount fails on invalid CDC params**.
 //! 9. **Mount fails on corrupted inode pointer**.
 
-use llmdb::forward::{ActivationSite, CholeskyFactor, HessianFactorCache};
+use llmdb::forward::{
+    ActivationSite, CholeskyFactor, CompensatedChunkWriteError, CompensationApplyError,
+    HessianFactorCache,
+};
 use llmdb::gguf::parser::GgufTensorInfo;
 use llmdb::gguf::quant::GgufQuantType;
 use llmdb::stego::planner::TensorTier;
@@ -59,9 +62,13 @@ fn f32_to_f16_bits(value: f32) -> u16 {
 }
 
 fn f16_slot(weight_count: u64, data_offset: u64) -> TensorSlot {
+    named_f16_slot("fs.f16", weight_count, data_offset)
+}
+
+fn named_f16_slot(name: &str, weight_count: u64, data_offset: u64) -> TensorSlot {
     let bits = GgufQuantType::F16.stealable_bits_hint() as u64;
     TensorSlot {
-        name: "fs.f16".to_owned(),
+        name: name.to_owned(),
         quant_type: GgufQuantType::F16,
         tier: TensorTier::Tier1,
         data_offset,
@@ -95,10 +102,35 @@ fn make_cover(weight_count: u64) -> (Vec<u8>, TensorMap) {
     (bytes, map)
 }
 
+fn make_compensatable_cover(weight_count: u64) -> (Vec<u8>, TensorMap) {
+    let mut bytes = Vec::with_capacity(weight_count as usize * 2);
+    for _ in 0..weight_count {
+        bytes.extend_from_slice(&0x3C0F_u16.to_le_bytes());
+    }
+    let slot = named_f16_slot("blk.0.attn_q.weight", weight_count, 0);
+    let map = TensorMap {
+        slots: vec![slot.clone()],
+        total_capacity_bits: slot.capacity_bits,
+        total_capacity_bytes: slot.capacity_bits / 8,
+    };
+    (bytes, map)
+}
+
 fn identity_factor(n: usize) -> CholeskyFactor {
     let mut l = vec![0.0_f32; n * (n + 1) / 2];
     for i in 0..n {
         l[i * (i + 1) / 2 + i] = 1.0;
+    }
+    CholeskyFactor::new(n, l)
+}
+
+fn coupled_factor(n: usize) -> CholeskyFactor {
+    let mut l = vec![0.0_f32; n * (n + 1) / 2];
+    for i in 0..n {
+        l[i * (i + 1) / 2 + i] = 1.0;
+        if i > 0 {
+            l[i * (i + 1) / 2] = 0.25;
+        }
     }
     CholeskyFactor::new(n, l)
 }
@@ -112,6 +144,26 @@ fn compensation_runtime_fixture() -> (Vec<GgufTensorInfo>, HessianFactorCache) {
     }];
     let mut factors = HessianFactorCache::new();
     factors.insert(ActivationSite::QkvInput, 0, identity_factor(2));
+    (tensors, factors)
+}
+
+fn compensatable_file_runtime_fixture(
+    weight_count: u64,
+    input_dim: u64,
+) -> (Vec<GgufTensorInfo>, HessianFactorCache) {
+    assert_eq!(weight_count % input_dim, 0);
+    let tensors = vec![GgufTensorInfo {
+        name: "blk.0.attn_q.weight".to_owned(),
+        dimensions: vec![input_dim, weight_count / input_dim],
+        raw_type_id: GgufQuantType::F16 as u32,
+        data_offset: 0,
+    }];
+    let mut factors = HessianFactorCache::new();
+    factors.insert(
+        ActivationSite::QkvInput,
+        0,
+        coupled_factor(input_dim as usize),
+    );
     (tensors, factors)
 }
 
@@ -157,6 +209,51 @@ fn compensation_runtime_is_mount_local_state() {
     let cover_after = fs.unmount().expect("unmount");
     let fs2 = Filesystem::mount_with_cdc_params(cover_after, map, small_cdc()).expect("mount");
     assert!(fs2.compensation_runtime().is_none());
+}
+
+#[test]
+fn attached_compensation_runtime_is_used_for_file_content() {
+    let (cover, map) = make_compensatable_cover(60_000);
+    let mut fs = Filesystem::init_with_cdc_params(cover, map, small_cdc()).expect("init");
+    let (tensors, _factors) = compensatable_file_runtime_fixture(60_000, 16);
+    let generation_before = fs.generation();
+    let free_before = fs.allocator_free_weights();
+    let dirty_before = fs.dirty_bitmap().set_count();
+
+    fs.set_compensation_runtime(tensors, HessianFactorCache::new());
+    let err = fs
+        .create_file("/data", &[0x00])
+        .expect_err("missing compensation factor");
+
+    assert!(matches!(
+        err,
+        FsError::Compensation(CompensatedChunkWriteError::Apply {
+            source: CompensationApplyError::MissingFactor {
+                site: ActivationSite::QkvInput,
+                layer: 0,
+            }
+        })
+    ));
+    assert!(!fs.exists("/data"));
+    assert_eq!(fs.generation(), generation_before);
+    assert_eq!(fs.allocator_free_weights(), free_before);
+    assert_eq!(fs.dirty_bitmap().set_count(), dirty_before);
+}
+
+#[test]
+fn file_content_round_trips_with_compensation_runtime_attached() {
+    let (cover, map) = make_compensatable_cover(60_000);
+    let mut fs = Filesystem::init_with_cdc_params(cover, map, small_cdc()).expect("init");
+    let (tensors, factors) = compensatable_file_runtime_fixture(60_000, 16);
+
+    fs.set_compensation_runtime(tensors, factors);
+    fs.create_file("/data", &[0x00, 0x01, 0x02, 0x03])
+        .expect("create compensated file");
+
+    assert_eq!(
+        fs.read_file("/data").expect("read compensated file"),
+        &[0x00, 0x01, 0x02, 0x03],
+    );
 }
 
 #[test]
