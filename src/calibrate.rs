@@ -13,6 +13,9 @@
 //!    cycle through input channels).
 //! 5. Build a [`SalienceTable`] keyed by slot index.
 //! 6. Commit it via [`crate::v2::fs::Filesystem::commit_salience`].
+//! 7. In Full mode, attach the freshly-computed Hessian factor cache
+//!    to the same mounted filesystem for same-process compensated
+//!    writes. Nothing about that cache is persisted.
 //!
 //! The default corpus is an excerpt from the wiki.test.raw benchmark
 //! ([`DEFAULT_CALIBRATION_CORPUS`]) — long enough to tokenize past
@@ -144,6 +147,13 @@ pub struct CalibrationSummary {
     pub new_salience_inode_nonzero: bool,
 }
 
+#[derive(Debug, Clone)]
+struct CalibrationCommitOutcome {
+    populated_slot_count: usize,
+    total_slot_count: usize,
+    new_salience_inode_nonzero: bool,
+}
+
 /// Run a full calibration pass end-to-end. Expects the V2 cover
 /// to already be initialized (mounted before this call).
 ///
@@ -160,6 +170,7 @@ pub struct CalibrationSummary {
 ///   5. Map tensor names → TensorMap slot indices; expand
 ///      per-channel to per-weight via the periodic encoder.
 ///   6. `commit_salience(&table)` on `fs`.
+///   7. In Full mode, attach the runtime-only factor cache to `fs`.
 pub fn run_calibration(
     fs: &mut V2Filesystem,
     model_path: &Path,
@@ -181,32 +192,45 @@ pub fn run_calibration(
     let token_count = tokens.len();
 
     // 3 + 4. Forward pass + per-tensor salience, mode-dependent.
-    let per_tensor_salience = match mode {
-        CalibrationMode::Fast => run_fast_forward(&model, &tokens),
+    let (per_tensor_salience, factors) = match mode {
+        CalibrationMode::Fast => (run_fast_forward(&model, &tokens), None),
         CalibrationMode::Full => {
-            // Discard the factor cache here; `run_calibration`'s
-            // job ends at salience commit. Callers that want to
-            // keep factors for Phase E compensation call
-            // `run_full_forward` directly.
-            run_full_forward(&model, &tokens, token_count)?.per_tensor_obs
+            let result = run_full_forward(&model, &tokens, token_count)?;
+            (result.per_tensor_obs, Some(result.factors))
         }
     };
 
     // 5. Parse GGUF for tensor shapes and build the salience table.
     let gguf = parse_path(model_path).map_err(|e| CalibrateError::GgufParse(e.to_string()))?;
-    let table = build_salience_table(tensor_map, &gguf.tensors, &per_tensor_salience)?;
-    let populated_slot_count = table.populated_slot_count();
-    let total_slot_count = table.slot_count();
-
-    // 6. Commit.
-    let ptr = fs.commit_salience(&table)?;
-    let new_salience_inode_nonzero = !ptr.is_null();
+    let outcome =
+        commit_calibration_outputs(fs, tensor_map, &gguf.tensors, &per_tensor_salience, factors)?;
 
     Ok(CalibrationSummary {
         token_count,
+        populated_slot_count: outcome.populated_slot_count,
+        total_slot_count: outcome.total_slot_count,
+        new_salience_inode_nonzero: outcome.new_salience_inode_nonzero,
+    })
+}
+
+fn commit_calibration_outputs(
+    fs: &mut V2Filesystem,
+    tensor_map: &TensorMap,
+    gguf_tensors: &[crate::gguf::parser::GgufTensorInfo],
+    per_tensor_salience: &HashMap<String, Vec<f32>>,
+    factors: Option<HessianFactorCache>,
+) -> Result<CalibrationCommitOutcome, CalibrateError> {
+    let table = build_salience_table(tensor_map, gguf_tensors, per_tensor_salience)?;
+    let populated_slot_count = table.populated_slot_count();
+    let total_slot_count = table.slot_count();
+    let ptr = fs.commit_salience(&table)?;
+    if let Some(factors) = factors {
+        fs.set_compensation_runtime(gguf_tensors.to_vec(), factors);
+    }
+    Ok(CalibrationCommitOutcome {
         populated_slot_count,
         total_slot_count,
-        new_salience_inode_nonzero,
+        new_salience_inode_nonzero: !ptr.is_null(),
     })
 }
 
@@ -350,6 +374,7 @@ mod tests {
     use crate::gguf::quant::GgufQuantType;
     use crate::stego::planner::TensorTier;
     use crate::stego::tensor_map::TensorSlot;
+    use crate::v2::cdc::FastCdcParams;
     use std::collections::HashMap;
 
     fn tensor_info(name: &str, dimensions: Vec<u64>) -> GgufTensorInfo {
@@ -373,6 +398,30 @@ mod tests {
             bit_start: 0,
             bit_end: weight_count * 4,
         }
+    }
+
+    fn small_cdc() -> FastCdcParams {
+        FastCdcParams {
+            min_size: 32,
+            avg_size: 64,
+            max_size: 128,
+        }
+    }
+
+    fn f16_cover(weight_count: u64) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(weight_count as usize * 2);
+        for _ in 0..weight_count {
+            bytes.extend_from_slice(&0x3C0F_u16.to_le_bytes());
+        }
+        bytes
+    }
+
+    fn identity_factor(n: usize) -> CholeskyFactor {
+        let mut l = vec![0.0_f32; n * (n + 1) / 2];
+        for i in 0..n {
+            l[i * (i + 1) / 2 + i] = 1.0;
+        }
+        CholeskyFactor::new(n, l)
     }
 
     #[test]
@@ -445,5 +494,50 @@ mod tests {
         salience.insert("blk.0.attn_q.weight".to_owned(), vec![1.0_f32, 2.0, 3.0]);
         let err = build_salience_table(&map, &tensors, &salience).unwrap_err();
         assert!(matches!(err, CalibrateError::WeightCountMismatch { .. },));
+    }
+
+    #[test]
+    fn commit_calibration_outputs_attaches_runtime_only_with_factors() {
+        let weight_count = 20_000;
+        let map = TensorMap {
+            slots: vec![slot("blk.0.attn_q.weight", weight_count)],
+            total_capacity_bits: weight_count * 4,
+            total_capacity_bytes: weight_count * 4 / 8,
+        };
+        let tensors = vec![tensor_info(
+            "blk.0.attn_q.weight",
+            vec![4, weight_count / 4],
+        )];
+        let mut salience = HashMap::new();
+        salience.insert(
+            "blk.0.attn_q.weight".to_owned(),
+            vec![1.0_f32, 2.0, 3.0, 4.0],
+        );
+
+        let mut fast_fs =
+            V2Filesystem::init_with_cdc_params(f16_cover(weight_count), map.clone(), small_cdc())
+                .expect("init fast fs");
+        let fast = commit_calibration_outputs(&mut fast_fs, &map, &tensors, &salience, None)
+            .expect("commit fast calibration outputs");
+        assert_eq!(fast.populated_slot_count, 1);
+        assert!(fast.new_salience_inode_nonzero);
+        assert!(fast_fs.compensation_runtime().is_none());
+
+        let mut factors = HessianFactorCache::new();
+        factors.insert(ActivationSite::QkvInput, 0, identity_factor(4));
+        let mut full_fs =
+            V2Filesystem::init_with_cdc_params(f16_cover(weight_count), map.clone(), small_cdc())
+                .expect("init full fs");
+        let full =
+            commit_calibration_outputs(&mut full_fs, &map, &tensors, &salience, Some(factors))
+                .expect("commit full calibration outputs");
+
+        assert_eq!(full.populated_slot_count, 1);
+        assert_eq!(full.total_slot_count, 1);
+        assert!(full.new_salience_inode_nonzero);
+        let runtime = full_fs.compensation_runtime().expect("runtime");
+        assert_eq!(runtime.gguf_tensors(), tensors.as_slice());
+        assert!(runtime.factors().contains(ActivationSite::QkvInput, 0));
+        assert!(full_fs.load_salience().expect("load salience").is_some());
     }
 }
